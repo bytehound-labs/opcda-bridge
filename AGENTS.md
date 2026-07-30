@@ -17,14 +17,14 @@ much broader scope (a generic industrial protocol multiplexer supporting OPC UA/
 similar to [`ng-gateway`](https://github.com/shiyuecamus/ng-gateway) or Telegraf). **Deliberately
 scoped back down to OPC DA only** to avoid never shipping a v1. Resist re-expanding scope to other
 protocols until an OPC DA MVP (gateway + client, read/write working end-to-end) actually ships. If
-a generic multiplexer is revisited later, it should be a separate project/crate built *on top of*
+a generic multiplexer is revisited later, it should be a separate project/crate built _on top of_
 a working opcda-bridge, not a redesign of it.
 
 ## Key architectural decisions
 
 - **Do not copy or transliterate `openopc2`'s Python source.** It's GPL-2.0-or-later; a
   derivative work would inherit that license. This is a clean-room rewrite based on
-  understanding its *behavior/architecture*, not its code.
+  understanding its _behavior/architecture_, not its code.
 - **Build on the [`opc-da-client`](https://github.com/wends155/opc-cli) crate** (MIT,
   async/trait-based, `windows-rs`-backed) for the COM/OPC DA layer, rather than reimplementing raw
   OPC DA COM interfaces from scratch. Its lower-level sibling
@@ -56,7 +56,7 @@ development.
   `chore:`, etc.).
 - **Formatting/linting**: `cargo fmt` (default settings) and
   `cargo clippy --all-targets --all-features -- -D warnings`, once code exists.
-- Full contributor workflow is documented in [`CONTRIBUTING.md`](../CONTRIBUTING.md); this file is
+- Full contributor workflow is documented in [`CONTRIBUTING.md`](CONTRIBUTING.md); this file is
   for future coding-agent sessions, not human contributors.
 
 ## Build / Test / Lint

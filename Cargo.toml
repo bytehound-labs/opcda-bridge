@@ -1,0 +1,13 @@
+[workspace]
+members = ["gateway", "client"]
+resolver = "2"
+
+[package]
+name = "opcda-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "OPC DA gateway/client bridge between Windows and Linux"
+license = "MIT"
+repository = "https://github.com/mikeboiko/opcda-bridge"
+
+[dependencies]

@@ -1,0 +1,60 @@
+glob_matcher: doublestar
+
+pre-commit:
+  parallel: true
+  skip:
+    - rebase
+  commands:
+    rustfmt-format:
+      glob: '**/*.rs'
+      run: |
+        echo "Formatting Rust files with rustfmt..."
+        rustfmt {staged_files}
+      stage_fixed: true
+
+    clippy-lint:
+      glob: '**/*.rs'
+      run: |
+        echo "Linting Rust files with clippy..."
+        cargo clippy --all-targets --all-features -- -D warnings
+
+    taplo-format:
+      glob: '**/*.toml'
+      run: |
+        echo "Formatting TOML files with taplo..."
+        taplo fmt {staged_files}
+      stage_fixed: true
+
+    prettier-format:
+      glob: '**/*.{md,yaml,yml,json}'
+      run: |
+        echo "Formatting files with prettier..."
+        npx prettier --write {staged_files}
+      stage_fixed: true
+
+    shfmt-format:
+      glob: '**/*.{sh,bash}'
+      run: |
+        echo "Formatting shell scripts with shfmt..."
+        shfmt --apply-ignore -w {staged_files}
+      stage_fixed: true
+
+    ds-sync:
+      run: |
+        echo "Syncing .env.example and pushing secrets to Bitwarden..."
+        ds reverse
+        ds push
+        git add .env.example 2>/dev/null || true
+
+post-merge:
+  commands:
+    ds-sync-pull:
+      run: |
+        if command -v ds >/dev/null 2>&1 && [ -f .envsync.yaml ]; then
+          if rbw unlocked >/dev/null 2>&1; then
+            echo "Syncing .env from Bitwarden..."
+            ds sync || echo "ds sync reported an issue (see above); .env may need manual attention."
+          else
+            echo "Skipping ds sync: rbw is locked. Run 'rbw unlock' then 'ds sync' manually if .env.example changed."
+          fi
+        fi

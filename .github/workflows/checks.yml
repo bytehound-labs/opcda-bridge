@@ -1,0 +1,35 @@
+name: Checks
+
+on:
+  push:
+    branches: [init, main]
+  pull_request:
+    branches: [init, main]
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint with clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo-deny
+        run: cargo deny check

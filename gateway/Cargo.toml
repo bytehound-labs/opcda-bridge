@@ -1,0 +1,9 @@
+[package]
+name = "opcda-bridge-gateway"
+version = "0.1.0"
+edition = "2024"
+description = "OPC DA gateway (Windows COM server)"
+license = "MIT"
+repository = "https://github.com/mikeboiko/opcda-bridge"
+
+[dependencies]

@@ -29,6 +29,9 @@ Example: `feat(gateway): add tag subscription support`.
 - Format with `cargo fmt` (default rustfmt settings) before committing.
 - Lint with `cargo clippy --all-targets --all-features -- -D warnings`; fix every warning or
   justify an explicit `#[allow(...)]` with a comment.
+- Both are enforced automatically by a [lefthook](https://github.com/evilmartians/lefthook)
+  `pre-commit` hook (`.lefthook.yml`), which also formats `Cargo.toml`/TOML with `taplo` and
+  Markdown/YAML/JSON with `prettier`. Run `lefthook install` once after cloning to enable it.
 
 ## Testing
 
