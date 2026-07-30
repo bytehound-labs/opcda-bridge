@@ -10,6 +10,8 @@ jobs:
   release-gateway:
     if: startsWith(github.ref_name, 'opcda-bridge-gateway-v')
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
@@ -27,6 +29,8 @@ jobs:
   release-client:
     if: startsWith(github.ref_name, 'opcda-bridge-client-v')
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
