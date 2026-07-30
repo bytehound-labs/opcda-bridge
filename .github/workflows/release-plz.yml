@@ -2,7 +2,7 @@ name: Release-plz
 
 on:
   push:
-    branches: [init, main]
+    branches: [main]
 
 jobs:
   release-plz:
@@ -16,5 +16,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: release-plz/action@v0.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
         with:
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
