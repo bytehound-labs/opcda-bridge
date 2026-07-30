@@ -7,10 +7,19 @@ on:
         description: 'Release tag (e.g. opcda-bridge-client-v0.1.0)'
         required: true
         type: string
+      pkgrel:
+        description: 'Arch package release number (bump for packaging-only fixes)'
+        required: false
+        default: '1'
+        type: string
   workflow_call:
     inputs:
       release_tag:
         required: true
+        type: string
+      pkgrel:
+        required: false
+        default: '1'
         type: string
     secrets:
       AUR_SSH_PRIVATE_KEY:
@@ -22,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
 
       - name: Check for AUR key
         id: check-key
@@ -59,8 +68,8 @@ jobs:
           ARCHIVE=$(ls assets/opcda-bridge-client-linux-*.tar.gz)
           {
             echo "ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
-            echo "LICENSE_SHA=$(sha256sum LICENSE | cut -d' ' -f1)"
-            echo "README_SHA=$(sha256sum README.md | cut -d' ' -f1)"
+            echo "LICENSE_SHA=$(git show "${{ inputs.release_tag }}:LICENSE" | sha256sum | cut -d' ' -f1)"
+            echo "README_SHA=$(git show "${{ inputs.release_tag }}:README.md" | sha256sum | cut -d' ' -f1)"
           } >> "$GITHUB_ENV"
 
       - name: Generate PKGBUILD and .SRCINFO
@@ -68,7 +77,7 @@ jobs:
         run: |
           bash scripts/aurpkg \
             --version "${{ steps.version.outputs.value }}" \
-            --pkgrel 1 \
+            --pkgrel "${{ inputs.pkgrel }}" \
             --license-sha256 "$LICENSE_SHA" \
             --readme-sha256 "$README_SHA" \
             --x86_64-sha256 "$ARCHIVE_SHA" \
@@ -88,16 +97,16 @@ jobs:
         if: steps.check-key.outputs.configured == 'true'
         run: |
           PKGVER="${VERSION#v}"
-          PKGREL=1
           git clone ssh://aur@aur.archlinux.org/opcda-bridge-client-bin.git aur-clone
           cp aur-repo/* aur-clone/
           cd aur-clone
-          if git diff --quiet; then
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
             echo "No changes to AUR package"
             exit 0
           fi
-          git add PKGBUILD .SRCINFO
-          git commit -m "upgpkg: opcda-bridge-client-bin ${PKGVER}-$PKGREL"
+          git commit -m "upgpkg: opcda-bridge-client-bin ${PKGVER}-${PKGREL}"
           git push origin HEAD
         env:
           VERSION: ${{ steps.version.outputs.value }}
+          PKGREL: ${{ inputs.pkgrel }}
