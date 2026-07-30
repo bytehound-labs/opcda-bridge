@@ -27,6 +27,7 @@ pub fn resolve_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn test_default_bridge_port() {
@@ -92,8 +93,14 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // std::env::set_var/remove_var mutate process-global state, but `cargo
+    // test` runs tests in parallel threads by default, so the three tests
+    // below race on the same OPC_BRIDGE_PORT variable unless serialized.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_resolve_port_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("OPC_BRIDGE_PORT") };
         let port = resolve_port();
         assert_eq!(port, DEFAULT_BRIDGE_PORT);
@@ -101,6 +108,7 @@ mod tests {
 
     #[test]
     fn test_resolve_port_from_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("OPC_BRIDGE_PORT", "9999") };
         let port = resolve_port();
         assert_eq!(port, 9999);
@@ -109,6 +117,7 @@ mod tests {
 
     #[test]
     fn test_resolve_port_invalid_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("OPC_BRIDGE_PORT", "not_a_number") };
         let port = resolve_port();
         assert_eq!(port, DEFAULT_BRIDGE_PORT);
