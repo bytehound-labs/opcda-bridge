@@ -74,6 +74,7 @@ mkdir -p "$OUTPUT_DIR"
 
 # Strip 'v' prefix for pkgver
 pkgver="${VERSION#v}"
+release_tag="opcda-bridge-client-$VERSION"
 
 ARCHIVE_NAME="opcda-bridge-client-linux-x86_64.tar.gz"
 
@@ -91,7 +92,7 @@ license=('MIT')
 provides=('opcda-bridge-client')
 conflicts=('opcda-bridge-client')
 
-source_x86_64=("\${pkgname}-\${pkgver}-x86_64.tar.gz::https://github.com/mikeboiko/opcda-bridge/releases/download/v\${pkgver}/$ARCHIVE_NAME")
+source_x86_64=("\${pkgname}-\${pkgver}-x86_64.tar.gz::https://github.com/mikeboiko/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME")
 sha256sums_x86_64=('$X86_64_SHA')
 
 package() {
@@ -109,7 +110,7 @@ cat > "$OUTPUT_DIR/.SRCINFO" << SRCINFOEOF
 	license = MIT
 	provides = opcda-bridge-client
 	conflicts = opcda-bridge-client
-	source_x86_64 = opcda-bridge-client-bin-\$pkgver-x86_64.tar.gz::https://github.com/mikeboiko/opcda-bridge/releases/download/v$pkgver/$ARCHIVE_NAME
+	source_x86_64 = opcda-bridge-client-bin-\$pkgver-x86_64.tar.gz::https://github.com/mikeboiko/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME
 	sha256sums_x86_64 = $X86_64_SHA
 
 pkgname = opcda-bridge-client-bin
