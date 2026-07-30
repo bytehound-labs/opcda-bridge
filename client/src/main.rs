@@ -65,9 +65,16 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::sync::Mutex;
+
+    // std::env::set_var/remove_var mutate process-global state, but `cargo
+    // test` runs tests in parallel threads by default, so the tests below
+    // that touch OPC_BRIDGE_HOST race with each other unless serialized.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_cli_default_host() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
         assert_eq!(args.host, "localhost:7600");
@@ -168,6 +175,7 @@ mod tests {
 
     #[test]
     fn test_cli_host_from_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
         assert_eq!(args.host, "envhost:8888");
@@ -176,6 +184,7 @@ mod tests {
 
     #[test]
     fn test_cli_arg_overrides_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888") };
         let args =
             Cli::try_parse_from(["opcda-bridge", "--host", "arghost:7777", "servers"]).unwrap();
