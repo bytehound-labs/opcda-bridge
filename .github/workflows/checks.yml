@@ -1,10 +1,11 @@
 name: Checks
 
 on:
+  workflow_dispatch:
   push:
-    branches: [init, main]
+    branches: [main]
   pull_request:
-    branches: [init, main]
+    branches: [main]
 
 jobs:
   check:
@@ -15,6 +16,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: i686-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
 
@@ -29,7 +31,18 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny,cargo-machete,protoc
 
       - name: Run cargo-deny
         run: cargo deny check
+
+      - name: Check for unused dependencies
+        run: cargo machete
+
+      - name: Build gateway (release, 32-bit)
+        run: cargo build -p opcda-bridge-gateway --release --target i686-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opcda-bridge-gateway
+          path: target/i686-pc-windows-msvc/release/opcda-bridge-gateway.exe

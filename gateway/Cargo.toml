@@ -7,3 +7,16 @@ license = "MIT"
 repository = "https://github.com/mikeboiko/opcda-bridge"
 
 [dependencies]
+bridge-proto = { path = "../bridge-proto" }
+opcda-bridge = { path = ".." }
+tonic = "0.14"
+tonic-prost = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio-stream = "0.1"
+anyhow = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+opc-da-client = "0.1"
+
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost"]

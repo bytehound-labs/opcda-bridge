@@ -1,5 +1,5 @@
 [workspace]
-members = ["gateway", "client"]
+members = ["bridge-proto", "gateway", "client"]
 resolver = "2"
 
 [package]
@@ -11,3 +11,4 @@ license = "MIT"
 repository = "https://github.com/mikeboiko/opcda-bridge"
 
 [dependencies]
+thiserror = "2"

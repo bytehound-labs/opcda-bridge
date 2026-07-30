@@ -1,15 +1,19 @@
 # opcda-bridge
 
+[![CI](https://github.com/mikeboiko/opcda-bridge/actions/workflows/checks.yml/badge.svg)](https://github.com/mikeboiko/opcda-bridge/actions/workflows/checks.yml)
+[![Coverage](https://github.com/mikeboiko/opcda-bridge/actions/workflows/coverage.yml/badge.svg)](https://github.com/mikeboiko/opcda-bridge/actions/workflows/coverage.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
+
 A lightweight Rust gateway bridging classic OPC DA (Windows/COM) servers to remote Linux/macOS clients.
 
 ## Status
 
-Early scaffolding. Architecture and key dependencies are decided; only a minimal `cargo init`
-binary exists so far — no gateway/client/COM logic has landed yet.
+Active development. Gateway and client are functional end-to-end — OPC DA read/write/browse passing against a live Kepware server. See the [roadmap](#) for upcoming features.
 
 ## Why
 
-OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based industrial protocol still running on countless PLCs, DCSs, and SCADA systems that predate its successor, OPC UA. The existing open-source bridge for non-Windows clients, [openopc2](https://github.com/iterativ/openopc2), works well but carries a full Python/Pyro5 stack and legacy dependency baggage.
+OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based industrial protocol still running on countless PLCs, DCSs, and SCADA systems that predate its successor, OPC UA.
 
 `opcda-bridge` aims to be the same idea distilled to a single static Rust binary per side:
 

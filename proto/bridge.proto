@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package bridge;
+
+service Bridge {
+  rpc ListServers(ListServersRequest) returns (ListServersResponse);
+  rpc Browse(BrowseRequest) returns (stream BrowseResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Write(WriteRequest) returns (WriteResponse);
+}
+
+message ListServersRequest {
+  string host = 1;
+}
+
+message ListServersResponse {
+  repeated string servers = 1;
+}
+
+message BrowseRequest {
+  string server = 1;
+  bool flat = 2;
+  string path = 3;
+  uint32 max_tags = 4;
+}
+
+message BrowseResponse {
+  string tag_id = 1;
+  string node_type = 2;
+}
+
+message ReadRequest {
+  string server = 1;
+  repeated string tag_ids = 2;
+}
+
+message ReadResponse {
+  repeated TagValue values = 1;
+}
+
+message TagValue {
+  string tag_id = 1;
+  string value = 2;
+  string quality = 3;
+  string timestamp = 4;
+}
+
+message WriteRequest {
+  string server = 1;
+  string tag_id = 2;
+  oneof typed_value {
+    string string_value = 3;
+    int32 int_value = 4;
+    double float_value = 5;
+    bool bool_value = 6;
+  }
+}
+
+message WriteResponse {
+  string tag_id = 1;
+  bool success = 2;
+  optional string error = 3;
+}
