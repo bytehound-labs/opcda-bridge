@@ -25,7 +25,7 @@ jobs:
           bin: opcda-bridge-gateway
           manifest_path: gateway/Cargo.toml
           target: i686-pc-windows-msvc
-          archive: opcda-bridge-gateway-windows-x86.zip
+          archive: opcda-bridge-gateway-windows-x86
           token: ${{ secrets.GITHUB_TOKEN }}
 
   release-client:
@@ -37,11 +37,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            archive: opcda-bridge-client-linux-x86_64.tar.gz
+            archive: opcda-bridge-client-linux-x86_64
           - os: macos-latest
-            archive: opcda-bridge-client-macos-arm64.tar.gz
+            archive: opcda-bridge-client-macos-arm64
           - os: windows-latest
-            archive: opcda-bridge-client-windows-x86_64.zip
+            archive: opcda-bridge-client-windows-x86_64
       max-parallel: 1
     steps:
       - uses: actions/checkout@v5
