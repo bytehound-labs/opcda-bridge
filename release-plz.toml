@@ -1,15 +1,2 @@
-[[package]]
-name = "opcda-bridge"
-publish = false
-
-[[package]]
-name = "opcda-bridge-gateway"
-publish = false
-
-[[package]]
-name = "opcda-bridge-client"
-publish = false
-
-[[package]]
-name = "bridge-proto"
+[workspace]
 publish = false
