@@ -150,3 +150,68 @@ fn parse_value(raw: &str) -> Value {
     }
     Value::String(raw.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_value_bool_true() {
+        assert!(matches!(parse_value("true"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_parse_value_bool_false() {
+        assert!(matches!(parse_value("false"), Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_parse_value_int_positive() {
+        assert!(matches!(parse_value("42"), Value::Int(42)));
+    }
+
+    #[test]
+    fn test_parse_value_int_negative() {
+        assert!(matches!(parse_value("-1"), Value::Int(-1)));
+    }
+
+    #[test]
+    fn test_parse_value_int_zero() {
+        assert!(matches!(parse_value("0"), Value::Int(0)));
+    }
+
+    #[test]
+    fn test_parse_value_float_positive() {
+        assert!(matches!(parse_value("3.14"), Value::Float(v) if (v - 3.14).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_parse_value_float_negative() {
+        assert!(matches!(parse_value("-2.5"), Value::Float(v) if (v + 2.5).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn test_parse_value_float_exponential() {
+        assert!(matches!(parse_value("1e10"), Value::Float(v) if (v - 1e10).abs() < 1.0));
+    }
+
+    #[test]
+    fn test_parse_value_string_simple() {
+        assert!(matches!(parse_value("hello"), Value::String(s) if s == "hello"));
+    }
+
+    #[test]
+    fn test_parse_value_string_empty() {
+        assert!(matches!(parse_value(""), Value::String(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn test_parse_value_string_numeric_string() {
+        assert!(matches!(parse_value("42foo"), Value::String(s) if s == "42foo"));
+    }
+
+    #[test]
+    fn test_parse_value_string_special_chars() {
+        assert!(matches!(parse_value("hello world!"), Value::String(s) if s == "hello world!"));
+    }
+}

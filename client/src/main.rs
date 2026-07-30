@@ -60,3 +60,126 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_default_host() {
+        unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
+        let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
+        assert_eq!(args.host, "localhost:7600");
+    }
+
+    #[test]
+    fn test_cli_custom_host() {
+        let args =
+            Cli::try_parse_from(["opcda-bridge", "--host", "192.168.1.1:9999", "servers"]).unwrap();
+        assert_eq!(args.host, "192.168.1.1:9999");
+    }
+
+    #[test]
+    fn test_cli_servers_command() {
+        let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
+        assert!(matches!(args.command, Commands::Servers));
+    }
+
+    #[test]
+    fn test_cli_browse_command() {
+        let args =
+            Cli::try_parse_from(["opcda-bridge", "browse", "--server", "MyServer", "--flat"])
+                .unwrap();
+        match args.command {
+            Commands::Browse { server, flat } => {
+                assert_eq!(server, "MyServer");
+                assert!(flat);
+            }
+            _ => panic!("expected Browse"),
+        }
+    }
+
+    #[test]
+    fn test_cli_browse_no_flat() {
+        let args = Cli::try_parse_from(["opcda-bridge", "browse", "--server", "MyServer"]).unwrap();
+        match args.command {
+            Commands::Browse { server, flat } => {
+                assert_eq!(server, "MyServer");
+                assert!(!flat);
+            }
+            _ => panic!("expected Browse"),
+        }
+    }
+
+    #[test]
+    fn test_cli_read_command() {
+        let args = Cli::try_parse_from([
+            "opcda-bridge",
+            "read",
+            "--server",
+            "MyServer",
+            "tag1",
+            "tag2",
+            "tag3",
+        ])
+        .unwrap();
+        match args.command {
+            Commands::Read { server, tags } => {
+                assert_eq!(server, "MyServer");
+                assert_eq!(tags, vec!["tag1", "tag2", "tag3"]);
+            }
+            _ => panic!("expected Read"),
+        }
+    }
+
+    #[test]
+    fn test_cli_read_no_tags() {
+        let args = Cli::try_parse_from(["opcda-bridge", "read", "--server", "MyServer"]).unwrap();
+        match args.command {
+            Commands::Read { server, tags } => {
+                assert_eq!(server, "MyServer");
+                assert!(tags.is_empty());
+            }
+            _ => panic!("expected Read"),
+        }
+    }
+
+    #[test]
+    fn test_cli_write_command() {
+        let args = Cli::try_parse_from([
+            "opcda-bridge",
+            "write",
+            "--server",
+            "MyServer",
+            "Tag1",
+            "42",
+        ])
+        .unwrap();
+        match args.command {
+            Commands::Write { server, tag, value } => {
+                assert_eq!(server, "MyServer");
+                assert_eq!(tag, "Tag1");
+                assert_eq!(value, "42");
+            }
+            _ => panic!("expected Write"),
+        }
+    }
+
+    #[test]
+    fn test_cli_host_from_env() {
+        unsafe { std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888") };
+        let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
+        assert_eq!(args.host, "envhost:8888");
+        unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
+    }
+
+    #[test]
+    fn test_cli_arg_overrides_env() {
+        unsafe { std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888") };
+        let args =
+            Cli::try_parse_from(["opcda-bridge", "--host", "arghost:7777", "servers"]).unwrap();
+        assert_eq!(args.host, "arghost:7777");
+        unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
+    }
+}

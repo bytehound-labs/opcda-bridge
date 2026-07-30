@@ -6,8 +6,9 @@ the network — a single static binary per side, no legacy dependency stack.
 
 ## Status
 
-Pre-implementation as of repo creation (2026-07). No `Cargo.toml`/`src/` yet — architecture and
-key dependencies are decided (below), but nothing has been scaffolded or coded.
+Active development. Workspace is scaffolded with gateway (`opcda-bridge-gateway`), client
+(`opcda-bridge-client`), shared proto definitions (`bridge-proto`), and an umbrella root crate
+(`opcda-bridge`). Gateway and client are functional end-to-end against a live Kepware server.
 
 ## Origin and scope discipline
 
@@ -54,8 +55,27 @@ target for early gateway development.
 - Full contributor workflow is documented in [`CONTRIBUTING.md`](CONTRIBUTING.md); this file is
   for future coding-agent sessions, not human contributors.
 
-## Build / Test / Lint
+## Build / Test / Lint / Coverage
 
-Not yet applicable — no `Cargo.toml` exists. Once scaffolded: `cargo build`, `cargo test`,
-`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`. The gateway crate
-will be Windows-only (COM); the client crate should be cross-platform.
+- **Build**: `cargo build`
+- **Test**: `cargo test --workspace`
+- **Lint**: `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`
+- **Coverage**: `cargo llvm-cov --workspace --lcov`
+
+The gateway crate is Windows-only (COM); the client crate is cross-platform. Tests that require
+the `OpcClient` trait use a mock implementation so they run on all platforms.
+
+### Coverage enforcement
+
+Coverage is tracked by Codecov and enforced at **100%** via `codecov.yml` (project and patch
+targets both at 100% with 0% threshold). CI fails if coverage drops. All code — including error
+branches, edge cases, and default values — must be tested. When adding new code, add
+corresponding tests in the same PR to maintain 100% coverage.
+
+### Test design for the gateway
+
+The gateway binary (`opcda-bridge-gateway`) depends on `opc-da-client` only on Windows
+(`#[cfg(target_os = "windows")]`). To keep the gateway's core logic testable on all platforms,
+an `OpcClient` trait (in `gateway/src/opc.rs`) abstracts OPC DA operations. The concrete
+adapter (`opc_da_adapter.rs`) wraps `opc_da_client::OpcDaWrapper` and is Windows-only. Server
+tests use `MockOpcClient` (defined in the test module) to exercise all RPC handler paths.
