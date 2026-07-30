@@ -156,10 +156,10 @@ mod tests {
         let req = WriteRequest {
             server: "S".into(),
             tag_id: "t1".into(),
-            typed_value: Some(TypedValue::FloatValue(3.14)),
+            typed_value: Some(TypedValue::FloatValue(9.5)),
         };
         assert!(
-            matches!(req.typed_value, Some(TypedValue::FloatValue(v)) if (v - 3.14).abs() < f64::EPSILON)
+            matches!(req.typed_value, Some(TypedValue::FloatValue(v)) if (v - 9.5).abs() < f64::EPSILON)
         );
     }
 

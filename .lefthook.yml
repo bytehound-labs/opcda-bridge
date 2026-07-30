@@ -16,13 +16,13 @@ pre-commit:
       glob: '**/*.rs'
       run: |
         echo "Linting Rust files with clippy..."
-        cargo clippy --all-targets --all-features -- -D warnings
+        cargo clippy --workspace --all-targets --all-features -- -D warnings
 
     check-release:
       glob: '**/*.rs'
       run: |
         echo "Checking release profile..."
-        cargo check --release
+        cargo check --workspace --release
 
     taplo-format:
       glob: '**/*.toml'

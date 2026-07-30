@@ -10,7 +10,7 @@ struct ServerRow {
 }
 
 pub async fn cmd_servers(host: String) -> anyhow::Result<()> {
-    let mut client = BridgeClient::connect(format!("http://{}", host)).await?;
+    let mut client = BridgeClient::connect(format!("http://{host}")).await?;
     let response = client
         .list_servers(ListServersRequest {
             host: "localhost".to_string(),
@@ -31,7 +31,7 @@ struct TagRow {
 }
 
 pub async fn cmd_browse(host: String, server: String, flat: bool) -> anyhow::Result<()> {
-    let mut client = BridgeClient::connect(format!("http://{}", host)).await?;
+    let mut client = BridgeClient::connect(format!("http://{host}")).await?;
     let mut stream = client
         .browse(BrowseRequest {
             server,
@@ -68,7 +68,7 @@ struct ReadRow {
 }
 
 pub async fn cmd_read(host: String, server: String, tags: Vec<String>) -> anyhow::Result<()> {
-    let mut client = BridgeClient::connect(format!("http://{}", host)).await?;
+    let mut client = BridgeClient::connect(format!("http://{host}")).await?;
     let response = client
         .read(ReadRequest {
             server,
@@ -113,7 +113,7 @@ pub async fn cmd_write(
         Value::Bool(b) => bridge_proto::bridge::write_request::TypedValue::BoolValue(b),
     };
 
-    let mut client = BridgeClient::connect(format!("http://{}", host)).await?;
+    let mut client = BridgeClient::connect(format!("http://{host}")).await?;
     let response = client
         .write(WriteRequest {
             server,
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_parse_value_float_positive() {
-        assert!(matches!(parse_value("3.14"), Value::Float(v) if (v - 3.14).abs() < f64::EPSILON));
+        assert!(matches!(parse_value("9.5"), Value::Float(v) if (v - 9.5).abs() < f64::EPSILON));
     }
 
     #[test]

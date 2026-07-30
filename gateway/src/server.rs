@@ -22,6 +22,10 @@ pub struct BridgeService<C> {
 }
 
 impl<C: OpcClient> BridgeService<C> {
+    // Only called by the Windows-only `Default` impl below (and by tests); on a
+    // non-Windows, non-test build neither call site is compiled, so this looks
+    // unused to clippy even though it's the primary way to construct the type.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn new(client: C) -> Self {
         Self { client }
     }
@@ -227,7 +231,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .clone()
-                .map_err(|e| anyhow::anyhow!("{}", e))
+                .map_err(|e| anyhow::anyhow!("{e}"))
         }
 
         async fn browse_tags(
@@ -241,7 +245,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .clone()
-                .map_err(|e| anyhow::anyhow!("{}", e))
+                .map_err(|e| anyhow::anyhow!("{e}"))
         }
 
         async fn read_tag_values(
@@ -253,7 +257,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .clone()
-                .map_err(|e| anyhow::anyhow!("{}", e))
+                .map_err(|e| anyhow::anyhow!("{e}"))
         }
 
         async fn write_tag_value(
@@ -266,7 +270,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .clone()
-                .map_err(|e| anyhow::anyhow!("{}", e))
+                .map_err(|e| anyhow::anyhow!("{e}"))
         }
     }
 
@@ -430,8 +434,8 @@ mod tests {
 
     #[test]
     fn test_typed_value_to_opc_float() {
-        let result = typed_value_to_opc_value(Some(ProtoTypedValue::FloatValue(3.14))).unwrap();
-        assert_eq!(result, OpcValue::Float(3.14));
+        let result = typed_value_to_opc_value(Some(ProtoTypedValue::FloatValue(9.5))).unwrap();
+        assert_eq!(result, OpcValue::Float(9.5));
     }
 
     #[test]
@@ -558,7 +562,7 @@ mod tests {
             .await
             .unwrap();
         use tokio_stream::StreamExt;
-        let mut stream = response.into_inner();
+        let stream = response.into_inner();
         let items: Vec<_> = stream.collect::<Vec<_>>().await;
         for item in items {
             assert!(item.is_ok());
@@ -800,7 +804,7 @@ mod tests {
             .write(Request::new(WriteRequest {
                 server: "S".into(),
                 tag_id: "tag_f".into(),
-                typed_value: Some(ProtoTypedValue::FloatValue(3.14)),
+                typed_value: Some(ProtoTypedValue::FloatValue(9.5)),
             }))
             .await
             .unwrap();
