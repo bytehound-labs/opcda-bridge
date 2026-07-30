@@ -3,13 +3,8 @@ use opc_da_client::{OpcDaWrapper, OpcProvider, OpcValue as ExtOpcValue};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
+#[derive(Default)]
 pub struct OpcDaAdapter(pub OpcDaWrapper);
-
-impl Default for OpcDaAdapter {
-    fn default() -> Self {
-        Self(OpcDaWrapper::default())
-    }
-}
 
 #[async_trait::async_trait]
 impl OpcClient for OpcDaAdapter {
