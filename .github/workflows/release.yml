@@ -56,3 +56,11 @@ jobs:
           manifest_path: client/Cargo.toml
           archive: ${{ matrix.archive }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  aur-publish:
+    needs: release-client
+    if: startsWith(github.ref_name, 'opcda-bridge-client-v')
+    uses: ./.github/workflows/aur-publish.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    secrets: inherit

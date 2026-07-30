@@ -1,0 +1,76 @@
+name: AUR Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+    secrets:
+      AUR_SSH_PRIVATE_KEY:
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Skip if no AUR key configured
+        if: ${{ !secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          echo "AUR_SSH_PRIVATE_KEY not configured, skipping AUR publish"
+          exit 0
+
+      - name: Download Linux release asset
+        run: |
+          gh release download "${{ inputs.release_tag }}" \
+            --pattern "opcda-bridge-client-linux-*" \
+            --dir assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute checksums
+        run: |
+          ARCHIVE=$(ls assets/opcda-bridge-client-linux-*.tar.gz)
+          echo "ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Generate PKGBUILD and .SRCINFO
+        run: |
+          bash scripts/aurpkg \
+            --version "${{ inputs.release_tag }}" \
+            --pkgrel 1 \
+            --license-sha256 "0000000000000000000000000000000000000000000000000000000000000000" \
+            --readme-sha256 "0000000000000000000000000000000000000000000000000000000000000000" \
+            --x86_64-sha256 "$ARCHIVE_SHA" \
+            --output-dir aur-repo
+
+      - name: Setup SSH for AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Push to AUR
+        run: |
+          PKGVER="${{ inputs.release_tag }}"
+          PKGREL=1
+          git clone ssh://aur@aur.archlinux.org/opcda-bridge-client-bin.git aur-clone
+          cp aur-repo/* aur-clone/
+          cd aur-clone
+          if git diff --quiet; then
+            echo "No changes to AUR package"
+            exit 0
+          fi
+          git add PKGBUILD .SRCINFO
+          git commit -m "upgpkg: opcda-bridge-client-bin ${PKGVER#v}-$PKGREL"
+          git push origin HEAD
