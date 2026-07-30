@@ -61,6 +61,8 @@ jobs:
     needs: release-client
     if: startsWith(github.ref_name, 'opcda-bridge-client-v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
@@ -79,6 +81,7 @@ jobs:
       - name: Download Linux release asset
         if: steps.check-key.outputs.configured == 'true'
         run: |
+          gh release edit "${{ github.ref_name }}" --draft=false
           gh release download "${{ github.ref_name }}" \
             --pattern "opcda-bridge-client-linux-*" \
             --dir assets
