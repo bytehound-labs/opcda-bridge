@@ -1,6 +1,8 @@
 name: AUR Publish
 
 on:
+  push:
+    branches-ignore: ['**']
   workflow_dispatch:
     inputs:
       release_tag:
