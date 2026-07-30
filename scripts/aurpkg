@@ -92,11 +92,18 @@ license=('MIT')
 provides=('opcda-bridge-client')
 conflicts=('opcda-bridge-client')
 
+source=("LICENSE::https://raw.githubusercontent.com/mikeboiko/opcda-bridge/$release_tag/LICENSE"
+        "README.md::https://raw.githubusercontent.com/mikeboiko/opcda-bridge/$release_tag/README.md")
+sha256sums=('$LICENSE_SHA'
+            '$README_SHA')
+
 source_x86_64=("\${pkgname}-\${pkgver}-x86_64.tar.gz::https://github.com/mikeboiko/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME")
 sha256sums_x86_64=('$X86_64_SHA')
 
 package() {
     install -Dm755 "opcda-bridge-client" "\${pkgdir}/usr/bin/opcda-bridge-client"
+    install -Dm644 "LICENSE" "\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE"
+    install -Dm644 "README.md" "\${pkgdir}/usr/share/doc/\${pkgname}/README.md"
 }
 BUILDEOF
 
@@ -108,6 +115,10 @@ cat > "$OUTPUT_DIR/.SRCINFO" << SRCINFOEOF
 	url = https://github.com/mikeboiko/opcda-bridge
 	arch = x86_64
 	license = MIT
+	source = LICENSE::https://raw.githubusercontent.com/mikeboiko/opcda-bridge/$release_tag/LICENSE
+	source = README.md::https://raw.githubusercontent.com/mikeboiko/opcda-bridge/$release_tag/README.md
+	sha256sums = $LICENSE_SHA
+	sha256sums = $README_SHA
 	provides = opcda-bridge-client
 	conflicts = opcda-bridge-client
 	source_x86_64 = opcda-bridge-client-bin-\$pkgver-x86_64.tar.gz::https://github.com/mikeboiko/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME

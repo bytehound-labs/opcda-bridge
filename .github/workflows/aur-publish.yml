@@ -1,12 +1,10 @@
 name: AUR Publish
 
 on:
-  push:
-    branches-ignore: ['**']
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (e.g. v0.1.0)'
+        description: 'Release tag (e.g. opcda-bridge-client-v0.1.0)'
         required: true
         type: string
   workflow_call:
@@ -23,14 +21,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.release_tag }}
 
-      - name: Skip if no AUR key configured
-        if: ${{ !secrets.AUR_SSH_PRIVATE_KEY }}
+      - name: Check for AUR key
+        id: check-key
         run: |
-          echo "AUR_SSH_PRIVATE_KEY not configured, skipping AUR publish"
-          exit 0
+          if [ -n "$AUR_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "AUR_SSH_PRIVATE_KEY not configured, skipping AUR publish"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Derive package version
+        id: version
+        if: steps.check-key.outputs.configured == 'true'
+        run: |
+          echo "value=${RELEASE_TAG#opcda-bridge-client-}" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
 
       - name: Download Linux release asset
+        if: steps.check-key.outputs.configured == 'true'
         run: |
           gh release download "${{ inputs.release_tag }}" \
             --pattern "opcda-bridge-client-linux-*" \
@@ -39,21 +54,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute checksums
+        if: steps.check-key.outputs.configured == 'true'
         run: |
           ARCHIVE=$(ls assets/opcda-bridge-client-linux-*.tar.gz)
-          echo "ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          {
+            echo "ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
+            echo "LICENSE_SHA=$(sha256sum LICENSE | cut -d' ' -f1)"
+            echo "README_SHA=$(sha256sum README.md | cut -d' ' -f1)"
+          } >> "$GITHUB_ENV"
 
       - name: Generate PKGBUILD and .SRCINFO
+        if: steps.check-key.outputs.configured == 'true'
         run: |
           bash scripts/aurpkg \
-            --version "${{ inputs.release_tag }}" \
+            --version "${{ steps.version.outputs.value }}" \
             --pkgrel 1 \
-            --license-sha256 "0000000000000000000000000000000000000000000000000000000000000000" \
-            --readme-sha256 "0000000000000000000000000000000000000000000000000000000000000000" \
+            --license-sha256 "$LICENSE_SHA" \
+            --readme-sha256 "$README_SHA" \
             --x86_64-sha256 "$ARCHIVE_SHA" \
             --output-dir aur-repo
 
       - name: Setup SSH for AUR
+        if: steps.check-key.outputs.configured == 'true'
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
@@ -63,8 +85,9 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Push to AUR
+        if: steps.check-key.outputs.configured == 'true'
         run: |
-          PKGVER="${{ inputs.release_tag }}"
+          PKGVER="${VERSION#v}"
           PKGREL=1
           git clone ssh://aur@aur.archlinux.org/opcda-bridge-client-bin.git aur-clone
           cp aur-repo/* aur-clone/
@@ -74,5 +97,7 @@ jobs:
             exit 0
           fi
           git add PKGBUILD .SRCINFO
-          git commit -m "upgpkg: opcda-bridge-client-bin ${PKGVER#v}-$PKGREL"
+          git commit -m "upgpkg: opcda-bridge-client-bin ${PKGVER}-$PKGREL"
           git push origin HEAD
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
