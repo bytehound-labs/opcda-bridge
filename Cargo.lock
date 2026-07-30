@@ -711,6 +711,7 @@ name = "opcda-bridge-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bridge-proto",
  "opc-da-client",
  "opcda-bridge",

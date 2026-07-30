@@ -1,5 +1,8 @@
-#[cfg(target_os = "windows")]
+mod opc;
 mod server;
+
+#[cfg(target_os = "windows")]
+mod opc_da_adapter;
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
