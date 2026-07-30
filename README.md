@@ -1,7 +1,7 @@
 # opcda-bridge
 
 [![CI](https://github.com/mikeboiko/opcda-bridge/actions/workflows/checks.yml/badge.svg)](https://github.com/mikeboiko/opcda-bridge/actions/workflows/checks.yml)
-[![Coverage](https://github.com/mikeboiko/opcda-bridge/actions/workflows/coverage.yml/badge.svg)](https://github.com/mikeboiko/opcda-bridge/actions/workflows/coverage.yml)
+[![codecov](https://codecov.io/gh/mikeboiko/opcda-bridge/branch/main/graph/badge.svg?token=)](https://codecov.io/gh/mikeboiko/opcda-bridge)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 
