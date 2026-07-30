@@ -5,10 +5,23 @@ mod server;
 mod opc_da_adapter;
 
 #[cfg(target_os = "windows")]
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+}
+
+#[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
     use opc_da_client::ComGuard;
     use std::net::SocketAddr;
     use tonic::transport::Server;
+
+    init_tracing();
 
     let _guard = ComGuard::new().expect("COM initialization failed");
     Box::leak(Box::new(_guard));
@@ -23,7 +36,7 @@ fn main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        println!("opcda-bridge gateway listening on {}", addr);
+        tracing::info!(%addr, "opcda-bridge gateway listening");
         Server::builder()
             .add_service(bridge_proto::bridge::bridge_server::BridgeServer::new(
                 bridge,

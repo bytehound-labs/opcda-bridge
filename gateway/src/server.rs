@@ -10,7 +10,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 fn internal(e: impl std::fmt::Display) -> Status {
-    Status::internal(e.to_string())
+    let message = e.to_string();
+    tracing::error!(error = %message, "OPC operation failed");
+    Status::internal(message)
 }
 
 const NODE_TYPE_LEAF: &str = "Leaf";
@@ -91,6 +93,7 @@ fn map_to_write_response(result: WriteResult) -> WriteResponse {
 
 #[tonic::async_trait]
 impl<C: OpcClient> Bridge for BridgeService<C> {
+    #[tracing::instrument(skip(self, request))]
     async fn list_servers(
         &self,
         request: Request<ListServersRequest>,
@@ -98,11 +101,13 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         let req = request.into_inner();
         let host = resolve_host(&req.host);
         let servers = self.client.list_servers(host).await.map_err(internal)?;
+        tracing::info!(host, count = servers.len(), "listed OPC DA servers");
         Ok(Response::new(ListServersResponse { servers }))
     }
 
     type BrowseStream = ReceiverStream<std::result::Result<BrowseResponse, Status>>;
 
+    #[tracing::instrument(skip(self, request))]
     async fn browse(
         &self,
         request: Request<BrowseRequest>,
@@ -120,6 +125,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
             .map_err(internal)?;
 
         let tags = select_tags(req.flat, discovered, &tags_sink)?;
+        tracing::info!(server = %req.server, count = tags.len(), "browsed OPC DA tags");
 
         let (tx, rx) = mpsc::channel(128);
 
@@ -141,6 +147,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    #[tracing::instrument(skip(self, request))]
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = request.into_inner();
 
@@ -150,6 +157,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
             .await
             .map_err(internal)?;
 
+        tracing::info!(server = %req.server, count = values.len(), "read OPC DA tag values");
         let proto_values = map_to_proto_tag_values(values);
 
         Ok(Response::new(ReadResponse {
@@ -157,6 +165,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         }))
     }
 
+    #[tracing::instrument(skip(self, request))]
     async fn write(
         &self,
         request: Request<WriteRequest>,
@@ -171,6 +180,12 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
             .await
             .map_err(internal)?;
 
+        tracing::info!(
+            server = %req.server,
+            tag_id = %req.tag_id,
+            success = result.success,
+            "wrote OPC DA tag value"
+        );
         Ok(Response::new(map_to_write_response(result)))
     }
 }
