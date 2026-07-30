@@ -60,75 +60,7 @@ jobs:
   aur-publish:
     needs: release-client
     if: startsWith(github.ref_name, 'opcda-bridge-client-v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Check for AUR key
-        id: check-key
-        run: |
-          if [ -n "$AUR_KEY" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "AUR_SSH_PRIVATE_KEY not configured, skipping AUR publish"
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-          fi
-        env:
-          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-
-      - name: Download Linux release asset
-        if: steps.check-key.outputs.configured == 'true'
-        run: |
-          gh release edit "${{ github.ref_name }}" --draft=false
-          gh release download "${{ github.ref_name }}" \
-            --pattern "opcda-bridge-client-linux-*" \
-            --dir assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute checksums
-        if: steps.check-key.outputs.configured == 'true'
-        run: |
-          ARCHIVE=$(ls assets/opcda-bridge-client-linux-*.tar.gz)
-          echo "ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)" >> "$GITHUB_ENV"
-
-      - name: Generate PKGBUILD and .SRCINFO
-        if: steps.check-key.outputs.configured == 'true'
-        run: |
-          VERSION="${GITHUB_REF_NAME#opcda-bridge-client-}"
-          bash scripts/aurpkg \
-            --version "$VERSION" \
-            --pkgrel 1 \
-            --license-sha256 "0000000000000000000000000000000000000000000000000000000000000000" \
-            --readme-sha256 "0000000000000000000000000000000000000000000000000000000000000000" \
-            --x86_64-sha256 "$ARCHIVE_SHA" \
-            --output-dir aur-repo
-
-      - name: Setup SSH for AUR
-        if: steps.check-key.outputs.configured == 'true'
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Push to AUR
-        if: steps.check-key.outputs.configured == 'true'
-        run: |
-          PKGVER="${GITHUB_REF_NAME#opcda-bridge-client-}"
-          PKGVER="${PKGVER#v}"
-          PKGREL=1
-          git clone ssh://aur@aur.archlinux.org/opcda-bridge-client-bin.git aur-clone
-          cp aur-repo/* aur-clone/
-          cd aur-clone
-          if git diff --quiet; then
-            echo "No changes to AUR package"
-            exit 0
-          fi
-          git add PKGBUILD .SRCINFO
-          git commit -m "upgpkg: opcda-bridge-client-bin ${PKGVER}-${PKGREL}"
-          git push origin HEAD
+    uses: ./.github/workflows/aur-publish.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    secrets: inherit
