@@ -98,7 +98,7 @@ jobs:
         run: |
           PKGVER="${VERSION#v}"
           git clone ssh://aur@aur.archlinux.org/opcda-bridge-client-bin.git aur-clone
-          cp aur-repo/* aur-clone/
+          cp aur-repo/PKGBUILD aur-repo/.SRCINFO aur-clone/
           cd aur-clone
           git add PKGBUILD .SRCINFO
           if git diff --cached --quiet; then
