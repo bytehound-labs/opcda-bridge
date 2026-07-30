@@ -3,7 +3,7 @@ mod commands;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "opcda-bridge", about = "OPC DA bridge client")]
+#[command(name = "opcda-bridge", about = "OPC DA bridge client", version)]
 struct Cli {
     #[arg(long, env = "OPC_BRIDGE_HOST", default_value = "localhost:7600")]
     host: String,
@@ -78,6 +78,15 @@ mod tests {
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
         assert_eq!(args.host, "localhost:7600");
+    }
+
+    #[test]
+    fn test_cli_version_flag() {
+        let err = Cli::try_parse_from(["opcda-bridge", "--version"])
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
