@@ -20,6 +20,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete,protoc
+
       - name: Check formatting
         run: cargo fmt --check --all
 
@@ -28,10 +32,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny,cargo-machete,protoc
 
       - name: Run cargo-deny
         run: cargo deny check
