@@ -1,5 +1,9 @@
 pub mod opc;
+pub mod run;
 pub mod server;
+
+#[cfg(test)]
+mod test_support;
 
 #[cfg(target_os = "windows")]
 pub mod opc_da_adapter;

@@ -194,81 +194,9 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
 mod tests {
     use super::*;
     use crate::opc::{OpcValue, TagValue, WriteResult};
+    use crate::test_support::MockOpcClient;
     use bridge_proto::bridge::write_request::TypedValue as ProtoTypedValue;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
-
-    struct MockOpcClient {
-        list_servers_result: Mutex<Result<Vec<String>, String>>,
-        browse_tags_result: Mutex<Result<Vec<String>, String>>,
-        read_tag_values_result: Mutex<Result<Vec<TagValue>, String>>,
-        write_tag_value_result: Mutex<Result<WriteResult, String>>,
-    }
-
-    impl Default for MockOpcClient {
-        fn default() -> Self {
-            Self {
-                list_servers_result: Mutex::new(Ok(vec![])),
-                browse_tags_result: Mutex::new(Ok(vec![])),
-                read_tag_values_result: Mutex::new(Ok(vec![])),
-                write_tag_value_result: Mutex::new(Ok(WriteResult {
-                    tag_id: String::new(),
-                    success: true,
-                    error: None,
-                })),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl OpcClient for MockOpcClient {
-        async fn list_servers(&self, _host: &str) -> anyhow::Result<Vec<String>> {
-            self.list_servers_result
-                .lock()
-                .unwrap()
-                .clone()
-                .map_err(|e| anyhow::anyhow!("{e}"))
-        }
-
-        async fn browse_tags(
-            &self,
-            _server: &str,
-            _max_tags: usize,
-            _progress: Arc<AtomicUsize>,
-            _tags_sink: Arc<Mutex<Vec<String>>>,
-        ) -> anyhow::Result<Vec<String>> {
-            self.browse_tags_result
-                .lock()
-                .unwrap()
-                .clone()
-                .map_err(|e| anyhow::anyhow!("{e}"))
-        }
-
-        async fn read_tag_values(
-            &self,
-            _server: &str,
-            _tag_ids: Vec<String>,
-        ) -> anyhow::Result<Vec<TagValue>> {
-            self.read_tag_values_result
-                .lock()
-                .unwrap()
-                .clone()
-                .map_err(|e| anyhow::anyhow!("{e}"))
-        }
-
-        async fn write_tag_value(
-            &self,
-            _server: &str,
-            _tag_id: &str,
-            _value: OpcValue,
-        ) -> anyhow::Result<WriteResult> {
-            self.write_tag_value_result
-                .lock()
-                .unwrap()
-                .clone()
-                .map_err(|e| anyhow::anyhow!("{e}"))
-        }
-    }
 
     fn new_bridge_service(
         list_servers: Result<Vec<String>, String>,
@@ -281,6 +209,7 @@ mod tests {
             browse_tags_result: Mutex::new(browse_tags),
             read_tag_values_result: Mutex::new(read_tag_values),
             write_tag_value_result: Mutex::new(write_tag_value),
+            ..MockOpcClient::default()
         })
     }
 
@@ -900,13 +829,6 @@ mod tests {
         assert_eq!(wr.tag_id, "bad_tag");
         assert!(!wr.success);
         assert_eq!(wr.error, Some("access denied".into()));
-    }
-
-    #[test]
-    fn test_mock_opc_client_default() {
-        let mock = MockOpcClient::default();
-        let result = mock.list_servers_result.lock().unwrap();
-        assert!(result.is_ok());
     }
 
     #[tokio::test]

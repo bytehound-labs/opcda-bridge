@@ -15,8 +15,8 @@ fn init_tracing() {
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
     use opc_da_client::ComGuard;
+    use opcda_bridge_gateway::run;
     use std::net::SocketAddr;
-    use tonic::transport::Server;
 
     init_tracing();
 
@@ -33,13 +33,10 @@ fn main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        tracing::info!(%addr, "opcda-bridge gateway listening");
-        Server::builder()
-            .add_service(bridge_proto::bridge::bridge_server::BridgeServer::new(
-                bridge,
-            ))
-            .serve(addr)
-            .await?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(addr = %listener.local_addr()?, "opcda-bridge gateway listening");
+        run::serve(listener, bridge, run::shutdown_signal()).await?;
+        tracing::info!("opcda-bridge gateway shut down");
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
