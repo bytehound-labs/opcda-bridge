@@ -1,10 +1,15 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "opcda-bridge", about = "OPC DA bridge client", version)]
 pub struct Cli {
-    #[arg(long, env = "OPC_BRIDGE_HOST", default_value = "localhost:7600")]
-    pub host: String,
+    #[arg(long, env = "OPC_BRIDGE_HOST")]
+    pub host: Option<String>,
+
+    /// Path to a TOML config file (default: platform config dir, see README)
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -16,26 +21,29 @@ pub enum Commands {
     Servers,
     /// Browse tags on a server
     Browse {
-        /// OPC DA server ProgID
+        /// OPC DA server ProgID (falls back to the config file's `server` key)
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         /// Flat list (skip tree structure)
         #[arg(long)]
         flat: bool,
+        /// Cap on the number of tags streamed back (default: 1000)
+        #[arg(long)]
+        max_tags: Option<u32>,
     },
     /// Read tag values
     Read {
-        /// OPC DA server ProgID
+        /// OPC DA server ProgID (falls back to the config file's `server` key)
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         /// Tag IDs to read
         tags: Vec<String>,
     },
     /// Write a value to a tag
     Write {
-        /// OPC DA server ProgID
+        /// OPC DA server ProgID (falls back to the config file's `server` key)
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         /// Tag ID to write
         tag: String,
         /// Value to write (parsed as bool, int, float, or string)
@@ -44,16 +52,27 @@ pub enum Commands {
 }
 
 pub async fn run_command(cli: Cli) -> anyhow::Result<()> {
+    let config = crate::config::load_config(cli.config.as_deref())?;
+    let host = crate::config::resolve_host(cli.host, &config);
+
     match cli.command {
-        Commands::Servers => crate::commands::cmd_servers(cli.host).await?,
-        Commands::Browse { server, flat } => {
-            crate::commands::cmd_browse(cli.host, server, flat).await?
+        Commands::Servers => crate::commands::cmd_servers(host).await?,
+        Commands::Browse {
+            server,
+            flat,
+            max_tags,
+        } => {
+            let server = crate::config::resolve_server(server, &config)?;
+            let max_tags = crate::config::resolve_max_tags(max_tags, &config);
+            crate::commands::cmd_browse(host, server, flat, max_tags).await?
         }
         Commands::Read { server, tags } => {
-            crate::commands::cmd_read(cli.host, server, tags).await?
+            let server = crate::config::resolve_server(server, &config)?;
+            crate::commands::cmd_read(host, server, tags).await?
         }
         Commands::Write { server, tag, value } => {
-            crate::commands::cmd_write(cli.host, server, tag, value).await?
+            let server = crate::config::resolve_server(server, &config)?;
+            crate::commands::cmd_write(host, server, tag, value).await?
         }
     }
     Ok(())
@@ -76,7 +95,8 @@ mod tests {
     async fn test_run_command_servers() {
         let host = start_mock_server(MockBridgeService::default()).await;
         let cli = Cli {
-            host,
+            host: Some(host),
+            config: None,
             command: Commands::Servers,
         };
         run_command(cli).await.unwrap();
@@ -86,22 +106,41 @@ mod tests {
     async fn test_run_command_browse() {
         let host = start_mock_server(MockBridgeService::default()).await;
         let cli = Cli {
-            host,
+            host: Some(host),
+            config: None,
             command: Commands::Browse {
-                server: "S".into(),
+                server: Some("S".into()),
                 flat: false,
+                max_tags: None,
             },
         };
         run_command(cli).await.unwrap();
     }
 
     #[tokio::test]
+    async fn test_run_command_browse_no_server_errors() {
+        let host = start_mock_server(MockBridgeService::default()).await;
+        let cli = Cli {
+            host: Some(host),
+            config: None,
+            command: Commands::Browse {
+                server: None,
+                flat: false,
+                max_tags: None,
+            },
+        };
+        let err = run_command(cli).await.unwrap_err();
+        assert!(err.to_string().contains("no OPC server specified"));
+    }
+
+    #[tokio::test]
     async fn test_run_command_read() {
         let host = start_mock_server(MockBridgeService::default()).await;
         let cli = Cli {
-            host,
+            host: Some(host),
+            config: None,
             command: Commands::Read {
-                server: "S".into(),
+                server: Some("S".into()),
                 tags: vec![],
             },
         };
@@ -120,9 +159,10 @@ mod tests {
         })
         .await;
         let cli = Cli {
-            host,
+            host: Some(host),
+            config: None,
             command: Commands::Write {
-                server: "S".into(),
+                server: Some("S".into()),
                 tag: "t".into(),
                 value: "hello".into(),
             },
@@ -169,7 +209,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
-        assert_eq!(args.host, "localhost:7600");
+        assert_eq!(args.host, None);
     }
 
     #[test]
@@ -185,7 +225,14 @@ mod tests {
     fn test_cli_custom_host() {
         let args =
             Cli::try_parse_from(["opcda-bridge", "--host", "192.168.1.1:9999", "servers"]).unwrap();
-        assert_eq!(args.host, "192.168.1.1:9999");
+        assert_eq!(args.host, Some("192.168.1.1:9999".to_string()));
+    }
+
+    #[test]
+    fn test_cli_config_flag() {
+        let args =
+            Cli::try_parse_from(["opcda-bridge", "--config", "custom.toml", "servers"]).unwrap();
+        assert_eq!(args.config, Some(PathBuf::from("custom.toml")));
     }
 
     #[test]
@@ -201,7 +248,7 @@ mod tests {
                 .unwrap();
         assert!(matches!(
             args.command,
-            Commands::Browse { ref server, flat } if server == "MyServer" && flat
+            Commands::Browse { ref server, flat, .. } if server.as_deref() == Some("MyServer") && flat
         ));
     }
 
@@ -210,7 +257,36 @@ mod tests {
         let args = Cli::try_parse_from(["opcda-bridge", "browse", "--server", "MyServer"]).unwrap();
         assert!(matches!(
             args.command,
-            Commands::Browse { ref server, flat: false } if server == "MyServer"
+            Commands::Browse { ref server, flat: false, .. } if server.as_deref() == Some("MyServer")
+        ));
+    }
+
+    #[test]
+    fn test_cli_browse_no_server() {
+        let args = Cli::try_parse_from(["opcda-bridge", "browse"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Commands::Browse { server: None, .. }
+        ));
+    }
+
+    #[test]
+    fn test_cli_browse_max_tags() {
+        let args = Cli::try_parse_from([
+            "opcda-bridge",
+            "browse",
+            "--server",
+            "MyServer",
+            "--max-tags",
+            "50",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Commands::Browse {
+                max_tags: Some(50),
+                ..
+            }
         ));
     }
 
@@ -229,7 +305,7 @@ mod tests {
         assert!(matches!(
             args.command,
             Commands::Read { ref server, ref tags }
-                if server == "MyServer"
+                if server.as_deref() == Some("MyServer")
                     && tags == &vec!["tag1".to_string(), "tag2".to_string(), "tag3".to_string()]
         ));
     }
@@ -239,7 +315,7 @@ mod tests {
         let args = Cli::try_parse_from(["opcda-bridge", "read", "--server", "MyServer"]).unwrap();
         assert!(matches!(
             args.command,
-            Commands::Read { ref server, ref tags } if server == "MyServer" && tags.is_empty()
+            Commands::Read { ref server, ref tags } if server.as_deref() == Some("MyServer") && tags.is_empty()
         ));
     }
 
@@ -257,7 +333,7 @@ mod tests {
         assert!(matches!(
             args.command,
             Commands::Write { ref server, ref tag, ref value }
-                if server == "MyServer" && tag == "Tag1" && value == "42"
+                if server.as_deref() == Some("MyServer") && tag == "Tag1" && value == "42"
         ));
     }
 
@@ -266,7 +342,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
-        assert_eq!(args.host, "envhost:8888");
+        assert_eq!(args.host, Some("envhost:8888".to_string()));
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
     }
 
@@ -276,7 +352,7 @@ mod tests {
         unsafe { std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888") };
         let args =
             Cli::try_parse_from(["opcda-bridge", "--host", "arghost:7777", "servers"]).unwrap();
-        assert_eq!(args.host, "arghost:7777");
+        assert_eq!(args.host, Some("arghost:7777".to_string()));
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
     }
 }

@@ -1,0 +1,16 @@
+# Example configuration for opcda-bridge-gateway.
+#
+# Copy this file to "opcda-bridge-gateway.toml" next to the gateway
+# executable (or pass a path explicitly with --config) to have it picked
+# up automatically. Every key is optional — anything left out (or the
+# whole file, if it doesn't exist) falls back to its environment variable
+# or built-in default.
+#
+# Precedence for every setting: CLI flag > environment variable > config
+# file > built-in default.
+
+# Port the gateway listens on.
+# CLI flag: --port
+# Env var: OPC_BRIDGE_PORT
+# Default: 7600
+port = 7600

@@ -70,9 +70,9 @@ On the Windows machine running the OPC DA server:
 opcda-bridge-gateway.exe
 ```
 
-It listens on all interfaces on port `7600` by default — override with the `OPC_BRIDGE_PORT`
-environment variable. If the client will connect from another machine, open that port in the
-Windows Firewall.
+It listens on all interfaces on port `7600` by default — override with `--port`, the
+`OPC_BRIDGE_PORT` environment variable, or a config file (see [Configuration](#configuration)
+below). If the client will connect from another machine, open that port in the Windows Firewall.
 
 Press `Ctrl+C` (or close the console window) to stop it — the gateway finishes any in-flight
 requests before exiting rather than dropping them mid-response.
@@ -80,13 +80,15 @@ requests before exiting rather than dropping them mid-response.
 ### 2. Run client commands
 
 Point the client at the gateway with `--host <address:port>` (or set `OPC_BRIDGE_HOST`; both
-default to `localhost:7600`):
+default to `localhost:7600`). A default OPC DA server and other settings can also come from a
+config file — see [Configuration](#configuration) below.
 
 - List the OPC DA servers registered on the gateway's host:
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 servers
   ```
-- Browse a server's tag tree (add `--flat` for a flat tag list instead of the tree):
+- Browse a server's tag tree (add `--flat` for a flat tag list instead of the tree, and
+  `--max-tags` to cap how many are streamed back — default 1000):
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5
   ```
@@ -101,6 +103,48 @@ default to `localhost:7600`):
 
 Every command prints its result as a table. Run `opcda-bridge-client --help` or
 `opcda-bridge-client <command> --help` for the full flag reference.
+
+## Configuration
+
+Both binaries accept a `--config <path>` flag pointing at a TOML file. Every setting resolves
+with the same precedence, highest first:
+
+**CLI flag > environment variable > config file > built-in default**
+
+A config file (or an individual key within it) is entirely optional — anything not set falls
+back through the rest of the chain. If `--config` is omitted, each binary looks for a config
+file in a default location; a missing file there is not an error, since it may simply not have
+been created yet. A file that _does_ exist but fails to parse as TOML is always a hard error,
+pointing at the file and the parse problem.
+
+### Gateway
+
+Looks for `opcda-bridge-gateway.toml` next to the executable unless `--config` gives another
+path. See [`gateway/opcda-bridge-gateway.example.toml`](gateway/opcda-bridge-gateway.example.toml)
+for every available key.
+
+| Setting     | CLI flag | Env var           | Config key | Default |
+| ----------- | -------- | ----------------- | ---------- | ------- |
+| Listen port | `--port` | `OPC_BRIDGE_PORT` | `port`     | `7600`  |
+
+### Client
+
+Looks for a config file in a platform-specific location unless `--config` gives another path:
+
+- Linux/macOS: `$XDG_CONFIG_HOME/opcda-bridge/client.toml`, falling back to
+  `$HOME/.config/opcda-bridge/client.toml`.
+- Windows: `%APPDATA%\opcda-bridge\client.toml`.
+
+See [`client/client.example.toml`](client/client.example.toml) for every available key.
+
+| Setting               | CLI flag     | Env var           | Config key | Default                               |
+| --------------------- | ------------ | ----------------- | ---------- | ------------------------------------- |
+| Gateway address       | `--host`     | `OPC_BRIDGE_HOST` | `host`     | `localhost:7600`                      |
+| Default OPC DA server | `--server`   | —                 | `server`   | none — must be set one way or another |
+| Browse tag cap        | `--max-tags` | —                 | `max_tags` | `1000`                                |
+
+`server` has no built-in default: if it is left unset by every source, `browse`/`read`/`write`
+fail with an error rather than guessing a server.
 
 ## Architecture
 

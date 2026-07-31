@@ -22,9 +22,15 @@ anyhow = "1"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 opc-da-client = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [package.metadata.cargo-machete]
 ignored = ["tonic-prost"]

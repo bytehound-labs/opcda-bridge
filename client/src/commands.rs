@@ -30,14 +30,19 @@ struct TagRow {
     node_type: String,
 }
 
-pub async fn cmd_browse(host: String, server: String, flat: bool) -> anyhow::Result<()> {
+pub async fn cmd_browse(
+    host: String,
+    server: String,
+    flat: bool,
+    max_tags: u32,
+) -> anyhow::Result<()> {
     let mut client = BridgeClient::connect(format!("http://{host}")).await?;
     let mut stream = client
         .browse(BrowseRequest {
             server,
             flat,
             path: String::new(),
-            max_tags: 1000,
+            max_tags,
         })
         .await?
         .into_inner();
@@ -185,7 +190,9 @@ mod tests {
     async fn test_cmd_browse_empty() {
         let svc = MockBridgeService::default();
         let host = start_mock_server(svc).await;
-        cmd_browse(host, "TestServer".into(), false).await.unwrap();
+        cmd_browse(host, "TestServer".into(), false, 1000)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -204,7 +211,9 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_browse(host, "TestServer".into(), true).await.unwrap();
+        cmd_browse(host, "TestServer".into(), true, 1000)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
