@@ -22,10 +22,6 @@ pub struct BridgeService<C> {
 }
 
 impl<C: OpcClient> BridgeService<C> {
-    // Only called by the Windows-only `Default` impl below (and by tests); on a
-    // non-Windows, non-test build neither call site is compiled, so this looks
-    // unused to clippy even though it's the primary way to construct the type.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn new(client: C) -> Self {
         Self { client }
     }

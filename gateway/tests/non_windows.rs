@@ -1,7 +1,8 @@
+#![cfg(not(target_os = "windows"))]
+
 use std::process::Command;
 
 #[test]
-#[cfg(not(target_os = "windows"))]
 fn test_non_windows_exit() {
     let test_exe = std::env::current_exe().unwrap();
     let target_dir = test_exe.parent().unwrap().parent().unwrap();
