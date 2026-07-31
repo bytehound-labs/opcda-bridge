@@ -69,7 +69,7 @@ the `OpcClient` trait use a mock implementation so they run on all platforms.
 ### Coverage enforcement
 
 Coverage is tracked by Codecov and enforced at **100%** via `codecov.yml` (project and patch
-targets both at 100% with 0% threshold). CI fails if coverage drops. All code — including error
+targets both at 100% with a 1% threshold). CI fails if coverage drops. All code — including error
 branches, edge cases, and default values — must be tested. When adding new code, add
 corresponding tests in the same PR to maintain 100% coverage.
 
@@ -78,5 +78,9 @@ corresponding tests in the same PR to maintain 100% coverage.
 The gateway binary (`opcda-bridge-gateway`) depends on `opc-da-client` only on Windows
 (`#[cfg(target_os = "windows")]`). To keep the gateway's core logic testable on all platforms,
 an `OpcClient` trait (in `gateway/src/opc.rs`) abstracts OPC DA operations. The concrete
-adapter (`opc_da_adapter.rs`) wraps `opc_da_client::OpcDaWrapper` and is Windows-only. Server
-tests use `MockOpcClient` (defined in the test module) to exercise all RPC handler paths.
+adapter (`opc_da_adapter.rs`) wraps `opc_da_client::OpcDaWrapper` and is Windows-only. The run
+loop (`gateway/src/run.rs`) that serves the gRPC service and drains it on shutdown is generic
+over `OpcClient` too, so it runs under tests on any platform even though the gateway only ships
+for Windows. Both `server`'s and `run`'s tests share one `MockOpcClient`
+(`gateway/src/test_support.rs`) to exercise all RPC handler and shutdown paths without touching
+COM.

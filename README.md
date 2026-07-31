@@ -74,6 +74,9 @@ It listens on all interfaces on port `7600` by default — override with the `OP
 environment variable. If the client will connect from another machine, open that port in the
 Windows Firewall.
 
+Press `Ctrl+C` (or close the console window) to stop it — the gateway finishes any in-flight
+requests before exiting rather than dropping them mid-response.
+
 ### 2. Run client commands
 
 Point the client at the gateway with `--host <address:port>` (or set `OPC_BRIDGE_HOST`; both
