@@ -17,6 +17,22 @@ pub struct Cli {
     /// Port to listen on (default: 7600)
     #[arg(long, env = "OPC_BRIDGE_PORT")]
     pub port: Option<u16>,
+
+    /// Log level / directive spec, e.g. "info" or "opcda_bridge_gateway=debug,tower=warn" (default: info)
+    #[arg(long, env = "RUST_LOG")]
+    pub log_level: Option<String>,
+
+    /// Directory to write log files to (default: a "logs" directory next to the executable)
+    #[arg(long, value_name = "PATH")]
+    pub log_dir: Option<PathBuf>,
+
+    /// Log output format: "pretty" or "json" (default: pretty)
+    #[arg(long)]
+    pub log_format: Option<String>,
+
+    /// Log file rotation: "hourly", "daily", or "never" (default: daily)
+    #[arg(long)]
+    pub log_rotation: Option<String>,
 }
 
 /// Gateway configuration loaded from an optional TOML file. Every field is
@@ -230,6 +246,30 @@ mod tests {
         let cli = Cli::try_parse_from(["opcda-bridge-gateway"]).unwrap();
         assert_eq!(cli.config, None);
         assert_eq!(cli.port, None);
+        assert_eq!(cli.log_level, None);
+        assert_eq!(cli.log_dir, None);
+        assert_eq!(cli.log_format, None);
+        assert_eq!(cli.log_rotation, None);
+    }
+
+    #[test]
+    fn test_cli_parses_log_flags() {
+        let cli = Cli::try_parse_from([
+            "opcda-bridge-gateway",
+            "--log-level",
+            "debug",
+            "--log-dir",
+            "/tmp/logs",
+            "--log-format",
+            "json",
+            "--log-rotation",
+            "hourly",
+        ])
+        .unwrap();
+        assert_eq!(cli.log_level, Some("debug".to_string()));
+        assert_eq!(cli.log_dir, Some(PathBuf::from("/tmp/logs")));
+        assert_eq!(cli.log_format, Some("json".to_string()));
+        assert_eq!(cli.log_rotation, Some("hourly".to_string()));
     }
 
     #[test]

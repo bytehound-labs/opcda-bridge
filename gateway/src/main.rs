@@ -2,29 +2,31 @@
 use opcda_bridge_gateway::server;
 
 #[cfg(target_os = "windows")]
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-}
-
-#[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
     use clap::Parser;
     use opc_da_client::ComGuard;
     use opcda_bridge_gateway::config::{self, Cli};
+    use opcda_bridge_gateway::logging;
     use opcda_bridge_gateway::run;
     use std::net::SocketAddr;
-
-    init_tracing();
 
     let cli = Cli::parse();
     let config = config::load_config(cli.config.as_deref())?;
     let port = config::resolve_port(cli.port, &config);
+
+    let exe = std::env::current_exe().expect("failed to resolve current executable path");
+    let default_log_dir = logging::log_dir_from_exe(&exe);
+    let log_settings = logging::resolve_log_settings(
+        cli.log_level,
+        cli.log_dir,
+        cli.log_format,
+        cli.log_rotation,
+        &config.log,
+        &default_log_dir,
+    );
+    // Hold the guard for the process lifetime: dropping it early would
+    // silently truncate buffered log lines that haven't yet been flushed.
+    let _log_guard = logging::init_tracing(&log_settings)?;
 
     let _guard = ComGuard::new().expect("COM initialization failed");
     Box::leak(Box::new(_guard));

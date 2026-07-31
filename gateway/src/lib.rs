@@ -1,4 +1,5 @@
 pub mod config;
+pub mod logging;
 pub mod opc;
 pub mod run;
 pub mod server;
