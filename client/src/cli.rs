@@ -62,114 +62,19 @@ pub async fn run_command(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridge_proto::bridge::bridge_server::{Bridge, BridgeServer};
-    use bridge_proto::bridge::{
-        BrowseRequest, BrowseResponse, ListServersRequest, ListServersResponse, ReadRequest,
-        ReadResponse, WriteRequest, WriteResponse,
-    };
+    use crate::test_support::{MockBridgeService, start_mock_server};
+    use bridge_proto::bridge::{BrowseResponse, WriteResponse};
     use clap::Parser;
-    use std::net::SocketAddr;
     use std::sync::Mutex;
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-    use tonic::transport::Server;
-    use tonic::{Request, Response, Status};
 
     // std::env::set_var/remove_var mutate process-global state, but `cargo
     // test` runs tests in parallel threads by default, so the tests below
     // that touch OPC_BRIDGE_HOST race with each other unless serialized.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    struct MockBridgeService {
-        response: MockResponse,
-    }
-
-    enum MockResponse {
-        ListServers(ListServersResponse),
-        BrowseResponses(Vec<BrowseResponse>),
-        Read(ReadResponse),
-        Write(WriteResponse),
-    }
-
-    #[tonic::async_trait]
-    impl Bridge for MockBridgeService {
-        async fn list_servers(
-            &self,
-            _request: Request<ListServersRequest>,
-        ) -> Result<Response<ListServersResponse>, Status> {
-            match &self.response {
-                MockResponse::ListServers(r) => Ok(Response::new(r.clone())),
-                _ => Ok(Response::new(ListServersResponse { servers: vec![] })),
-            }
-        }
-
-        type BrowseStream = ReceiverStream<Result<BrowseResponse, Status>>;
-
-        async fn browse(
-            &self,
-            _request: Request<BrowseRequest>,
-        ) -> Result<Response<Self::BrowseStream>, Status> {
-            let items = match &self.response {
-                MockResponse::BrowseResponses(r) => r.clone(),
-                _ => vec![],
-            };
-            let (tx, rx) = mpsc::channel(4);
-            tokio::spawn(async move {
-                for item in items {
-                    if tx.send(Ok(item)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            Ok(Response::new(ReceiverStream::new(rx)))
-        }
-
-        async fn read(
-            &self,
-            _request: Request<ReadRequest>,
-        ) -> Result<Response<ReadResponse>, Status> {
-            match &self.response {
-                MockResponse::Read(r) => Ok(Response::new(r.clone())),
-                _ => Ok(Response::new(ReadResponse { values: vec![] })),
-            }
-        }
-
-        async fn write(
-            &self,
-            _request: Request<WriteRequest>,
-        ) -> Result<Response<WriteResponse>, Status> {
-            match &self.response {
-                MockResponse::Write(r) => Ok(Response::new(r.clone())),
-                _ => Ok(Response::new(WriteResponse {
-                    tag_id: String::new(),
-                    success: true,
-                    error: None,
-                })),
-            }
-        }
-    }
-
-    async fn start_mock_server(response: MockResponse) -> String {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let svc = MockBridgeService { response };
-        tokio::spawn(async move {
-            Server::builder()
-                .add_service(BridgeServer::new(svc))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-        format!("127.0.0.1:{port}")
-    }
-
     #[tokio::test]
     async fn test_run_command_servers() {
-        let host = start_mock_server(MockResponse::ListServers(ListServersResponse {
-            servers: vec![],
-        }))
-        .await;
+        let host = start_mock_server(MockBridgeService::default()).await;
         let cli = Cli {
             host,
             command: Commands::Servers,
@@ -179,7 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_command_browse() {
-        let host = start_mock_server(MockResponse::BrowseResponses(vec![])).await;
+        let host = start_mock_server(MockBridgeService::default()).await;
         let cli = Cli {
             host,
             command: Commands::Browse {
@@ -192,7 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_command_read() {
-        let host = start_mock_server(MockResponse::Read(ReadResponse { values: vec![] })).await;
+        let host = start_mock_server(MockBridgeService::default()).await;
         let cli = Cli {
             host,
             command: Commands::Read {
@@ -205,11 +110,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_command_write() {
-        let host = start_mock_server(MockResponse::Write(WriteResponse {
-            tag_id: "t".into(),
-            success: true,
-            error: None,
-        }))
+        let host = start_mock_server(MockBridgeService {
+            write_response: WriteResponse {
+                tag_id: "t".into(),
+                success: true,
+                error: None,
+            },
+            ..Default::default()
+        })
         .await;
         let cli = Cli {
             host,
@@ -226,14 +134,15 @@ mod tests {
     async fn test_browse_drop_triggers_break() {
         use bridge_proto::bridge::BrowseRequest;
         use bridge_proto::bridge::bridge_client::BridgeClient;
-        let host = start_mock_server(MockResponse::BrowseResponses(
-            (0..300)
+        let host = start_mock_server(MockBridgeService {
+            browse_responses: (0..300)
                 .map(|i| BrowseResponse {
                     tag_id: format!("tag{i}"),
                     node_type: "Leaf".into(),
                 })
                 .collect(),
-        ))
+            ..Default::default()
+        })
         .await;
         let mut client = BridgeClient::connect(format!("http://{host}"))
             .await
