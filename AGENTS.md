@@ -84,3 +84,20 @@ over `OpcClient` too, so it runs under tests on any platform even though the gat
 for Windows. Both `server`'s and `run`'s tests share one `MockOpcClient`
 (`gateway/src/test_support.rs`) to exercise all RPC handler and shutdown paths without touching
 COM.
+
+### Config file precedence
+
+Both binaries resolve every configurable setting with **CLI flag > environment variable >
+config file > built-in default** precedence (`gateway/src/config.rs`, `client/src/config.rs`).
+To keep this composable while satisfying the 100% coverage gate:
+
+- Path discovery (`config_path_from_exe` / `config_path_from`) is a pure function taking
+  environment values as explicit arguments rather than reading `std::env` inline, so every
+  permutation is testable without the `ENV_MUTEX` dance.
+- `load_config_file(path, missing_is_error)` takes an explicit bool rather than inferring intent:
+  an auto-discovered path silently falls back to defaults when absent (`missing_is_error =
+false`), but an explicit `--config` path is a hard error if missing (`true`). Malformed TOML is
+  always a hard error regardless.
+- To layer a config file _underneath_ clap's own `CLI > env` resolution, config-backed fields
+  drop their clap `default_value` and become `Option<T>`; a `.or(config_value).unwrap_or(default)`
+  chain is applied once after parsing.

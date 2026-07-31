@@ -14,19 +14,20 @@ fn init_tracing() {
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
+    use clap::Parser;
     use opc_da_client::ComGuard;
+    use opcda_bridge_gateway::config::{self, Cli};
     use opcda_bridge_gateway::run;
     use std::net::SocketAddr;
 
     init_tracing();
 
+    let cli = Cli::parse();
+    let config = config::load_config(cli.config.as_deref())?;
+    let port = config::resolve_port(cli.port, &config);
+
     let _guard = ComGuard::new().expect("COM initialization failed");
     Box::leak(Box::new(_guard));
-
-    let port: u16 = std::env::var("OPC_BRIDGE_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(opcda_bridge::DEFAULT_BRIDGE_PORT);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let bridge = server::BridgeService::default();
