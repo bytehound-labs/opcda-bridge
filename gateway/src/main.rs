@@ -1,6 +1,4 @@
 #[cfg(target_os = "windows")]
-use opcda_bridge_gateway::opc_da_adapter;
-#[cfg(target_os = "windows")]
 use opcda_bridge_gateway::server;
 
 #[cfg(target_os = "windows")]
