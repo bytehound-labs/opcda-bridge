@@ -101,3 +101,25 @@ false`), but an explicit `--config` path is a hard error if missing (`true`). Ma
 - To layer a config file _underneath_ clap's own `CLI > env` resolution, config-backed fields
   drop their clap `default_value` and become `Option<T>`; a `.or(config_value).unwrap_or(default)`
   chain is applied once after parsing.
+
+### Logging
+
+`gateway/src/logging.rs` builds a layered `tracing-subscriber` registry: a non-blocking rolling
+file writer (`tracing-appender`) is always on, and a stdout layer is added only when
+`std::io::stdout().is_terminal()` — a Windows service has no console, so the file layer must never
+depend on one being present. The `WorkerGuard` returned by `tracing_appender::non_blocking` must
+be held for the process lifetime (a local binding in `main()` that lives until the function
+returns is enough); dropping it early silently truncates buffered log lines on exit. Settings
+resolve through the same CLI > env > config > default precedence as the rest of the config
+surface, with `RUST_LOG` folded into `--log-level` via clap's `env` attribute exactly like
+`--port`/`OPC_BRIDGE_PORT`.
+
+`init_tracing` installs a process-global subscriber, and `try_init()` can only succeed once per
+process — `cargo test` runs every unit test in a crate in one shared process, so which test
+"wins" that single real installation is not deterministic. To stay testable under the 100%
+coverage gate anyway, `init_tracing` is a thin wrapper around
+`init_tracing_with_stdout(settings, attach_stdout: bool)`: "is a console attached" becomes an
+explicit, injectable parameter instead of being read inline. Tests drive every layer-construction
+branch (JSON vs. pretty format, stdout attached vs. detached) directly through that `bool` and
+deliberately never assert whether `try_init()` returned `Ok` or `Err` — only that the code path
+leading up to it runs.

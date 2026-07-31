@@ -127,6 +127,8 @@ for every available key.
 | ----------- | -------- | ----------------- | ---------- | ------- |
 | Listen port | `--port` | `OPC_BRIDGE_PORT` | `port`     | `7600`  |
 
+Logging settings (`log.*`) are also read from this file — see [Logging](#logging) below.
+
 ### Client
 
 Looks for a config file in a platform-specific location unless `--config` gives another path:
@@ -145,6 +147,28 @@ See [`client/client.example.toml`](client/client.example.toml) for every availab
 
 `server` has no built-in default: if it is left unset by every source, `browse`/`read`/`write`
 fail with an error rather than guessing a server.
+
+## Logging
+
+The gateway writes structured logs to a rolling file next to its executable — by default
+`logs/opcda-bridge-gateway.log.<date>` — through a non-blocking writer, so logging never adds
+latency to request handling. When a console is attached (running interactively, as opposed to
+under a background/service process), the same log lines are also printed to stdout.
+
+| Setting      | CLI flag         | Env var    | Config key     | Default                       |
+| ------------ | ---------------- | ---------- | -------------- | ----------------------------- |
+| Level/filter | `--log-level`    | `RUST_LOG` | `log.level`    | `info`                        |
+| Directory    | `--log-dir`      | —          | `log.dir`      | `logs` next to the executable |
+| Format       | `--log-format`   | —          | `log.format`   | `pretty`                      |
+| Rotation     | `--log-rotation` | —          | `log.rotation` | `daily`                       |
+
+- **Level/filter** accepts a single level (`error`, `warn`, `info`, `debug`, `trace`) or a full
+  [`tracing_subscriber::EnvFilter`](https://docs.rs/tracing-subscriber) directive spec, e.g.
+  `opcda_bridge_gateway=debug,tower=warn`. An invalid value falls back to `info` rather than
+  preventing the gateway from starting.
+- **Format** is `pretty` (human-readable text) or `json` (one JSON object per line, for log
+  shippers such as Fluent Bit or Vector).
+- **Rotation** is `hourly`, `daily`, or `never` (a single file that grows indefinitely).
 
 ## Architecture
 

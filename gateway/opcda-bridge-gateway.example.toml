@@ -14,3 +14,27 @@
 # Env var: OPC_BRIDGE_PORT
 # Default: 7600
 port = 7600
+
+[log]
+# Log level, or a full tracing directive spec (e.g.
+# "opcda_bridge_gateway=debug,tower=warn").
+# CLI flag: --log-level
+# Env var: RUST_LOG
+# Default: info
+level = "info"
+
+# Directory log files are written to.
+# CLI flag: --log-dir
+# Default: a "logs" directory next to the executable
+dir = "logs"
+
+# Log output format: "pretty" (human-readable) or "json" (one JSON object
+# per line, for log shippers).
+# CLI flag: --log-format
+# Default: pretty
+format = "pretty"
+
+# Log file rotation: "hourly", "daily", or "never".
+# CLI flag: --log-rotation
+# Default: daily
+rotation = "daily"
