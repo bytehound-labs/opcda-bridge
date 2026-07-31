@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-gateway-v0.1.1...opcda-bridge-gateway-v0.1.2) - 2026-07-31
+
+### Added
+
+- add TOML config file support to gateway and client ([#6](https://github.com/mikeboiko/opcda-bridge/pull/6))
+
 ## [0.1.1](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-gateway-v0.1.0...opcda-bridge-gateway-v0.1.1) - 2026-07-31
 
 ### Other
