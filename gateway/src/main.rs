@@ -1,8 +1,7 @@
-mod opc;
-mod server;
-
 #[cfg(target_os = "windows")]
-mod opc_da_adapter;
+use opcda_bridge_gateway::opc_da_adapter;
+#[cfg(target_os = "windows")]
+use opcda_bridge_gateway::server;
 
 #[cfg(target_os = "windows")]
 fn init_tracing() {
@@ -50,6 +49,5 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
-    eprintln!("opcda-bridge gateway requires Windows (COM/DCOM dependency)");
-    std::process::exit(1);
+    opcda_bridge_gateway::non_windows_run();
 }

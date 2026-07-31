@@ -25,3 +25,7 @@ tags.*
 .env
 .env.*
 !.env.example
+
+# Generated coverage reports
+lcov.info
+*.profraw

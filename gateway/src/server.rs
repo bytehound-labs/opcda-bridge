@@ -905,4 +905,41 @@ mod tests {
         assert!(!wr.success);
         assert_eq!(wr.error, Some("access denied".into()));
     }
+
+    #[test]
+    fn test_mock_opc_client_default() {
+        let mock = MockOpcClient::default();
+        let result = mock.list_servers_result.lock().unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_browse_stream_break_on_drop() {
+        let many_tags: Vec<String> = (0..200).map(|i| format!("tag{i}")).collect();
+        let svc = new_bridge_service(
+            Ok(vec![]),
+            Ok(many_tags),
+            Ok(vec![]),
+            Ok(WriteResult {
+                tag_id: String::new(),
+                success: true,
+                error: None,
+            }),
+        );
+        let response = svc
+            .browse(Request::new(BrowseRequest {
+                server: "TS".into(),
+                flat: false,
+                path: String::new(),
+                max_tags: 0,
+            }))
+            .await
+            .unwrap();
+        use tokio_stream::StreamExt;
+        let mut stream = response.into_inner();
+        let _first = stream.next().await;
+        drop(stream);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+    }
 }
