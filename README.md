@@ -5,11 +5,11 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 
-A lightweight Rust gateway bridging classic OPC DA (Windows/COM) servers to remote Linux/macOS clients.
+A lightweight Rust gateway bridging classic OPC DA (Windows/COM) servers to remote Linux/macOS/Windows clients.
 
 ## Status
 
-Active development. Gateway and client are functional end-to-end — OPC DA read/write/browse passing against a live Kepware server. See the [roadmap](#) for upcoming features.
+Active development. Gateway and client are functional end-to-end — OPC DA read/write/browse passing against a live Kepware server.
 
 ## Why
 
