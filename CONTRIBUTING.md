@@ -1,6 +1,6 @@
 # Contributing to opcda-bridge
 
-The project is in early planning, but the practices below apply from the first commit onward.
+opcda-bridge is under active development. The practices below apply to all contributions.
 
 ## Development workflow: trunk-based
 
@@ -11,7 +11,7 @@ The project is in early planning, but the practices below apply from the first c
 - PRs are squash-merged, so the squash commit message (not the intermediate commits) must follow
   the commit convention below.
 - No `develop` branch and no long-lived `release` branches. Releases are tagged directly off
-  `main` (`vX.Y.Z`, [SemVer](https://semver.org/)).
+  `main` (`<component>-vX.Y.Z`, [SemVer](https://semver.org/)).
 - Incomplete or experimental work that must land before it's fully ready goes behind a Cargo
   feature flag rather than sitting unmerged on a branch.
 - Trivial fixes (typos, doc tweaks) may be pushed directly to `main`; everything else goes
@@ -26,26 +26,27 @@ Example: `feat(gateway): add tag subscription support`.
 
 ## Code style
 
-- Format with `cargo fmt` (default rustfmt settings) before committing.
-- Lint with `cargo clippy --all-targets --all-features -- -D warnings`; fix every warning or
-  justify an explicit `#[allow(...)]` with a comment.
+- Format with `cargo fmt --all` (default rustfmt settings) before committing.
+- Lint with `cargo clippy --workspace --all-targets --all-features -- -D warnings`; fix every
+  warning or justify an explicit `#[allow(...)]` with a comment.
 - Both are enforced automatically by a [lefthook](https://github.com/evilmartians/lefthook)
   `pre-commit` hook (`.lefthook.yml`), which also formats `Cargo.toml`/TOML with `taplo` and
   Markdown/YAML/JSON with `prettier`. Run `lefthook install` once after cloning to enable it.
 
 ## Testing
 
-- Unit-test protocol/parsing logic with plain `cargo test` — no hardware required.
-- Mock the OPC DA backend (e.g. via `opc-da-client`'s `mockall`-based `test-support` feature) for
-  anything that would otherwise need a live COM connection, so the suite runs on any OS/CI.
+- Unit-test protocol/parsing logic with `cargo test --workspace` — no hardware required.
+- The gateway depends on `opc-da-client` only on Windows (`#[cfg(target_os = "windows")]`). Its
+  core logic is abstracted behind an `OpcClient` trait (`gateway/src/opc.rs`) so it stays testable
+  on any OS: tests exercise a hand-written `MockOpcClient` instead of a live COM connection.
 - Hardware-in-the-loop tests (against a real Windows host + OPC DA server) aren't part of CI;
   note manual verification steps in the PR description when a change needs them.
 
 ## CI
 
-PRs must pass `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` before merge.
-The gateway crate is Windows-only (COM); the client crate should build and test on Linux, macOS,
-and Windows.
+PRs must pass `cargo fmt --check --all`, `cargo clippy --workspace --all-targets --all-features
+-- -D warnings`, and `cargo test --workspace` before merge. The gateway crate is Windows-only
+(COM); the client crate should build and test on Linux, macOS, and Windows.
 
 ## Pull requests
 
@@ -55,7 +56,8 @@ and Windows.
 
 ## Releases
 
-SemVer tags (`vX.Y.Z`) cut directly from `main`. No release branches.
+SemVer tags (`<component>-vX.Y.Z`) cut directly from `main`, one release per workspace crate
+(`bridge-proto`, `opcda-bridge-gateway`, `opcda-bridge-client`). No release branches.
 
 ## License
 

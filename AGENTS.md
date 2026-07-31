@@ -59,7 +59,8 @@ target for early gateway development.
 
 - **Build**: `cargo build`
 - **Test**: `cargo test --workspace`
-- **Lint**: `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`
+- **Lint**: `cargo fmt --check --all` and
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - **Coverage**: `cargo llvm-cov --workspace --lcov`
 
 The gateway crate is Windows-only (COM); the client crate is cross-platform. Tests that require
