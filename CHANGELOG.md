@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-v0.1.3...opcda-bridge-v0.1.4) - 2026-08-01
+
+### Added
+
+- real hierarchical tag browsing (gateway + client) ([#10](https://github.com/mikeboiko/opcda-bridge/pull/10))
+
 ## [0.1.3](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-v0.1.2...opcda-bridge-v0.1.3) - 2026-07-31
 
 ### Added
