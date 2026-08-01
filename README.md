@@ -87,10 +87,13 @@ config file — see [Configuration](#configuration) below.
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 servers
   ```
-- Browse a server's tag tree (add `--flat` for a flat tag list instead of the tree, and
-  `--max-tags` to cap how many are streamed back — default 1000):
+- Browse a server's tags. Default output is one level of the tag tree, rooted at `--path`
+  (the top level if omitted); `Branch` entries are suffixed `/` — pass one back in as `--path` to
+  drill down a level further. Add `--flat` for a flat list of every tag instead, and `--max-tags`
+  to cap how many are streamed back (default 1000):
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5
+  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 --path Simulink.Device1
   ```
 - Read one or more tag values:
   ```sh
@@ -101,8 +104,9 @@ config file — see [Configuration](#configuration) below.
   opcda-bridge-client --host 192.168.1.50:7600 write --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D 42
   ```
 
-Every command prints its result as a table. Run `opcda-bridge-client --help` or
-`opcda-bridge-client <command> --help` for the full flag reference.
+Every command prints its result as a table, except `browse` in its default tree mode, which
+prints an indented tree instead (pass `--flat` for the tabular form). Run
+`opcda-bridge-client --help` or `opcda-bridge-client <command> --help` for the full flag reference.
 
 ## Configuration
 

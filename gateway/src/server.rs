@@ -16,6 +16,28 @@ fn internal(e: impl std::fmt::Display) -> Status {
 }
 
 const NODE_TYPE_LEAF: &str = "Leaf";
+const NODE_TYPE_BRANCH: &str = "Branch";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeType {
+    Branch,
+    Leaf,
+}
+
+impl NodeType {
+    fn as_str(self) -> &'static str {
+        match self {
+            NodeType::Branch => NODE_TYPE_BRANCH,
+            NodeType::Leaf => NODE_TYPE_LEAF,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowseNode {
+    tag_id: String,
+    node_type: NodeType,
+}
 
 pub struct BridgeService<C> {
     client: C,
@@ -46,19 +68,96 @@ fn effective_max_tags(max_tags: u32) -> usize {
     }
 }
 
-fn select_tags(
+fn select_browse_nodes(
     flat: bool,
+    path: &str,
     discovered: Vec<String>,
     tags_sink: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-) -> Result<Vec<String>, Status> {
+) -> Result<Vec<BrowseNode>, Status> {
     if flat {
+        // Flat mode streams every fully-qualified tag discovered, ignoring
+        // `path` entirely — it reads from the sink rather than `discovered`
+        // so it reflects tags as they're incrementally reported during a
+        // live browse, not just the final return value.
         tags_sink
             .lock()
-            .map(|guard| guard.clone())
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|tag_id| BrowseNode {
+                        tag_id: tag_id.clone(),
+                        node_type: NodeType::Leaf,
+                    })
+                    .collect()
+            })
             .map_err(|_| Status::internal("browse lock poisoned"))
     } else {
-        Ok(discovered)
+        Ok(browse_tree(path, &discovered))
     }
+}
+
+/// Synthesize one level of tag hierarchy from a flat list of
+/// fully-qualified, dot-separated tag IDs (e.g. `"Simulink.Device1.Python.D"`).
+/// Upstream OPC DA browsing is flat-only, so hierarchy is synthesized here
+/// by splitting on `.` — the same convention most OPC tooling uses.
+///
+/// Returns the distinct immediate children directly under `path` (each
+/// listed exactly once, in first-seen order), classified as `Branch` when
+/// at least one discovered tag extends further below that child, or `Leaf`
+/// when the child is itself the end of a tag ID. `path` is matched as a
+/// dot-separated prefix — `""` means the root level, `"Simulink"` means
+/// direct children of `"Simulink"`, and so on. A trailing `.` on `path` is
+/// tolerated and stripped.
+fn browse_tree(path: &str, discovered: &[String]) -> Vec<BrowseNode> {
+    let path = path.strip_suffix('.').unwrap_or(path);
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}.")
+    };
+
+    let mut nodes: Vec<BrowseNode> = Vec::new();
+    let mut index_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for tag in discovered {
+        let Some(rest) = tag.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        if rest.is_empty() {
+            // `tag` equals `path` itself exactly — nothing to list below a leaf.
+            continue;
+        }
+        let next_segment = rest.split_once('.').map_or(rest, |(seg, _)| seg);
+        let is_branch = rest.len() > next_segment.len();
+        let child_id = if path.is_empty() {
+            next_segment.to_string()
+        } else {
+            format!("{path}.{next_segment}")
+        };
+
+        match index_of.get(&child_id) {
+            Some(&i) => {
+                if is_branch {
+                    // A later tag proves this child has children of its
+                    // own too; Branch always wins over Leaf, and once
+                    // upgraded a child is never downgraded back.
+                    nodes[i].node_type = NodeType::Branch;
+                }
+            }
+            None => {
+                index_of.insert(child_id.clone(), nodes.len());
+                nodes.push(BrowseNode {
+                    tag_id: child_id,
+                    node_type: if is_branch {
+                        NodeType::Branch
+                    } else {
+                        NodeType::Leaf
+                    },
+                });
+            }
+        }
+    }
+    nodes
 }
 
 fn map_to_proto_tag_values(values: Vec<TagValue>) -> Vec<ProtoTagValue> {
@@ -124,17 +223,17 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
             .await
             .map_err(internal)?;
 
-        let tags = select_tags(req.flat, discovered, &tags_sink)?;
-        tracing::info!(server = %req.server, count = tags.len(), "browsed OPC DA tags");
+        let tags = select_browse_nodes(req.flat, &req.path, discovered, &tags_sink)?;
+        tracing::info!(server = %req.server, path = %req.path, count = tags.len(), "browsed OPC DA tags");
 
         let (tx, rx) = mpsc::channel(128);
 
         tokio::spawn(async move {
-            for tag_id in tags {
+            for node in tags {
                 if tx
                     .send(Ok(BrowseResponse {
-                        tag_id,
-                        node_type: NODE_TYPE_LEAF.to_string(),
+                        tag_id: node.tag_id,
+                        node_type: node.node_type.as_str().to_string(),
                     }))
                     .await
                     .is_err()
@@ -259,32 +358,193 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tags_not_flat_returns_discovered() {
-        let discovered = vec!["tag1".to_string(), "tag2".to_string()];
-        let sink = Arc::new(Mutex::new(vec!["sink_tag".to_string()]));
-        let result = select_tags(false, discovered.clone(), &sink).unwrap();
-        assert_eq!(result, discovered);
-    }
-
-    #[test]
-    fn test_select_tags_flat_returns_sink() {
-        let discovered = vec!["discovered".to_string()];
+    fn test_select_browse_nodes_flat_returns_sink_as_leaves() {
+        let discovered = vec!["A.B".to_string()];
         let sink = Arc::new(Mutex::new(vec!["sink1".to_string(), "sink2".to_string()]));
-        let result = select_tags(true, discovered, &sink).unwrap();
-        assert_eq!(result, vec!["sink1", "sink2"]);
+        let result = select_browse_nodes(true, "ignored", discovered, &sink).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                BrowseNode {
+                    tag_id: "sink1".to_string(),
+                    node_type: NodeType::Leaf
+                },
+                BrowseNode {
+                    tag_id: "sink2".to_string(),
+                    node_type: NodeType::Leaf
+                },
+            ]
+        );
     }
 
     #[test]
-    fn test_select_tags_flat_poisoned() {
+    fn test_select_browse_nodes_flat_poisoned() {
         let discovered = vec!["discovered".to_string()];
         let sink = Arc::new(Mutex::new(vec![]));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = sink.lock().unwrap();
             panic!("intentional poison");
         }));
-        let result = select_tags(true, discovered, &sink);
+        let result = select_browse_nodes(true, "", discovered, &sink);
         assert!(result.is_err());
         assert!(result.unwrap_err().message().contains("poisoned"));
+    }
+
+    #[test]
+    fn test_select_browse_nodes_not_flat_uses_browse_tree() {
+        let discovered = vec!["A.B".to_string(), "A.C".to_string(), "D".to_string()];
+        let sink = Arc::new(Mutex::new(vec![]));
+        let result = select_browse_nodes(false, "", discovered, &sink).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                BrowseNode {
+                    tag_id: "A".to_string(),
+                    node_type: NodeType::Branch
+                },
+                BrowseNode {
+                    tag_id: "D".to_string(),
+                    node_type: NodeType::Leaf
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_root_single_segment_tags_are_leaves() {
+        let discovered = vec!["Foo".to_string(), "Bar".to_string()];
+        let nodes = browse_tree("", &discovered);
+        assert_eq!(
+            nodes,
+            vec![
+                BrowseNode {
+                    tag_id: "Foo".to_string(),
+                    node_type: NodeType::Leaf
+                },
+                BrowseNode {
+                    tag_id: "Bar".to_string(),
+                    node_type: NodeType::Leaf
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_root_groups_multi_segment_tags_into_branches() {
+        let discovered = vec![
+            "Simulink.Device1.Python.D".to_string(),
+            "Simulink.Device1.Python.E".to_string(),
+            "System.Time".to_string(),
+        ];
+        let nodes = browse_tree("", &discovered);
+        assert_eq!(
+            nodes,
+            vec![
+                BrowseNode {
+                    tag_id: "Simulink".to_string(),
+                    node_type: NodeType::Branch
+                },
+                BrowseNode {
+                    tag_id: "System".to_string(),
+                    node_type: NodeType::Branch
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_nested_path() {
+        let discovered = vec![
+            "Simulink.Device1.Python.D".to_string(),
+            "Simulink.Device1.Python.E".to_string(),
+            "Simulink.Device2".to_string(),
+        ];
+        let nodes = browse_tree("Simulink.Device1", &discovered);
+        assert_eq!(
+            nodes,
+            vec![BrowseNode {
+                tag_id: "Simulink.Device1.Python".to_string(),
+                node_type: NodeType::Branch
+            }]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_leaf_at_deepest_level() {
+        let discovered = vec!["Simulink.Device1.Python.D".to_string()];
+        let nodes = browse_tree("Simulink.Device1.Python", &discovered);
+        assert_eq!(
+            nodes,
+            vec![BrowseNode {
+                tag_id: "Simulink.Device1.Python.D".to_string(),
+                node_type: NodeType::Leaf
+            }]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_non_existent_path_returns_empty() {
+        let discovered = vec!["Simulink.Device1".to_string()];
+        let nodes = browse_tree("DoesNotExist", &discovered);
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_browse_tree_tolerates_trailing_dot_on_path() {
+        let discovered = vec!["Simulink.Device1".to_string()];
+        let with_dot = browse_tree("Simulink.", &discovered);
+        let without_dot = browse_tree("Simulink", &discovered);
+        assert_eq!(with_dot, without_dot);
+    }
+
+    #[test]
+    fn test_browse_tree_dedups_repeated_branches() {
+        let discovered = vec![
+            "A.B.C".to_string(),
+            "A.B.D".to_string(),
+            "A.B.E".to_string(),
+        ];
+        let nodes = browse_tree("", &discovered);
+        assert_eq!(
+            nodes,
+            vec![BrowseNode {
+                tag_id: "A".to_string(),
+                node_type: NodeType::Branch
+            }]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_branch_classification_is_order_independent() {
+        // A leaf-looking tag ("A.B") and a tag proving "A.B" actually has
+        // children ("A.B.C") can arrive in either order; either way "A.B"
+        // must end up classified as Branch, never downgraded back to Leaf.
+        let leaf_first = vec!["A.B".to_string(), "A.B.C".to_string()];
+        let branch_first = vec!["A.B.C".to_string(), "A.B".to_string()];
+        let expected = vec![BrowseNode {
+            tag_id: "A.B".to_string(),
+            node_type: NodeType::Branch,
+        }];
+        assert_eq!(browse_tree("A", &leaf_first), expected);
+        assert_eq!(browse_tree("A", &branch_first), expected);
+    }
+
+    #[test]
+    fn test_browse_tree_ignores_blank_tag_ids() {
+        let discovered = vec!["".to_string(), "Foo".to_string()];
+        let nodes = browse_tree("", &discovered);
+        assert_eq!(
+            nodes,
+            vec![BrowseNode {
+                tag_id: "Foo".to_string(),
+                node_type: NodeType::Leaf
+            }]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_empty_discovered_returns_empty() {
+        assert!(browse_tree("", &[]).is_empty());
     }
 
     #[test]
@@ -573,6 +833,72 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message().contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn test_browse_not_flat_synthesizes_branch_for_dotted_tags() {
+        let svc = new_bridge_service(
+            Ok(vec![]),
+            Ok(vec!["A.B".into(), "A.C".into()]),
+            Ok(vec![]),
+            Ok(WriteResult {
+                tag_id: String::new(),
+                success: true,
+                error: None,
+            }),
+        );
+        let response = svc
+            .browse(Request::new(BrowseRequest {
+                server: "TestServer".into(),
+                flat: false,
+                path: String::new(),
+                max_tags: 0,
+            }))
+            .await
+            .unwrap();
+        use tokio_stream::StreamExt;
+        let mut stream = response.into_inner();
+        let node = stream.next().await.unwrap().unwrap();
+        assert_eq!(node.tag_id, "A");
+        assert_eq!(node.node_type, "Branch");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_browse_not_flat_honours_non_root_path() {
+        let svc = new_bridge_service(
+            Ok(vec![]),
+            Ok(vec!["A.B.C".into(), "A.D".into()]),
+            Ok(vec![]),
+            Ok(WriteResult {
+                tag_id: String::new(),
+                success: true,
+                error: None,
+            }),
+        );
+        let response = svc
+            .browse(Request::new(BrowseRequest {
+                server: "TestServer".into(),
+                flat: false,
+                path: "A".into(),
+                max_tags: 0,
+            }))
+            .await
+            .unwrap();
+        use tokio_stream::StreamExt;
+        let mut stream = response.into_inner();
+        let mut nodes = Vec::new();
+        while let Some(item) = stream.next().await {
+            let node = item.unwrap();
+            nodes.push((node.tag_id, node.node_type));
+        }
+        assert_eq!(
+            nodes,
+            vec![
+                ("A.B".to_string(), "Branch".to_string()),
+                ("A.D".to_string(), "Leaf".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
