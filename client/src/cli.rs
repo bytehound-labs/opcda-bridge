@@ -27,6 +27,10 @@ pub enum Commands {
         /// Flat list (skip tree structure)
         #[arg(long)]
         flat: bool,
+        /// Path to browse (default: root). Pass a `Branch` tag from a prior
+        /// browse to drill down one level further.
+        #[arg(long, default_value = "")]
+        path: String,
         /// Cap on the number of tags streamed back (default: 1000)
         #[arg(long)]
         max_tags: Option<u32>,
@@ -60,11 +64,12 @@ pub async fn run_command(cli: Cli) -> anyhow::Result<()> {
         Commands::Browse {
             server,
             flat,
+            path,
             max_tags,
         } => {
             let server = crate::config::resolve_server(server, &config)?;
             let max_tags = crate::config::resolve_max_tags(max_tags, &config);
-            crate::commands::cmd_browse(host, server, flat, max_tags).await?
+            crate::commands::cmd_browse(host, server, flat, path, max_tags).await?
         }
         Commands::Read { server, tags } => {
             let server = crate::config::resolve_server(server, &config)?;
@@ -111,6 +116,7 @@ mod tests {
             command: Commands::Browse {
                 server: Some("S".into()),
                 flat: false,
+                path: String::new(),
                 max_tags: None,
             },
         };
@@ -126,6 +132,7 @@ mod tests {
             command: Commands::Browse {
                 server: None,
                 flat: false,
+                path: String::new(),
                 max_tags: None,
             },
         };
@@ -287,6 +294,32 @@ mod tests {
                 max_tags: Some(50),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn test_cli_browse_default_path_is_root() {
+        let args = Cli::try_parse_from(["opcda-bridge", "browse", "--server", "MyServer"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Commands::Browse { ref path, .. } if path.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_cli_browse_path_flag() {
+        let args = Cli::try_parse_from([
+            "opcda-bridge",
+            "browse",
+            "--server",
+            "MyServer",
+            "--path",
+            "Simulink.Device1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Commands::Browse { ref path, .. } if path == "Simulink.Device1"
         ));
     }
 

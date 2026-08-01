@@ -1,5 +1,6 @@
 use bridge_proto::bridge::{
-    BrowseRequest, ListServersRequest, ReadRequest, WriteRequest, bridge_client::BridgeClient,
+    BrowseRequest, BrowseResponse, ListServersRequest, ReadRequest, WriteRequest,
+    bridge_client::BridgeClient,
 };
 use tabled::{Table, Tabled};
 
@@ -34,6 +35,7 @@ pub async fn cmd_browse(
     host: String,
     server: String,
     flat: bool,
+    path: String,
     max_tags: u32,
 ) -> anyhow::Result<()> {
     let mut client = BridgeClient::connect(format!("http://{host}")).await?;
@@ -41,23 +43,54 @@ pub async fn cmd_browse(
         .browse(BrowseRequest {
             server,
             flat,
-            path: String::new(),
+            path: path.clone(),
             max_tags,
         })
         .await?
         .into_inner();
 
     use tokio_stream::StreamExt;
-    let mut rows = Vec::new();
+    let mut nodes = Vec::new();
     while let Some(response) = stream.next().await {
-        let r = response?;
-        rows.push(TagRow {
-            tag_id: r.tag_id,
-            node_type: r.node_type,
-        });
+        nodes.push(response?);
     }
-    println!("{}", Table::new(rows));
+
+    if flat {
+        let rows: Vec<TagRow> = nodes
+            .into_iter()
+            .map(|r| TagRow {
+                tag_id: r.tag_id,
+                node_type: r.node_type,
+            })
+            .collect();
+        println!("{}", Table::new(rows));
+    } else {
+        print!("{}", render_tree(&path, &nodes));
+    }
     Ok(())
+}
+
+/// Render a single level of browse results as an indented tree, using the
+/// path given as the header line and box-drawing connectors for children.
+/// `Branch` nodes get a trailing `/` so the user knows to drill down with
+/// `--path <tag_id>`; `Leaf` nodes get no suffix. Kept as a pure
+/// string-building function (rather than printing directly) so it can be
+/// unit tested without capturing stdout.
+fn render_tree(path: &str, nodes: &[BrowseResponse]) -> String {
+    let mut out = String::new();
+    out.push_str(if path.is_empty() { "/" } else { path });
+    out.push('\n');
+    let last = nodes.len().saturating_sub(1);
+    for (i, node) in nodes.iter().enumerate() {
+        let connector = if i == last {
+            "└── "
+        } else {
+            "├── "
+        };
+        let suffix = if node.node_type == "Branch" { "/" } else { "" };
+        out.push_str(&format!("{connector}{}{suffix}\n", node.tag_id));
+    }
+    out
 }
 
 #[derive(Tabled)]
@@ -190,7 +223,7 @@ mod tests {
     async fn test_cmd_browse_empty() {
         let svc = MockBridgeService::default();
         let host = start_mock_server(svc).await;
-        cmd_browse(host, "TestServer".into(), false, 1000)
+        cmd_browse(host, "TestServer".into(), false, String::new(), 1000)
             .await
             .unwrap();
     }
@@ -211,7 +244,43 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_browse(host, "TestServer".into(), true, 1000)
+        cmd_browse(host, "TestServer".into(), true, String::new(), 1000)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_browse_tree_mode_renders_indented_tree() {
+        let svc = MockBridgeService {
+            browse_responses: vec![
+                BrowseResponse {
+                    tag_id: "Simulink".into(),
+                    node_type: "Branch".into(),
+                },
+                BrowseResponse {
+                    tag_id: "System".into(),
+                    node_type: "Leaf".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let host = start_mock_server(svc).await;
+        cmd_browse(host, "TestServer".into(), false, String::new(), 1000)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_browse_tree_mode_with_path() {
+        let svc = MockBridgeService {
+            browse_responses: vec![BrowseResponse {
+                tag_id: "Simulink.Device1".into(),
+                node_type: "Leaf".into(),
+            }],
+            ..Default::default()
+        };
+        let host = start_mock_server(svc).await;
+        cmd_browse(host, "TestServer".into(), false, "Simulink".into(), 1000)
             .await
             .unwrap();
     }
@@ -414,5 +483,53 @@ mod tests {
     #[test]
     fn test_parse_value_string_special_chars() {
         assert!(matches!(parse_value("hello world!"), Value::String(s) if s == "hello world!"));
+    }
+
+    #[test]
+    fn test_render_tree_empty_path_shows_root_marker() {
+        let out = render_tree("", &[]);
+        assert_eq!(out, "/\n");
+    }
+
+    #[test]
+    fn test_render_tree_non_empty_path_shows_path_header() {
+        let out = render_tree("Simulink.Device1", &[]);
+        assert_eq!(out, "Simulink.Device1\n");
+    }
+
+    #[test]
+    fn test_render_tree_single_leaf_uses_last_connector_no_suffix() {
+        let nodes = vec![BrowseResponse {
+            tag_id: "System".into(),
+            node_type: "Leaf".into(),
+        }];
+        let out = render_tree("", &nodes);
+        assert_eq!(out, "/\n└── System\n");
+    }
+
+    #[test]
+    fn test_render_tree_single_branch_uses_last_connector_with_suffix() {
+        let nodes = vec![BrowseResponse {
+            tag_id: "Simulink".into(),
+            node_type: "Branch".into(),
+        }];
+        let out = render_tree("", &nodes);
+        assert_eq!(out, "/\n└── Simulink/\n");
+    }
+
+    #[test]
+    fn test_render_tree_multiple_nodes_use_middle_and_last_connectors() {
+        let nodes = vec![
+            BrowseResponse {
+                tag_id: "Simulink".into(),
+                node_type: "Branch".into(),
+            },
+            BrowseResponse {
+                tag_id: "System".into(),
+                node_type: "Leaf".into(),
+            },
+        ];
+        let out = render_tree("", &nodes);
+        assert_eq!(out, "/\n├── Simulink/\n└── System\n");
     }
 }
