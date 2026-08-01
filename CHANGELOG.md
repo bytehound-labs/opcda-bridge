@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-v0.1.4...opcda-bridge-v0.1.5) - 2026-08-01
+
+### Added
+
+- *(gateway)* run as a Windows service ([#12](https://github.com/mikeboiko/opcda-bridge/pull/12))
+
 ## [0.1.4](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-v0.1.3...opcda-bridge-v0.1.4) - 2026-08-01
 
 ### Added
