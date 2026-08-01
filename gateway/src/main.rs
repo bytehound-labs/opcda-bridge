@@ -1,48 +1,33 @@
 #[cfg(target_os = "windows")]
-use opcda_bridge_gateway::server;
-
-#[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
     use clap::Parser;
-    use opc_da_client::ComGuard;
-    use opcda_bridge_gateway::config::{self, Cli};
-    use opcda_bridge_gateway::logging;
-    use opcda_bridge_gateway::run;
-    use std::net::SocketAddr;
+    use opcda_bridge_gateway::config::{Cli, ServiceCommand};
+    use opcda_bridge_gateway::{run, service};
 
     let cli = Cli::parse();
-    let config = config::load_config(cli.config.as_deref())?;
-    let port = config::resolve_port(cli.port, &config);
 
-    let exe = std::env::current_exe().expect("failed to resolve current executable path");
-    let default_log_dir = logging::log_dir_from_exe(&exe);
-    let log_settings = logging::resolve_log_settings(
-        cli.log_level,
-        cli.log_dir,
-        cli.log_format,
-        cli.log_rotation,
-        &config.log,
-        &default_log_dir,
-    );
-    // Hold the guard for the process lifetime: dropping it early would
-    // silently truncate buffered log lines that haven't yet been flushed.
-    let _log_guard = logging::init_tracing(&log_settings)?;
+    if let Some(command) = &cli.command {
+        return match command {
+            ServiceCommand::Install => service::install(&cli),
+            ServiceCommand::Uninstall => service::uninstall(),
+            ServiceCommand::Start => service::start(),
+            ServiceCommand::Stop => service::stop(),
+            ServiceCommand::Status => service::status(),
+        };
+    }
 
-    let _guard = ComGuard::new().expect("COM initialization failed");
-    Box::leak(Box::new(_guard));
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let bridge = server::BridgeService::default();
-
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!(addr = %listener.local_addr()?, "opcda-bridge gateway listening");
-        run::serve(listener, bridge, run::shutdown_signal()).await?;
-        tracing::info!("opcda-bridge gateway shut down");
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
+    // No subcommand: either running interactively (console mode) or
+    // launched bare by the SCM, exactly as `install` registered it. Try SCM
+    // dispatch first; only fall back to console mode if that failed
+    // specifically because the SCM didn't actually launch this process.
+    match service::run_as_service() {
+        Ok(()) => Ok(()),
+        Err(e) if service::is_run_outside_scm(&e) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run::run_gateway(cli, run::shutdown_signal()))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -2,6 +2,30 @@ use clap::Parser;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Windows service management subcommands. Give flags such as `--port` or
+/// `--log-dir` *before* the subcommand (e.g. `--log-dir C:\logs install`) —
+/// they are only meaningful on `install`, where they're baked into the
+/// registered service's launch arguments so it starts with the same
+/// configuration every time the SCM launches it.
+///
+/// Running the executable with no subcommand at all (as the installed
+/// service does) auto-detects whether it was launched by the Service
+/// Control Manager or interactively, and behaves accordingly — see
+/// `service::run_as_service`.
+#[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ServiceCommand {
+    /// Register the gateway as a Windows service (does not start it)
+    Install,
+    /// Remove the registered Windows service
+    Uninstall,
+    /// Start the registered Windows service
+    Start,
+    /// Stop the running Windows service
+    Stop,
+    /// Report the Windows service's current status
+    Status,
+}
+
 /// Command-line interface for the gateway.
 #[derive(Parser, Debug)]
 #[command(
@@ -10,6 +34,12 @@ use std::path::{Path, PathBuf};
     version
 )]
 pub struct Cli {
+    /// Windows service management command (install/uninstall/start/stop/status).
+    /// Omit entirely to run the gateway itself, whether interactively or as
+    /// an already-installed service.
+    #[command(subcommand)]
+    pub command: Option<ServiceCommand>,
+
     /// Path to a TOML config file (default: opcda-bridge-gateway.toml next to the executable)
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
@@ -244,12 +274,58 @@ mod tests {
     #[test]
     fn test_cli_defaults_to_none() {
         let cli = Cli::try_parse_from(["opcda-bridge-gateway"]).unwrap();
+        assert_eq!(cli.command, None);
         assert_eq!(cli.config, None);
         assert_eq!(cli.port, None);
         assert_eq!(cli.log_level, None);
         assert_eq!(cli.log_dir, None);
         assert_eq!(cli.log_format, None);
         assert_eq!(cli.log_rotation, None);
+    }
+
+    #[test]
+    fn test_cli_parses_service_subcommands() {
+        for (arg, expected) in [
+            ("install", ServiceCommand::Install),
+            ("uninstall", ServiceCommand::Uninstall),
+            ("start", ServiceCommand::Start),
+            ("stop", ServiceCommand::Stop),
+            ("status", ServiceCommand::Status),
+        ] {
+            let cli = Cli::try_parse_from(["opcda-bridge-gateway", arg]).unwrap();
+            assert_eq!(cli.command, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_cli_flags_before_subcommand_apply_to_install() {
+        // Flags must precede the subcommand: they configure what `install`
+        // bakes into the service's launch arguments, not the subcommand
+        // itself (which takes no flags of its own).
+        let cli = Cli::try_parse_from([
+            "opcda-bridge-gateway",
+            "--port",
+            "7700",
+            "--log-dir",
+            "/var/log/opcda",
+            "install",
+        ])
+        .unwrap();
+        assert_eq!(cli.command, Some(ServiceCommand::Install));
+        assert_eq!(cli.port, Some(7700));
+        assert_eq!(cli.log_dir, Some(PathBuf::from("/var/log/opcda")));
+    }
+
+    #[test]
+    fn test_cli_rejects_unknown_subcommand() {
+        let err = Cli::try_parse_from(["opcda-bridge-gateway", "bogus"])
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::InvalidSubcommand,
+            "unrecognized \"bogus\" positional argument should fail to parse as a subcommand, not be silently accepted"
+        );
     }
 
     #[test]

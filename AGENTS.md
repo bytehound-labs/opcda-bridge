@@ -123,3 +123,41 @@ explicit, injectable parameter instead of being read inline. Tests drive every l
 branch (JSON vs. pretty format, stdout attached vs. detached) directly through that `bool` and
 deliberately never assert whether `try_init()` returned `Ok` or `Err` — only that the code path
 leading up to it runs.
+
+### Windows service
+
+`gateway/src/service.rs` follows the same "extract a testable pure representation, map it onto
+the real Windows type in a thin shim" pattern as `logging.rs`. The top of the file is
+platform-neutral and covered by Linux tests: `ServiceDefinition`/`build_service_definition` (what
+to register), `service_launch_arguments` (which CLI flags become the service's permanent launch
+arguments), `ServiceLifecycle` (a plain mirror of `windows_service::service::ServiceState` that
+pins down the intended `StartPending → Running → StopPending → Stopped` reporting order), and
+`is_scm_launch_error_code` (the raw `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` check, kept as a
+plain `Option<i32>` comparison rather than matching on the Windows-only `windows_service::Error`
+directly). Only the `#[cfg(target_os = "windows")] mod windows_impl` submodule — the actual
+`ServiceManager`/`service_dispatcher`/`service_control_handler` glue — is invisible to the Linux
+coverage run, and it is kept intentionally thin: `install`/`uninstall`/`start`/`stop`/`status`
+each just map a `ServiceDefinition`/`SERVICE_NAME` onto the matching `windows_service` API call.
+
+`main()` cannot call into itself from library code (the bin and lib are separate compilation
+units), so the config/logging/COM/listener bootstrap that both console mode and the service entry
+point need lives in `run::run_gateway()`, not in `main.rs`. `main()` is now a thin dispatcher:
+parse `Cli`, dispatch any `ServiceCommand` subcommand to `service::*`, otherwise try
+`service::run_as_service()` and fall back to `run::run_gateway()` only when
+`service::is_run_outside_scm` recognizes the "not launched by the SCM" error — the same
+`run_gateway()` call console mode always made, just reached from a second entry point.
+
+Reporting `StopPending` happens from _inside_ the async `shutdown` future passed to
+`run_gateway`, at the instant the control handler's oneshot channel resolves — before the actual
+request-drain begins, not after `run_gateway` returns (too late to be meaningful) and not from
+inside the control handler closure itself (which doesn't have the `ServiceStatusHandle` yet,
+since that's the return value of the same `register()` call the closure is passed to).
+`ServiceStatusHandle` is `Clone` and documented safe to use from any thread, so the closure's
+registration and the shutdown future's status report use two independent clones of the same
+handle.
+
+`install` requires flags before the subcommand (e.g. `opcda-bridge-gateway.exe --port 7700
+install`, not `install --port 7700`) since the SCM always launches a service's executable bare —
+whatever the operator wants applied every time the service starts must be baked into the
+registration itself via `service_launch_arguments`, not left to how the process happened to be
+invoked once at install time.
