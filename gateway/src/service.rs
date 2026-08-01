@@ -347,8 +347,10 @@ mod windows_impl {
         // Report `StopPending` the instant the stop signal arrives, before
         // `run::run_gateway`'s shutdown future actually resolves and the
         // in-flight-request drain begins — this is exactly the moment the
-        // SCM needs to stop expecting an immediate `Stopped`.
-        let stop_status_handle = status_handle.clone();
+        // SCM needs to stop expecting an immediate `Stopped`. `ServiceStatusHandle`
+        // is `Copy` (and documented safe to use from any thread), so this is a
+        // plain copy, not a deep clone.
+        let stop_status_handle = status_handle;
         let shutdown = async move {
             let _ = shutdown_rx.await;
             let _ = report_status(&stop_status_handle, ServiceLifecycle::StopPending);
