@@ -174,6 +174,39 @@ under a background/service process), the same log lines are also printed to stdo
   shippers such as Fluent Bit or Vector).
 - **Rotation** is `hourly`, `daily`, or `never` (a single file that grows indefinitely).
 
+## Running as a Windows service
+
+The gateway can run under the Windows Service Control Manager (SCM) instead of an interactive
+console, so it starts automatically at boot without a logged-in user. Manage it with built-in
+subcommands — no need to hand-roll `sc.exe` invocations:
+
+| Command                              | Effect                                            |
+| ------------------------------------ | ------------------------------------------------- |
+| `opcda-bridge-gateway.exe install`   | Registers the service (auto-start, `LocalSystem`) |
+| `opcda-bridge-gateway.exe start`     | Starts the registered service                     |
+| `opcda-bridge-gateway.exe status`    | Prints the service's current SCM state            |
+| `opcda-bridge-gateway.exe stop`      | Requests a graceful stop                          |
+| `opcda-bridge-gateway.exe uninstall` | Stops (if running) and removes the service        |
+
+Run `install`, `uninstall`, `start`, and `stop` from an elevated (Administrator) prompt — the SCM
+rejects these operations otherwise.
+
+Any flags that should apply every time the service starts — `--port`, `--config`, `--log-*` —
+must be given to `install` **before** the subcommand, since they become the service's permanent
+launch arguments:
+
+```sh
+opcda-bridge-gateway.exe --port 7700 --log-dir C:\logs install
+```
+
+not `opcda-bridge-gateway.exe install --port 7700`. If the client will connect from another
+machine, remember to open the listen port in the Windows Firewall, same as console mode.
+
+Once running as a service there is no console, so [logging](#logging) always goes to the file
+sink — the same location and settings as console mode (next to the executable by default, or
+wherever `--log-dir`/`log.dir` points). The service also shuts down the same way `Ctrl+C` does in
+console mode: `stop` drains in-flight requests before the SCM reports it `Stopped`.
+
 ## Architecture
 
 - Gateway (Windows-only) built on [`opc-da-client`](https://github.com/wends155/opc-cli) for the COM/OPC DA layer — no dependency on proprietary SDKs (OPC Labs QuickOPC, Graybox, Matrikon, etc.).

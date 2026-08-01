@@ -3,6 +3,7 @@ pub mod logging;
 pub mod opc;
 pub mod run;
 pub mod server;
+pub mod service;
 
 #[cfg(test)]
 mod test_support;

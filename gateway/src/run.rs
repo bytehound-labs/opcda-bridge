@@ -3,7 +3,10 @@
 //! [`serve`] is generic over [`OpcClient`] (rather than tied to the
 //! Windows-only COM adapter) so the part of the gateway that actually
 //! implements graceful shutdown can be exercised by tests on any platform,
-//! using the same mock client as `server`'s unit tests.
+//! using the same mock client as `server`'s unit tests. [`run_gateway`]
+//! builds on top of it with the full, Windows-only bootstrap (config,
+//! logging, COM, bind) shared by both console mode and the Windows service
+//! entry point in `service.rs`.
 
 use crate::opc::OpcClient;
 use crate::server::BridgeService;
@@ -56,6 +59,55 @@ pub async fn shutdown_signal() {
         _ = ctrl_close.recv() => {}
         _ = ctrl_shutdown.recv() => {}
     }
+}
+
+/// Full gateway bootstrap: loads config/logging settings, initializes COM,
+/// binds the listener, and serves until `shutdown` resolves. Shared by both
+/// interactive (console) mode and the Windows service entry point
+/// (`service::run_as_service`), so the two differ only in where their
+/// `shutdown` future comes from and how the process's overall lifecycle
+/// (plain `main` return vs. SCM status reporting) is handled around this
+/// call — not in how the gateway itself starts up.
+///
+/// Windows-only, like the rest of the gateway's runtime setup: `ComGuard`
+/// and the real `OpcDaAdapter`-backed `BridgeService::default()` only exist
+/// on Windows.
+#[cfg(target_os = "windows")]
+pub async fn run_gateway(
+    cli: crate::config::Cli,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    use opc_da_client::ComGuard;
+    use std::net::SocketAddr;
+
+    let config = crate::config::load_config(cli.config.as_deref())?;
+    let port = crate::config::resolve_port(cli.port, &config);
+
+    let exe = std::env::current_exe().expect("failed to resolve current executable path");
+    let default_log_dir = crate::logging::log_dir_from_exe(&exe);
+    let log_settings = crate::logging::resolve_log_settings(
+        cli.log_level,
+        cli.log_dir,
+        cli.log_format,
+        cli.log_rotation,
+        &config.log,
+        &default_log_dir,
+    );
+    // Hold the guard for this call's lifetime: dropping it early would
+    // silently truncate buffered log lines that haven't yet been flushed.
+    let _log_guard = crate::logging::init_tracing(&log_settings)?;
+
+    let _guard = ComGuard::new().expect("COM initialization failed");
+    Box::leak(Box::new(_guard));
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!(addr = %listener.local_addr()?, "opcda-bridge gateway listening");
+
+    let bridge = BridgeService::default();
+    serve(listener, bridge, shutdown).await?;
+    tracing::info!("opcda-bridge gateway shut down");
+    Ok(())
 }
 
 #[cfg(test)]
