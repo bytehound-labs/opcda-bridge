@@ -56,8 +56,14 @@ PRs must pass `cargo fmt --check --all`, `cargo clippy --workspace --all-targets
 
 ## Releases
 
-SemVer tags (`<component>-vX.Y.Z`) cut directly from `main`, one release per workspace crate
-(`bridge-proto`, `opcda-bridge-gateway`, `opcda-bridge-client`). No release branches.
+SemVer tags (`<component>-vX.Y.Z`) cut directly from `main`, one release per shippable crate
+(`opcda-bridge-gateway`, `opcda-bridge-client`) — each tag triggers a CI job that builds and
+publishes that crate's binaries. No release branches.
+
+`opcda-bridge` (the workspace root package) and `bridge-proto` are internal-only shared crates
+consumed via path dependencies; release-plz tracks their versions in-repo but never tags or
+releases them independently (`release = false` in `release-plz.toml`), since neither is ever
+published or built as a standalone artifact.
 
 ## License
 
