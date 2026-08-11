@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-client-v0.1.3...opcda-bridge-client-v0.1.4) - 2026-08-11
+
+### Fixed
+
+- make client's --host/--config/--output/--json placeable after subcommand ([#18](https://github.com/mikeboiko/opcda-bridge/pull/18))
+
 ## [0.1.3](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-client-v0.1.2...opcda-bridge-client-v0.1.3) - 2026-08-11
 
 ### Added
