@@ -104,9 +104,54 @@ config file — see [Configuration](#configuration) below.
   opcda-bridge-client --host 192.168.1.50:7600 write --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D 42
   ```
 
-Every command prints its result as a table, except `browse` in its default tree mode, which
-prints an indented tree instead (pass `--flat` for the tabular form). Run
-`opcda-bridge-client --help` or `opcda-bridge-client <command> --help` for the full flag reference.
+Every command prints its result as a table by default, except `browse` in its default tree mode,
+which prints an indented tree instead (pass `--flat` for the tabular form). Pass `--output json`
+(or its shorthand, `--json`) for machine-readable output instead — see
+[JSON output](#json-output) below. Run `opcda-bridge-client --help` or
+`opcda-bridge-client <command> --help` for the full flag reference.
+
+### JSON output
+
+Every command accepts `--output json` (or the shorthand `--json`) to print a pretty-printed JSON
+array instead of a table, for shell scripting, CI, or piping into `jq`. Field names are the same
+across both formats:
+
+```sh
+opcda-bridge-client --host 192.168.1.50:7600 --json read --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D
+```
+
+```json
+[
+  {
+    "tag_id": "Simulink.Device1.Python.D",
+    "value": "42",
+    "quality": "Good",
+    "timestamp": "2024-01-01T00:00:00Z"
+  }
+]
+```
+
+`browse` always emits a flat JSON array of `{"tag_id": ..., "node_type": ...}` objects in this
+mode, regardless of `--flat` — the indented tree is a display-only rendering with no JSON
+equivalent. Commands that fail print a structured `{"error": "..."}` object to stderr instead of
+the usual `Error: ...` text, and the process still exits non-zero.
+
+`--output`/`--json` follow the same `CLI flag > environment variable > config file > default`
+precedence as every other setting (env var `OPC_BRIDGE_OUTPUT`, config key `output`), so a script
+can set the environment variable once instead of passing `--json` on every invocation.
+
+### Using the client from other languages
+
+The lightest-weight integration path for calling the client from a script (Python, shell, etc.)
+is shelling out to the binary with `--json` and parsing stdout, as shown above. For heavier
+integration — a long-running .NET or Python service that talks to the gateway directly — it's
+usually better to generate native gRPC stubs straight from
+[`bridge-proto/proto/bridge.proto`](bridge-proto/proto/bridge.proto) (e.g. `grpcio-tools` for
+Python, `Grpc.Tools` for .NET) and skip the client binary entirely; it's the same wire protocol
+the CLI itself speaks. One caveat: the gateway serves plaintext HTTP/2 (no TLS), so a .NET
+client needs to opt in explicitly with
+`AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true)` before
+connecting.
 
 ## Configuration
 
@@ -143,11 +188,12 @@ Looks for a config file in a platform-specific location unless `--config` gives 
 
 See [`client/client.example.toml`](client/client.example.toml) for every available key.
 
-| Setting               | CLI flag     | Env var           | Config key | Default                               |
-| --------------------- | ------------ | ----------------- | ---------- | ------------------------------------- |
-| Gateway address       | `--host`     | `OPC_BRIDGE_HOST` | `host`     | `localhost:7600`                      |
-| Default OPC DA server | `--server`   | —                 | `server`   | none — must be set one way or another |
-| Browse tag cap        | `--max-tags` | —                 | `max_tags` | `1000`                                |
+| Setting               | CLI flag              | Env var             | Config key | Default                               |
+| --------------------- | --------------------- | ------------------- | ---------- | ------------------------------------- |
+| Gateway address       | `--host`              | `OPC_BRIDGE_HOST`   | `host`     | `localhost:7600`                      |
+| Default OPC DA server | `--server`            | —                   | `server`   | none — must be set one way or another |
+| Browse tag cap        | `--max-tags`          | —                   | `max_tags` | `1000`                                |
+| Output format         | `--output` / `--json` | `OPC_BRIDGE_OUTPUT` | `output`   | `table`                               |
 
 `server` has no built-in default: if it is left unset by every source, `browse`/`read`/`write`
 fail with an error rather than guessing a server.

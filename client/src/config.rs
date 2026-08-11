@@ -1,3 +1,4 @@
+use crate::output::OutputFormat;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,7 @@ pub struct ClientConfig {
     pub host: Option<String>,
     pub server: Option<String>,
     pub max_tags: Option<u32>,
+    pub output: Option<OutputFormat>,
 }
 
 /// Resolve the client's default config path from raw environment values
@@ -110,6 +112,14 @@ pub fn resolve_server(cli_server: Option<String>, config: &ClientConfig) -> anyh
 /// Resolve the browse tag cap with `CLI flag > config file > default` precedence.
 pub fn resolve_max_tags(cli_max_tags: Option<u32>, config: &ClientConfig) -> u32 {
     cli_max_tags.or(config.max_tags).unwrap_or(DEFAULT_MAX_TAGS)
+}
+
+/// Resolve the output format with `CLI flag/env > config file > default`
+/// precedence. `cli_output` is already the CLI-only resolution (`--json`
+/// wins over `--output`, which itself already folds in `OPC_BRIDGE_OUTPUT`
+/// via clap's `env` attribute — see `output::resolve_from_cli`).
+pub fn resolve_output(cli_output: Option<OutputFormat>, config: &ClientConfig) -> OutputFormat {
+    cli_output.or(config.output).unwrap_or(OutputFormat::Table)
 }
 
 #[cfg(test)]
@@ -341,5 +351,42 @@ mod tests {
             resolve_max_tags(None, &ClientConfig::default()),
             DEFAULT_MAX_TAGS
         );
+    }
+
+    #[test]
+    fn test_resolve_output_cli_wins() {
+        let config = ClientConfig {
+            output: Some(OutputFormat::Json),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_output(Some(OutputFormat::Table), &config),
+            OutputFormat::Table
+        );
+    }
+
+    #[test]
+    fn test_resolve_output_config_wins_over_default() {
+        let config = ClientConfig {
+            output: Some(OutputFormat::Json),
+            ..Default::default()
+        };
+        assert_eq!(resolve_output(None, &config), OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_resolve_output_default_is_table() {
+        assert_eq!(
+            resolve_output(None, &ClientConfig::default()),
+            OutputFormat::Table
+        );
+    }
+
+    #[test]
+    fn test_load_config_file_output_key() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "output = \"json\"").unwrap();
+        let config = load_config_file(file.path(), true).unwrap();
+        assert_eq!(config.output, Some(OutputFormat::Json));
     }
 }

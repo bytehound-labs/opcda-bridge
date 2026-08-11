@@ -1,17 +1,27 @@
+use crate::output::{self, OutputFormat};
 use bridge_proto::bridge::{
     BrowseRequest, BrowseResponse, ListServersRequest, ReadRequest, WriteRequest,
     bridge_client::BridgeClient,
 };
-use tabled::{Table, Tabled};
+use serde::Serialize;
+use tabled::Tabled;
+use tabled::derive::display;
 
-#[derive(Tabled)]
+/// Connect to the gateway. Extracted since every command repeats this line
+/// verbatim — also the natural place a future TLS or auth option would hook
+/// in.
+async fn connect(host: &str) -> anyhow::Result<BridgeClient<tonic::transport::Channel>> {
+    Ok(BridgeClient::connect(format!("http://{host}")).await?)
+}
+
+#[derive(Tabled, Serialize)]
 struct ServerRow {
     #[tabled(rename = "Servers")]
     name: String,
 }
 
-pub async fn cmd_servers(host: String) -> anyhow::Result<()> {
-    let mut client = BridgeClient::connect(format!("http://{host}")).await?;
+pub async fn cmd_servers(host: String, format: OutputFormat) -> anyhow::Result<()> {
+    let mut client = connect(&host).await?;
     let response = client
         .list_servers(ListServersRequest {
             host: "localhost".to_string(),
@@ -19,11 +29,11 @@ pub async fn cmd_servers(host: String) -> anyhow::Result<()> {
         .await?;
     let servers = response.into_inner().servers;
     let rows: Vec<ServerRow> = servers.into_iter().map(|name| ServerRow { name }).collect();
-    println!("{}", Table::new(rows));
+    println!("{}", output::render(rows, format)?);
     Ok(())
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct TagRow {
     #[tabled(rename = "Tag")]
     tag_id: String,
@@ -37,8 +47,9 @@ pub async fn cmd_browse(
     flat: bool,
     path: String,
     max_tags: u32,
+    format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let mut client = BridgeClient::connect(format!("http://{host}")).await?;
+    let mut client = connect(&host).await?;
     let mut stream = client
         .browse(BrowseRequest {
             server,
@@ -55,7 +66,9 @@ pub async fn cmd_browse(
         nodes.push(response?);
     }
 
-    if flat {
+    // JSON always renders as rows, regardless of `--flat`, since the tree
+    // renderer produces a display-only string, not structured data.
+    if format == OutputFormat::Json || flat {
         let rows: Vec<TagRow> = nodes
             .into_iter()
             .map(|r| TagRow {
@@ -63,7 +76,7 @@ pub async fn cmd_browse(
                 node_type: r.node_type,
             })
             .collect();
-        println!("{}", Table::new(rows));
+        println!("{}", output::render(rows, format)?);
     } else {
         print!("{}", render_tree(&path, &nodes));
     }
@@ -93,7 +106,7 @@ fn render_tree(path: &str, nodes: &[BrowseResponse]) -> String {
     out
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct ReadRow {
     #[tabled(rename = "Tag")]
     tag_id: String,
@@ -105,8 +118,13 @@ struct ReadRow {
     timestamp: String,
 }
 
-pub async fn cmd_read(host: String, server: String, tags: Vec<String>) -> anyhow::Result<()> {
-    let mut client = BridgeClient::connect(format!("http://{host}")).await?;
+pub async fn cmd_read(
+    host: String,
+    server: String,
+    tags: Vec<String>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let mut client = connect(&host).await?;
     let response = client
         .read(ReadRequest {
             server,
@@ -123,18 +141,21 @@ pub async fn cmd_read(host: String, server: String, tags: Vec<String>) -> anyhow
             timestamp: v.timestamp,
         })
         .collect();
-    println!("{}", Table::new(rows));
+    println!("{}", output::render(rows, format)?);
     Ok(())
 }
 
-#[derive(Tabled)]
+#[derive(Tabled, Serialize)]
 struct WriteRow {
     #[tabled(rename = "Tag")]
     tag_id: String,
     #[tabled(rename = "Success")]
     success: bool,
-    #[tabled(rename = "Error")]
-    error: String,
+    /// `None` renders as an empty cell in the table but as JSON `null` — the
+    /// existing `.unwrap_or_default()` collapsed both to `""`, which is
+    /// indistinguishable from "no error" in JSON.
+    #[tabled(rename = "Error", display("display::option", ""))]
+    error: Option<String>,
 }
 
 pub async fn cmd_write(
@@ -142,6 +163,7 @@ pub async fn cmd_write(
     server: String,
     tag: String,
     value: String,
+    format: OutputFormat,
 ) -> anyhow::Result<()> {
     let parsed = parse_value(&value);
     let typed_value = match parsed {
@@ -151,7 +173,7 @@ pub async fn cmd_write(
         Value::Bool(b) => bridge_proto::bridge::write_request::TypedValue::BoolValue(b),
     };
 
-    let mut client = BridgeClient::connect(format!("http://{host}")).await?;
+    let mut client = connect(&host).await?;
     let response = client
         .write(WriteRequest {
             server,
@@ -163,9 +185,9 @@ pub async fn cmd_write(
     let rows = vec![WriteRow {
         tag_id: r.tag_id,
         success: r.success,
-        error: r.error.unwrap_or_default(),
+        error: r.error,
     }];
-    println!("{}", Table::new(rows));
+    println!("{}", output::render(rows, format)?);
     Ok(())
 }
 
@@ -204,7 +226,7 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_servers(host).await.unwrap();
+        cmd_servers(host, OutputFormat::Table).await.unwrap();
     }
 
     #[tokio::test]
@@ -216,16 +238,23 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_servers(host).await.unwrap();
+        cmd_servers(host, OutputFormat::Table).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_browse_empty() {
         let svc = MockBridgeService::default();
         let host = start_mock_server(svc).await;
-        cmd_browse(host, "TestServer".into(), false, String::new(), 1000)
-            .await
-            .unwrap();
+        cmd_browse(
+            host,
+            "TestServer".into(),
+            false,
+            String::new(),
+            1000,
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -244,9 +273,16 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_browse(host, "TestServer".into(), true, String::new(), 1000)
-            .await
-            .unwrap();
+        cmd_browse(
+            host,
+            "TestServer".into(),
+            true,
+            String::new(),
+            1000,
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -265,9 +301,16 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_browse(host, "TestServer".into(), false, String::new(), 1000)
-            .await
-            .unwrap();
+        cmd_browse(
+            host,
+            "TestServer".into(),
+            false,
+            String::new(),
+            1000,
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -280,16 +323,53 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_browse(host, "TestServer".into(), false, "Simulink".into(), 1000)
-            .await
-            .unwrap();
+        cmd_browse(
+            host,
+            "TestServer".into(),
+            false,
+            "Simulink".into(),
+            1000,
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_browse_json_bypasses_tree_even_when_not_flat() {
+        let svc = MockBridgeService {
+            browse_responses: vec![
+                BrowseResponse {
+                    tag_id: "Simulink".into(),
+                    node_type: "Branch".into(),
+                },
+                BrowseResponse {
+                    tag_id: "System".into(),
+                    node_type: "Leaf".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let host = start_mock_server(svc).await;
+        cmd_browse(
+            host,
+            "TestServer".into(),
+            false,
+            String::new(),
+            1000,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_read_empty() {
         let svc = MockBridgeService::default();
         let host = start_mock_server(svc).await;
-        cmd_read(host, "S".into(), vec![]).await.unwrap();
+        cmd_read(host, "S".into(), vec![], OutputFormat::Table)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -306,16 +386,43 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_read(host, "S".into(), vec!["t1".into()]).await.unwrap();
+        cmd_read(host, "S".into(), vec!["t1".into()], OutputFormat::Table)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_read_json() {
+        let svc = MockBridgeService {
+            read_response: ReadResponse {
+                values: vec![ProtoTagValue {
+                    tag_id: "t1".into(),
+                    value: "42".into(),
+                    quality: "Good".into(),
+                    timestamp: "now".into(),
+                }],
+            },
+            ..Default::default()
+        };
+        let host = start_mock_server(svc).await;
+        cmd_read(host, "S".into(), vec!["t1".into()], OutputFormat::Json)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_write_success() {
         let svc = MockBridgeService::default();
         let host = start_mock_server(svc).await;
-        cmd_write(host, "S".into(), "tag1".into(), "42".into())
-            .await
-            .unwrap();
+        cmd_write(
+            host,
+            "S".into(),
+            "tag1".into(),
+            "42".into(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -329,36 +436,82 @@ mod tests {
             ..Default::default()
         };
         let host = start_mock_server(svc).await;
-        cmd_write(host, "S".into(), "bad".into(), "0".into())
-            .await
-            .unwrap();
+        cmd_write(
+            host,
+            "S".into(),
+            "bad".into(),
+            "0".into(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_write_failure_json_error_is_null() {
+        let svc = MockBridgeService {
+            write_response: WriteResponse {
+                tag_id: "good".into(),
+                success: true,
+                error: None,
+            },
+            ..Default::default()
+        };
+        let host = start_mock_server(svc).await;
+        cmd_write(
+            host,
+            "S".into(),
+            "good".into(),
+            "0".into(),
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_write_float_value() {
         let svc = MockBridgeService::default();
         let host = start_mock_server(svc).await;
-        cmd_write(host, "S".into(), "tag1".into(), "3.14".into())
-            .await
-            .unwrap();
+        cmd_write(
+            host,
+            "S".into(),
+            "tag1".into(),
+            "3.14".into(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_write_bool_value() {
         let svc = MockBridgeService::default();
         let host = start_mock_server(svc).await;
-        cmd_write(host, "S".into(), "tag1".into(), "true".into())
-            .await
-            .unwrap();
+        cmd_write(
+            host,
+            "S".into(),
+            "tag1".into(),
+            "true".into(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_write_string_value() {
         let svc = MockBridgeService::default();
         let host = start_mock_server(svc).await;
-        cmd_write(host, "S".into(), "tag1".into(), "hello world".into())
-            .await
-            .unwrap();
+        cmd_write(
+            host,
+            "S".into(),
+            "tag1".into(),
+            "hello world".into(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -531,5 +684,78 @@ mod tests {
         ];
         let out = render_tree("", &nodes);
         assert_eq!(out, "/\n├── Simulink/\n└── System\n");
+    }
+
+    #[test]
+    fn test_server_row_json_keys() {
+        let rows = vec![ServerRow { name: "S1".into() }];
+        let out = output::render(rows, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value[0]["name"], "S1");
+    }
+
+    #[test]
+    fn test_tag_row_json_keys() {
+        let rows = vec![TagRow {
+            tag_id: "Simulink".into(),
+            node_type: "Branch".into(),
+        }];
+        let out = output::render(rows, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value[0]["tag_id"], "Simulink");
+        assert_eq!(value[0]["node_type"], "Branch");
+    }
+
+    #[test]
+    fn test_read_row_json_keys() {
+        let rows = vec![ReadRow {
+            tag_id: "t1".into(),
+            value: "42".into(),
+            quality: "Good".into(),
+            timestamp: "now".into(),
+        }];
+        let out = output::render(rows, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value[0]["tag_id"], "t1");
+        assert_eq!(value[0]["value"], "42");
+        assert_eq!(value[0]["quality"], "Good");
+        assert_eq!(value[0]["timestamp"], "now");
+    }
+
+    #[test]
+    fn test_write_row_json_no_error_is_null_not_empty_string() {
+        let rows = vec![WriteRow {
+            tag_id: "t1".into(),
+            success: true,
+            error: None,
+        }];
+        let out = output::render(rows, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(value[0]["error"].is_null());
+    }
+
+    #[test]
+    fn test_write_row_json_error_is_string_when_present() {
+        let rows = vec![WriteRow {
+            tag_id: "t1".into(),
+            success: false,
+            error: Some("access denied".into()),
+        }];
+        let out = output::render(rows, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value[0]["error"], "access denied");
+    }
+
+    #[test]
+    fn test_write_row_table_no_error_renders_empty_cell() {
+        let rows = vec![WriteRow {
+            tag_id: "t1".into(),
+            success: true,
+            error: None,
+        }];
+        let out = output::render(rows, OutputFormat::Table).unwrap();
+        // The `display::option` helper renders `None` as `""`, matching the
+        // old `.unwrap_or_default()` behavior for table output.
+        assert!(!out.contains("None"));
     }
 }

@@ -29,3 +29,10 @@ server = "Kepware.KepServerEX.V5"
 # CLI flag: --max-tags
 # Default: 1000
 max_tags = 1000
+
+# Output format: "table" (human-readable, default) or "json" (pretty-printed,
+# for scripting/piping into jq). --json is shorthand for --output json.
+# CLI flag: --output / --json
+# Env var: OPC_BRIDGE_OUTPUT
+# Default: table
+output = "table"

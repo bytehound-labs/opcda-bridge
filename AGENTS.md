@@ -161,3 +161,42 @@ install`, not `install --port 7700`) since the SCM always launches a service's e
 whatever the operator wants applied every time the service starts must be baked into the
 registration itself via `service_launch_arguments`, not left to how the process happened to be
 invoked once at install time.
+
+### Client output formats
+
+`client/src/output.rs` holds `OutputFormat` (`Table`/`Json`) and the two pure functions every
+command routes through: `render<T: Tabled + Serialize>(rows, format)` and `format_error(err,
+format)`. Every row struct (`ServerRow`, `TagRow`, `ReadRow`, `WriteRow`) derives both `Tabled`
+and `Serialize`, so JSON keys are the Rust field names — the external contract for scripted
+consumers — while table headers stay controlled separately via `#[tabled(rename = "...")]`.
+`WriteRow.error` is `Option<String>` rather than the pre-JSON code's `.unwrap_or_default()`
+collapse to `""`, so JSON can distinguish "no error" (`null`) from an actual empty string; the
+table rendering still shows an empty cell for `None` via `#[tabled(rename = "Error",
+display("display::option", ""))]` (the built-in `tabled::derive::display::option` helper, which
+takes the fallback-for-`None` string as its second argument).
+
+`--json` is a plain boolean flag, not linked to `--output` via clap's `conflicts_with` —
+`conflicts_with` can misfire against env-sourced values, so precedence between the two is instead
+resolved once in code (`output::resolve_from_cli`: `--json` always wins if set, otherwise
+`--output`) rather than left to clap. `cmd_browse`'s branching checks `format ==
+OutputFormat::Json` before checking `flat`, so JSON output always bypasses `render_tree` and
+emits the same flat `TagRow` shape regardless of `--flat` — the indented tree is a display-only
+`String` builder with no structured equivalent.
+
+`main()` can no longer return `anyhow::Result<()>` once errors need format-aware rendering:
+`lib::run() -> ExitCode` resolves the CLI-only output format (`output::resolve_from_cli`) _before_
+calling `config::load_config`, so a config-load failure — which happens before the config file's
+own `output` key could ever be known — still gets reported in a sensible format (`--json`/
+`--output`/`OPC_BRIDGE_OUTPUT`, or `table` if none of those were given). Only once the config
+loads successfully does the fully-resolved `CLI > env > config > default` format apply to the
+command's own result. `run()` itself is a thin `Cli::parse()` wrapper around the real, unit-tested
+entry point `run_with_cli(cli: Cli) -> ExitCode` — the same "inject the otherwise-unparseable
+input as a parameter" pattern `logging.rs` uses for `is_terminal()` — so every branch (success,
+command error, config-load error, both output formats) is covered by tests that construct a `Cli`
+directly instead of needing to control `std::env::args()`. The one line real coverage can't reach
+that way — `run()`'s own body, which only ever runs from the compiled binary — is covered instead
+by `client/tests/main_integration.rs` spawning the real binary against a closed local port
+(`127.0.0.1:1`, an immediate, deterministic connection refusal) so the full `run() ->
+run_with_cli() -> fail()` path executes at least once outside of unit tests, alongside the
+pre-existing `--help` integration test (which alone doesn't reach this: clap exits the process
+from inside `Cli::parse()` before `run_with_cli` is ever called).
