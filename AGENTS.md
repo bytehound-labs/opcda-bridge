@@ -183,6 +183,11 @@ OutputFormat::Json` before checking `flat`, so JSON output always bypasses `rend
 emits the same flat `TagRow` shape regardless of `--flat` — the indented tree is a display-only
 `String` builder with no structured equivalent.
 
+`host`/`config`/`output`/`json` on `Cli` are all `#[arg(..., global = true)]`, so they can be
+passed either before or after the subcommand (clap's default otherwise requires top-level flags
+to precede the subcommand token, which is easy to trip over when a flag like `--json` is added
+after a command's positional args out of habit).
+
 `main()` can no longer return `anyhow::Result<()>` once errors need format-aware rendering:
 `lib::run() -> ExitCode` resolves the CLI-only output format (`output::resolve_from_cli`) _before_
 calling `config::load_config`, so a config-load failure — which happens before the config file's

@@ -5,19 +5,28 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "opcda-bridge", about = "OPC DA bridge client", version)]
 pub struct Cli {
-    #[arg(long, env = "OPC_BRIDGE_HOST")]
+    // `global = true` on these four lets them be passed either before or
+    // after the subcommand (e.g. both `--json read ...` and `read ... --json`
+    // work), instead of clap's default of requiring them before it.
+    #[arg(long, env = "OPC_BRIDGE_HOST", global = true)]
     pub host: Option<String>,
 
     /// Path to a TOML config file (default: platform config dir, see README)
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
 
     /// Output format: `table` (default) or `json`
-    #[arg(long, value_enum, value_name = "FORMAT", env = "OPC_BRIDGE_OUTPUT")]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        env = "OPC_BRIDGE_OUTPUT",
+        global = true
+    )]
     pub output: Option<OutputFormat>,
 
     /// Shorthand for `--output json`. If both are set, `--json` wins.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub json: bool,
 
     #[command(subcommand)]
@@ -291,6 +300,25 @@ mod tests {
         let args =
             Cli::try_parse_from(["opcda-bridge", "--host", "192.168.1.1:9999", "servers"]).unwrap();
         assert_eq!(args.host, Some("192.168.1.1:9999".to_string()));
+    }
+
+    #[test]
+    fn test_cli_global_flags_after_subcommand() {
+        // host/config/output/json are `global = true` so they can be placed
+        // after the subcommand too, not just before it.
+        let args = Cli::try_parse_from([
+            "opcda-bridge",
+            "read",
+            "--server",
+            "MyServer",
+            "tag1",
+            "--host",
+            "192.168.1.1:9999",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(args.host, Some("192.168.1.1:9999".to_string()));
+        assert!(args.json);
     }
 
     #[test]

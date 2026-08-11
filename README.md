@@ -107,8 +107,10 @@ config file — see [Configuration](#configuration) below.
 Every command prints its result as a table by default, except `browse` in its default tree mode,
 which prints an indented tree instead (pass `--flat` for the tabular form). Pass `--output json`
 (or its shorthand, `--json`) for machine-readable output instead — see
-[JSON output](#json-output) below. Run `opcda-bridge-client --help` or
-`opcda-bridge-client <command> --help` for the full flag reference.
+[JSON output](#json-output) below. `--host`, `--config`, `--output`, and `--json` may be placed
+either before or after the subcommand (e.g. both `--json read ...` and `read ... --json` work).
+Run `opcda-bridge-client --help` or `opcda-bridge-client <command> --help` for the full flag
+reference.
 
 ### JSON output
 
