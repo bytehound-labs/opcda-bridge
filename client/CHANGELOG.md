@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-client-v0.1.2...opcda-bridge-client-v0.1.3) - 2026-08-11
+
+### Added
+
+- add --output json / --json flag to client ([#16](https://github.com/mikeboiko/opcda-bridge/pull/16))
+
 ## [0.1.2](https://github.com/mikeboiko/opcda-bridge/compare/opcda-bridge-client-v0.1.1...opcda-bridge-client-v0.1.2) - 2026-08-01
 
 ### Added
