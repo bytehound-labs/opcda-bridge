@@ -165,6 +165,14 @@ client needs to opt in explicitly with
 `AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true)` before
 connecting.
 
+For a Rust program, skip both of the above and depend on
+[`bridge-client-core`](bridge-client-core) directly instead: it's the same typed
+connect/list-servers/browse/read/write API `opcda-bridge-client` itself is built on, returning
+plain Rust values (`Vec<String>`, `Vec<BrowseNode>`, `Vec<TagValue>`, `WriteResult`) with no
+`clap`, `tabled`, `serde_json`, or `toml` pulled in transitively — just `bridge-proto`, `tonic`,
+and `thiserror`. See the crate's [`lib.rs`](bridge-client-core/src/lib.rs) doc comment for a
+usage example.
+
 ## Configuration
 
 Both binaries accept a `--config <path>` flag pointing at a TOML file. Every setting resolves
