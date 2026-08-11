@@ -1,3 +1,4 @@
+use crate::output::OutputFormat;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -10,6 +11,14 @@ pub struct Cli {
     /// Path to a TOML config file (default: platform config dir, see README)
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+
+    /// Output format: `table` (default) or `json`
+    #[arg(long, value_enum, value_name = "FORMAT", env = "OPC_BRIDGE_OUTPUT")]
+    pub output: Option<OutputFormat>,
+
+    /// Shorthand for `--output json`. If both are set, `--json` wins.
+    #[arg(long)]
+    pub json: bool,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -55,29 +64,38 @@ pub enum Commands {
     },
 }
 
-pub async fn run_command(cli: Cli) -> anyhow::Result<()> {
-    let config = crate::config::load_config(cli.config.as_deref())?;
-    let host = crate::config::resolve_host(cli.host, &config);
+/// Dispatch a parsed `Cli` to the requested subcommand.
+///
+/// Takes an already-loaded `config` and already-resolved `format` rather
+/// than loading the config itself, so a config-load failure (handled by
+/// the caller, `lib::run`) can be reported in the right format even before
+/// this function would otherwise learn the config file's `output` key.
+pub async fn run_command(
+    cli: Cli,
+    config: &crate::config::ClientConfig,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let host = crate::config::resolve_host(cli.host, config);
 
     match cli.command {
-        Commands::Servers => crate::commands::cmd_servers(host).await?,
+        Commands::Servers => crate::commands::cmd_servers(host, format).await?,
         Commands::Browse {
             server,
             flat,
             path,
             max_tags,
         } => {
-            let server = crate::config::resolve_server(server, &config)?;
-            let max_tags = crate::config::resolve_max_tags(max_tags, &config);
-            crate::commands::cmd_browse(host, server, flat, path, max_tags).await?
+            let server = crate::config::resolve_server(server, config)?;
+            let max_tags = crate::config::resolve_max_tags(max_tags, config);
+            crate::commands::cmd_browse(host, server, flat, path, max_tags, format).await?
         }
         Commands::Read { server, tags } => {
-            let server = crate::config::resolve_server(server, &config)?;
-            crate::commands::cmd_read(host, server, tags).await?
+            let server = crate::config::resolve_server(server, config)?;
+            crate::commands::cmd_read(host, server, tags, format).await?
         }
         Commands::Write { server, tag, value } => {
-            let server = crate::config::resolve_server(server, &config)?;
-            crate::commands::cmd_write(host, server, tag, value).await?
+            let server = crate::config::resolve_server(server, config)?;
+            crate::commands::cmd_write(host, server, tag, value, format).await?
         }
     }
     Ok(())
@@ -102,9 +120,17 @@ mod tests {
         let cli = Cli {
             host: Some(host),
             config: None,
+            output: None,
+            json: false,
             command: Commands::Servers,
         };
-        run_command(cli).await.unwrap();
+        run_command(
+            cli,
+            &crate::config::ClientConfig::default(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -113,6 +139,8 @@ mod tests {
         let cli = Cli {
             host: Some(host),
             config: None,
+            output: None,
+            json: false,
             command: Commands::Browse {
                 server: Some("S".into()),
                 flat: false,
@@ -120,7 +148,13 @@ mod tests {
                 max_tags: None,
             },
         };
-        run_command(cli).await.unwrap();
+        run_command(
+            cli,
+            &crate::config::ClientConfig::default(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -129,6 +163,8 @@ mod tests {
         let cli = Cli {
             host: Some(host),
             config: None,
+            output: None,
+            json: false,
             command: Commands::Browse {
                 server: None,
                 flat: false,
@@ -136,7 +172,13 @@ mod tests {
                 max_tags: None,
             },
         };
-        let err = run_command(cli).await.unwrap_err();
+        let err = run_command(
+            cli,
+            &crate::config::ClientConfig::default(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("no OPC server specified"));
     }
 
@@ -146,12 +188,20 @@ mod tests {
         let cli = Cli {
             host: Some(host),
             config: None,
+            output: None,
+            json: false,
             command: Commands::Read {
                 server: Some("S".into()),
                 tags: vec![],
             },
         };
-        run_command(cli).await.unwrap();
+        run_command(
+            cli,
+            &crate::config::ClientConfig::default(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -168,13 +218,21 @@ mod tests {
         let cli = Cli {
             host: Some(host),
             config: None,
+            output: None,
+            json: false,
             command: Commands::Write {
                 server: Some("S".into()),
                 tag: "t".into(),
                 value: "hello".into(),
             },
         };
-        run_command(cli).await.unwrap();
+        run_command(
+            cli,
+            &crate::config::ClientConfig::default(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -387,5 +445,97 @@ mod tests {
             Cli::try_parse_from(["opcda-bridge", "--host", "arghost:7777", "servers"]).unwrap();
         assert_eq!(args.host, Some("arghost:7777".to_string()));
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
+    }
+
+    #[test]
+    fn test_cli_default_output_is_none() {
+        // OPC_BRIDGE_OUTPUT is read by every Cli::try_parse_from call, so
+        // this must be guarded/cleared just like test_cli_default_host,
+        // or a concurrently-running env-setting test in another thread
+        // could leak a value in here.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
+        let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
+        assert_eq!(args.output, None);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn test_cli_output_table_flag() {
+        let args = Cli::try_parse_from(["opcda-bridge", "--output", "table", "servers"]).unwrap();
+        assert_eq!(args.output, Some(OutputFormat::Table));
+    }
+
+    #[test]
+    fn test_cli_output_json_flag() {
+        let args = Cli::try_parse_from(["opcda-bridge", "--output", "json", "servers"]).unwrap();
+        assert_eq!(args.output, Some(OutputFormat::Json));
+    }
+
+    #[test]
+    fn test_cli_json_shorthand_flag() {
+        // See test_cli_default_output_is_none: args.output is asserted here
+        // too, so this needs the same guard/clear.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
+        let args = Cli::try_parse_from(["opcda-bridge", "--json", "servers"]).unwrap();
+        assert!(args.json);
+        assert_eq!(args.output, None);
+    }
+
+    #[test]
+    fn test_cli_output_from_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("OPC_BRIDGE_OUTPUT", "json") };
+        let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
+        assert_eq!(args.output, Some(OutputFormat::Json));
+        unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
+    }
+
+    #[test]
+    fn test_cli_json_flag_with_output_env_set_both_parse() {
+        // `--json` and `--output` (even env-sourced) are not declared as
+        // clap conflicts: resolve_from_cli resolves the precedence in code
+        // (--json always wins) instead, so both can be present here.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("OPC_BRIDGE_OUTPUT", "table") };
+        let args = Cli::try_parse_from(["opcda-bridge", "--json", "servers"]).unwrap();
+        assert!(args.json);
+        assert_eq!(args.output, Some(OutputFormat::Table));
+        assert_eq!(
+            crate::output::resolve_from_cli(&args),
+            Some(OutputFormat::Json)
+        );
+        unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
+    }
+
+    #[test]
+    fn test_resolve_from_cli_json_wins_over_output() {
+        let args = Cli::try_parse_from(["opcda-bridge", "--json", "--output", "table", "servers"])
+            .unwrap();
+        assert_eq!(
+            crate::output::resolve_from_cli(&args),
+            Some(OutputFormat::Json)
+        );
+    }
+
+    #[test]
+    fn test_resolve_from_cli_output_only() {
+        let args = Cli::try_parse_from(["opcda-bridge", "--output", "json", "servers"]).unwrap();
+        assert_eq!(
+            crate::output::resolve_from_cli(&args),
+            Some(OutputFormat::Json)
+        );
+    }
+
+    #[test]
+    fn test_resolve_from_cli_neither_set() {
+        // args.output is env-sensitive when neither --output nor --json is
+        // passed, so this needs the same guard/clear as
+        // test_cli_default_output_is_none.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
+        let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
+        assert_eq!(crate::output::resolve_from_cli(&args), None);
     }
 }
