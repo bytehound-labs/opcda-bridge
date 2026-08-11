@@ -59,6 +59,16 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   cargo build --release -p opcda-bridge-client
   ./target/release/opcda-bridge-client --help
   ```
+- **`cargo install`** (same prerequisites as the gateway; installs straight from git since these
+  crates aren't published to crates.io):
+  ```sh
+  cargo install --git https://github.com/mikeboiko/opcda-bridge.git opcda-bridge-client --locked
+  ```
+  Pin to a specific release instead of tracking `main` by adding `--tag
+opcda-bridge-client-v<version>` (see the
+  [Releases](https://github.com/mikeboiko/opcda-bridge/releases) page for available tags). Either
+  way, this places `opcda-bridge-client` on `PATH` at `~/.cargo/bin/opcda-bridge-client`; re-run
+  the same command (add `--force` to overwrite an existing install) to upgrade.
 
 ## Usage
 
