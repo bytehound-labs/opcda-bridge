@@ -59,7 +59,14 @@ jobs:
 
   aur-publish:
     needs: release-client
-    if: startsWith(github.ref_name, 'opcda-bridge-client-v')
+    # AUR publishing is paused until aur.archlinux.org's outage clears (an
+    # ongoing DDoS-related outage starting 2026-08-01; see
+    # https://archlinux.org/news/recent-services-outages/). This job would
+    # otherwise fail on every client release with "The AUR is down due to
+    # maintenance", spamming failure notifications for something outside
+    # this repo's control. Restore the condition below once AUR is back:
+    #   if: startsWith(github.ref_name, 'opcda-bridge-client-v')
+    if: false
     uses: ./.github/workflows/aur-publish.yml
     with:
       release_tag: ${{ github.ref_name }}
