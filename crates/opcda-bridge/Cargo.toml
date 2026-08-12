@@ -1,0 +1,37 @@
+[package]
+name = "opcda-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Reusable async Rust client library for the opcda-bridge gateway's gRPC API"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/opcda-bridge"
+keywords = ["opc", "opc-da", "scada", "industrial", "grpc"]
+categories = ["network-programming", "api-bindings", "hardware-support"]
+
+[dependencies]
+opcda-bridge-proto.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[dev-dependencies]
+anyhow = "1"
+tokio = { workspace = true, features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tokio-stream.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost"]

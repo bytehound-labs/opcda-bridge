@@ -1,0 +1,53 @@
+[package]
+name = "opcda-bridge-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "OPC DA gateway (Windows COM server)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/opcda-bridge-gateway"
+keywords = ["opc", "opc-da", "scada", "dcs", "windows"]
+categories = [
+  "network-programming",
+  "hardware-support",
+  "command-line-utilities",
+]
+
+[dependencies]
+opcda-bridge-proto.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+] }
+tokio-stream.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+opc-da-client.workspace = true
+windows-service.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost"]
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+rustdoc-args = ["--cfg", "docsrs"]

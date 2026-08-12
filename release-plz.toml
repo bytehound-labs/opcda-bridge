@@ -1,15 +1,4 @@
 [workspace]
-publish = false
-git_only = true
-
-# `opcda-bridge` (the workspace root package) and `bridge-proto` are internal-only shared
-# crates: never published, and no release.yml job builds artifacts from their tags. Without
-# this override, release-plz still bumps/tags them whenever a root-level file changes (e.g.
-# README.md) or bridge-proto's directory changes, creating tags/releases with no purpose.
-[[package]]
-name = "opcda-bridge"
-release = false
-
-[[package]]
-name = "bridge-proto"
-release = false
+publish = true
+release = true
+publish_timeout = "30m"

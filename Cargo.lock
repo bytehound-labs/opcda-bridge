@@ -168,29 +168,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
-name = "bridge-client-core"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "bridge-proto",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
-]
-
-[[package]]
-name = "bridge-proto"
-version = "0.1.0"
-dependencies = [
- "prost",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -751,19 +728,25 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
+ "anyhow",
+ "opcda-bridge-proto",
  "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
 name = "opcda-bridge-client"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "anyhow",
- "bridge-client-core",
- "bridge-proto",
  "clap",
+ "opcda-bridge",
+ "opcda-bridge-proto",
  "serde",
  "serde_json",
  "tabled",
@@ -777,14 +760,13 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "bridge-proto",
  "clap",
  "opc-da-client",
- "opcda-bridge",
+ "opcda-bridge-proto",
  "serde",
  "tempfile",
  "tokio",
@@ -796,6 +778,16 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows-service",
+]
+
+[[package]]
+name = "opcda-bridge-proto"
+version = "0.2.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

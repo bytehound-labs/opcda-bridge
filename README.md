@@ -4,12 +4,18 @@
 [![codecov](https://codecov.io/gh/bytehound-labs/opcda-bridge/branch/main/graph/badge.svg?token=)](https://codecov.io/gh/bytehound-labs/opcda-bridge)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
+[![opcda-bridge on crates.io](https://img.shields.io/crates/v/opcda-bridge.svg)](https://crates.io/crates/opcda-bridge)
+[![opcda-bridge on docs.rs](https://docs.rs/opcda-bridge/badge.svg)](https://docs.rs/opcda-bridge)
+[![opcda-bridge-client on crates.io](https://img.shields.io/crates/v/opcda-bridge-client.svg)](https://crates.io/crates/opcda-bridge-client)
+[![opcda-bridge-gateway on crates.io](https://img.shields.io/crates/v/opcda-bridge-gateway.svg)](https://crates.io/crates/opcda-bridge-gateway)
 
 A lightweight Rust gateway bridging classic OPC DA (Windows/COM) servers to remote Linux/macOS/Windows clients.
 
 ## Status
 
-Active development. Gateway and client are functional end-to-end — OPC DA read/write/browse passing against a live Kepware server.
+Active development. Gateway and client are functional end-to-end — OPC DA read/write/browse passing
+against a live Kepware server. The workspace publishes the reusable client library, protocol
+definitions, cross-platform CLI, and Windows gateway as separate crates.
 
 ## Why
 
@@ -32,13 +38,17 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   `opcda-bridge-gateway-v*` release, extract it, and run `opcda-bridge-gateway.exe`. No installer
   needed. The binary targets 32-bit Windows (`i686`), matching the architecture most legacy OPC DA
   servers still require for COM interop.
-- **From source** (requires a Rust toolchain with 2024 edition support, i.e. Rust 1.85+, and the
+- **From source** (requires Rust 1.88+ and the
   Protocol Buffers compiler `protoc` on `PATH`):
   ```sh
   git clone https://github.com/bytehound-labs/opcda-bridge.git
   cd opcda-bridge
   cargo build --release -p opcda-bridge-gateway
   ./target/release/opcda-bridge-gateway.exe
+  ```
+- **Install from crates.io** (requires Rust 1.88+ and `protoc`):
+  ```sh
+  cargo install opcda-bridge-gateway
   ```
 
 ### Client (Linux, macOS, Windows)
@@ -59,16 +69,13 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   cargo build --release -p opcda-bridge-client
   ./target/release/opcda-bridge-client --help
   ```
-- **`cargo install`** (same prerequisites as the gateway; installs straight from git since these
-  crates aren't published to crates.io):
+- **Install from crates.io** (same prerequisites as the gateway):
   ```sh
-  cargo install --git https://github.com/bytehound-labs/opcda-bridge.git opcda-bridge-client --locked
+  cargo install opcda-bridge-client
   ```
-  Pin to a specific release instead of tracking `main` by adding `--tag
-opcda-bridge-client-v<version>` (see the
-  [Releases](https://github.com/bytehound-labs/opcda-bridge/releases) page for available tags). Either
-  way, this places `opcda-bridge-client` on `PATH` at `~/.cargo/bin/opcda-bridge-client`; re-run
-  the same command (add `--force` to overwrite an existing install) to upgrade.
+  This places `opcda-bridge-client` on `PATH` at `~/.cargo/bin/opcda-bridge-client`; re-run the same
+  command (add `--force` to overwrite an existing install) to upgrade. Use
+  `cargo install opcda-bridge-client --version 0.2.0` to pin a specific published version.
 
 ## Usage
 
@@ -158,7 +165,7 @@ The lightest-weight integration path for calling the client from a script (Pytho
 is shelling out to the binary with `--json` and parsing stdout, as shown above. For heavier
 integration — a long-running .NET or Python service that talks to the gateway directly — it's
 usually better to generate native gRPC stubs straight from
-[`bridge-proto/proto/bridge.proto`](bridge-proto/proto/bridge.proto) (e.g. `grpcio-tools` for
+[`opcda-bridge-proto/proto/bridge.proto`](crates/opcda-bridge-proto/proto/bridge.proto) (e.g. `grpcio-tools` for
 Python, `Grpc.Tools` for .NET) and skip the client binary entirely; it's the same wire protocol
 the CLI itself speaks. One caveat: the gateway serves plaintext HTTP/2 (no TLS), so a .NET
 client needs to opt in explicitly with
@@ -166,12 +173,17 @@ client needs to opt in explicitly with
 connecting.
 
 For a Rust program, skip both of the above and depend on
-[`bridge-client-core`](bridge-client-core) directly instead: it's the same typed
+[`opcda-bridge`](https://crates.io/crates/opcda-bridge) directly instead: it's the same typed
 connect/list-servers/browse/read/write API `opcda-bridge-client` itself is built on, returning
 plain Rust values (`Vec<String>`, `Vec<BrowseNode>`, `Vec<TagValue>`, `WriteResult`) with no
-`clap`, `tabled`, `serde_json`, or `toml` pulled in transitively — just `bridge-proto`, `tonic`,
-and `thiserror`. See the crate's [`lib.rs`](bridge-client-core/src/lib.rs) doc comment for a
-usage example.
+`clap`, `tabled`, `serde_json`, or `toml` pulled in transitively — just `opcda-bridge-proto`,
+`tonic`, and `thiserror`. Add it to a project with:
+
+```sh
+cargo add opcda-bridge
+```
+
+See the crate's [API documentation](https://docs.rs/opcda-bridge) for a usage example.
 
 ## Configuration
 
@@ -189,7 +201,8 @@ pointing at the file and the parse problem.
 ### Gateway
 
 Looks for `opcda-bridge-gateway.toml` next to the executable unless `--config` gives another
-path. See [`gateway/opcda-bridge-gateway.example.toml`](gateway/opcda-bridge-gateway.example.toml)
+path. See
+[`crates/opcda-bridge-gateway/opcda-bridge-gateway.example.toml`](crates/opcda-bridge-gateway/opcda-bridge-gateway.example.toml)
 for every available key.
 
 | Setting     | CLI flag | Env var           | Config key | Default |
@@ -206,7 +219,9 @@ Looks for a config file in a platform-specific location unless `--config` gives 
   `$HOME/.config/opcda-bridge/client.toml`.
 - Windows: `%APPDATA%\opcda-bridge\client.toml`.
 
-See [`client/client.example.toml`](client/client.example.toml) for every available key.
+See
+[`crates/opcda-bridge-client/client.example.toml`](crates/opcda-bridge-client/client.example.toml)
+for every available key.
 
 | Setting               | CLI flag              | Env var             | Config key | Default                               |
 | --------------------- | --------------------- | ------------------- | ---------- | ------------------------------------- |

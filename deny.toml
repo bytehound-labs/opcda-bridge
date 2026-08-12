@@ -1,5 +1,10 @@
 [advisories]
 version = 2
+ignore = [
+  # tabled 0.19/0.21 still depends on proc-macro-error2, for which RustSec
+  # currently reports no safe upgrade path. Revisit when tabled removes it.
+  "RUSTSEC-2026-0173",
+]
 
 [licenses]
 version = 2
