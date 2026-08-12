@@ -37,7 +37,8 @@ Example: `feat(gateway): add tag subscription support`.
 
 - Unit-test protocol/parsing logic with `cargo test --workspace` — no hardware required.
 - The gateway depends on `opc-da-client` only on Windows (`#[cfg(target_os = "windows")]`). Its
-  core logic is abstracted behind an `OpcClient` trait (`gateway/src/opc.rs`) so it stays testable
+  core logic is abstracted behind an `OpcClient` trait
+  (`crates/opcda-bridge-gateway/src/opc.rs`) so it stays testable
   on any OS: tests exercise a hand-written `MockOpcClient` instead of a live COM connection.
 - Hardware-in-the-loop tests (against a real Windows host + OPC DA server) aren't part of CI;
   note manual verification steps in the PR description when a change needs them.
@@ -56,14 +57,17 @@ PRs must pass `cargo fmt --check --all`, `cargo clippy --workspace --all-targets
 
 ## Releases
 
-SemVer tags (`<component>-vX.Y.Z`) cut directly from `main`, one release per shippable crate
-(`opcda-bridge-gateway`, `opcda-bridge-client`) — each tag triggers a CI job that builds and
-publishes that crate's binaries. No release branches.
+The workspace publishes four crates to crates.io:
 
-`opcda-bridge` (the workspace root package) and `bridge-proto` are internal-only shared crates
-consumed via path dependencies; release-plz tracks their versions in-repo but never tags or
-releases them independently (`release = false` in `release-plz.toml`), since neither is ever
-published or built as a standalone artifact.
+- `opcda-bridge-proto` — generated gRPC protocol types.
+- `opcda-bridge` — reusable async Rust client library.
+- `opcda-bridge-client` — cross-platform CLI.
+- `opcda-bridge-gateway` — Windows OPC DA gateway.
+
+`release-plz` creates release pull requests, publishes crates in dependency order, and creates
+SemVer tags and GitHub releases. The binary release workflow uses the client and gateway tags to
+build platform archives. Published crate names and versions are permanent; a yanked version
+cannot be reused.
 
 ## License
 

@@ -1,0 +1,41 @@
+[package]
+name = "opcda-bridge-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "OPC DA cross-platform client"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/opcda-bridge-client"
+keywords = ["opc", "opc-da", "scada", "industrial", "cli"]
+categories = [
+  "command-line-utilities",
+  "network-programming",
+  "hardware-support",
+]
+
+[dependencies]
+opcda-bridge.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tabled.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+opcda-bridge-proto.workspace = true
+tempfile.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tokio-stream.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

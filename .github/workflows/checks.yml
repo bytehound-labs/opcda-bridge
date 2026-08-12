@@ -46,3 +46,51 @@ jobs:
         with:
           name: opcda-bridge-gateway
           path: target/i686-pc-windows-msvc/release/opcda-bridge-gateway.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Linux tests
+        run: cargo test --workspace --locked
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify publishable packages
+        run: cargo package --workspace --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the declared MSRV
+        run: cargo check --workspace --all-targets --locked

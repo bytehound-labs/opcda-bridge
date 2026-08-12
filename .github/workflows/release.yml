@@ -23,7 +23,7 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: opcda-bridge-gateway
-          manifest_path: gateway/Cargo.toml
+          manifest_path: crates/opcda-bridge-gateway/Cargo.toml
           target: i686-pc-windows-msvc
           archive: opcda-bridge-gateway-windows-x86
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -53,7 +53,7 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: opcda-bridge-client
-          manifest_path: client/Cargo.toml
+          manifest_path: crates/opcda-bridge-client/Cargo.toml
           archive: ${{ matrix.archive }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
