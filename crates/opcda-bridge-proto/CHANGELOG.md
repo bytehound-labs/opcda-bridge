@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/bytehound-labs/opcda-bridge/releases/tag/opcda-bridge-proto-v0.2.0) - 2026-08-12
+
+### Added
+
+- publish workspace crates
+
 ## [0.1.0](https://github.com/mikeboiko/opcda-bridge/releases/tag/bridge-proto-v0.1.0) - 2026-07-30
 
 ### Other
