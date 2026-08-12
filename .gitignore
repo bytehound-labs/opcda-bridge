@@ -14,8 +14,7 @@ target
 **/mutants.out*/
 
 # Other
-/tags
-tags.*
+**/tags
 
 # Added by cargo
 

@@ -74,6 +74,14 @@ targets both at 100% with a 1% threshold). CI fails if coverage drops. All code 
 branches, edge cases, and default values — must be tested. When adding new code, add
 corresponding tests in the same PR to maintain 100% coverage.
 
+**Codecov upload is temporarily non-blocking** (`.github/workflows/coverage.yml` sets
+`fail_ci_if_error: false`) since this repo transferred from `mikeboiko/opcda-bridge` to
+`bytehound-labs/opcda-bridge`: Codecov doesn't recognize the repo under its new owner and rejects
+tokenless uploads on a protected branch ("Token required - not valid tokenless upload"). Re-add/
+re-sync `bytehound-labs/opcda-bridge` on codecov.io, add its token as the `CODECOV_TOKEN` repo
+secret, then restore `fail_ci_if_error: true`. The local coverage numbers computed by
+`cargo llvm-cov` are unaffected — this gap is only about the upload/PR-status integration.
+
 ### Test design for the gateway
 
 The gateway binary (`opcda-bridge-gateway`) depends on `opc-da-client` only on Windows
