@@ -1,4 +1,6 @@
 [workspace]
 publish = true
 release = true
+release_always = false
+release_commits = "^(feat|fix|perf|refactor|docs|test|build|ci|revert)[(:]|^chore\\([^)]*\\)!?[(:]"
 publish_timeout = "30m"
