@@ -2,12 +2,10 @@
 
 [![CI](https://github.com/bytehound-labs/opcda-bridge/actions/workflows/checks.yml/badge.svg)](https://github.com/bytehound-labs/opcda-bridge/actions/workflows/checks.yml)
 [![codecov](https://codecov.io/gh/bytehound-labs/opcda-bridge/branch/main/graph/badge.svg?token=)](https://codecov.io/gh/bytehound-labs/opcda-bridge)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![opcda-bridge on crates.io](https://img.shields.io/crates/v/opcda-bridge.svg)](https://crates.io/crates/opcda-bridge)
 [![opcda-bridge on docs.rs](https://docs.rs/opcda-bridge/badge.svg)](https://docs.rs/opcda-bridge)
-[![opcda-bridge-client on crates.io](https://img.shields.io/crates/v/opcda-bridge-client.svg)](https://crates.io/crates/opcda-bridge-client)
-[![opcda-bridge-gateway on crates.io](https://img.shields.io/crates/v/opcda-bridge-gateway.svg)](https://crates.io/crates/opcda-bridge-gateway)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A lightweight Rust gateway bridging classic OPC DA (Windows/COM) servers to remote Linux/macOS/Windows clients.
 
