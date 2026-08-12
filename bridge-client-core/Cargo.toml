@@ -1,6 +1,6 @@
 [package]
 name = "bridge-client-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Reusable async Rust client library for the opcda-bridge gateway's gRPC API"
 license = "MIT"
