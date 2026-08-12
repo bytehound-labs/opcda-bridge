@@ -169,7 +169,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bridge-client-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bridge-proto",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-client"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "bridge-client-core",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
