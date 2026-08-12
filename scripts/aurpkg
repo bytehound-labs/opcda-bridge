@@ -89,6 +89,7 @@ pkgdesc='OPC DA cross-platform client'
 arch=('x86_64')
 url='https://github.com/bytehound-labs/opcda-bridge'
 license=('MIT')
+options=('!debug')
 provides=('opcda-bridge-client')
 conflicts=('opcda-bridge-client')
 
@@ -121,6 +122,7 @@ cat > "$OUTPUT_DIR/.SRCINFO" << SRCINFOEOF
 	sha256sums = $README_SHA
 	provides = opcda-bridge-client
 	conflicts = opcda-bridge-client
+	options = !debug
 	source_x86_64 = opcda-bridge-client-bin-\$pkgver-x86_64.tar.gz::https://github.com/bytehound-labs/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME
 	sha256sums_x86_64 = $X86_64_SHA
 
