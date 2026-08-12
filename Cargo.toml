@@ -8,7 +8,7 @@ version = "0.1.5"
 edition = "2024"
 description = "OPC DA gateway/client bridge between Windows and Linux"
 license = "MIT"
-repository = "https://github.com/mikeboiko/opcda-bridge"
+repository = "https://github.com/bytehound-labs/opcda-bridge"
 
 [dependencies]
 thiserror = "2"

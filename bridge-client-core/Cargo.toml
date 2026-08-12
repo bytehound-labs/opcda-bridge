@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2024"
 description = "Reusable async Rust client library for the opcda-bridge gateway's gRPC API"
 license = "MIT"
-repository = "https://github.com/mikeboiko/opcda-bridge"
+repository = "https://github.com/bytehound-labs/opcda-bridge"
 
 [dependencies]
 bridge-proto = { path = "../bridge-proto", version = "0.1.0" }

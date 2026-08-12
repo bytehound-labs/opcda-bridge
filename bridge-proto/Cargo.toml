@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "gRPC protocol definitions for opcda-bridge"
 license = "MIT"
-repository = "https://github.com/mikeboiko/opcda-bridge"
+repository = "https://github.com/bytehound-labs/opcda-bridge"
 
 [dependencies]
 prost = "0.14"

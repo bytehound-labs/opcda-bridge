@@ -1,7 +1,7 @@
 # opcda-bridge
 
-[![CI](https://github.com/mikeboiko/opcda-bridge/actions/workflows/checks.yml/badge.svg)](https://github.com/mikeboiko/opcda-bridge/actions/workflows/checks.yml)
-[![codecov](https://codecov.io/gh/mikeboiko/opcda-bridge/branch/main/graph/badge.svg?token=)](https://codecov.io/gh/mikeboiko/opcda-bridge)
+[![CI](https://github.com/bytehound-labs/opcda-bridge/actions/workflows/checks.yml/badge.svg)](https://github.com/bytehound-labs/opcda-bridge/actions/workflows/checks.yml)
+[![codecov](https://codecov.io/gh/bytehound-labs/opcda-bridge/branch/main/graph/badge.svg?token=)](https://codecov.io/gh/bytehound-labs/opcda-bridge)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 
@@ -22,7 +22,7 @@ OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based 
 
 ## Installation
 
-Prebuilt binaries for every tagged release are attached to the [Releases](https://github.com/mikeboiko/opcda-bridge/releases) page.
+Prebuilt binaries for every tagged release are attached to the [Releases](https://github.com/bytehound-labs/opcda-bridge/releases) page.
 
 ### Gateway (Windows)
 
@@ -35,7 +35,7 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
 - **From source** (requires a Rust toolchain with 2024 edition support, i.e. Rust 1.85+, and the
   Protocol Buffers compiler `protoc` on `PATH`):
   ```sh
-  git clone https://github.com/mikeboiko/opcda-bridge.git
+  git clone https://github.com/bytehound-labs/opcda-bridge.git
   cd opcda-bridge
   cargo build --release -p opcda-bridge-gateway
   ./target/release/opcda-bridge-gateway.exe
@@ -54,7 +54,7 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   ```
 - **From source** (same prerequisites as the gateway):
   ```sh
-  git clone https://github.com/mikeboiko/opcda-bridge.git
+  git clone https://github.com/bytehound-labs/opcda-bridge.git
   cd opcda-bridge
   cargo build --release -p opcda-bridge-client
   ./target/release/opcda-bridge-client --help
@@ -62,11 +62,11 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
 - **`cargo install`** (same prerequisites as the gateway; installs straight from git since these
   crates aren't published to crates.io):
   ```sh
-  cargo install --git https://github.com/mikeboiko/opcda-bridge.git opcda-bridge-client --locked
+  cargo install --git https://github.com/bytehound-labs/opcda-bridge.git opcda-bridge-client --locked
   ```
   Pin to a specific release instead of tracking `main` by adding `--tag
 opcda-bridge-client-v<version>` (see the
-  [Releases](https://github.com/mikeboiko/opcda-bridge/releases) page for available tags). Either
+  [Releases](https://github.com/bytehound-labs/opcda-bridge/releases) page for available tags). Either
   way, this places `opcda-bridge-client` on `PATH` at `~/.cargo/bin/opcda-bridge-client`; re-run
   the same command (add `--force` to overwrite an existing install) to upgrade.
 

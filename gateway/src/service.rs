@@ -20,7 +20,7 @@ pub const SERVICE_NAME: &str = "OpcdaBridgeGateway";
 pub const SERVICE_DISPLAY_NAME: &str = "OPC DA Bridge Gateway";
 /// Shown as the service's description in `services.msc`.
 pub const SERVICE_DESCRIPTION: &str = "Bridges native OPC DA (COM/DCOM) tags to opcda-bridge clients over the network. \
-     https://github.com/mikeboiko/opcda-bridge";
+     https://github.com/bytehound-labs/opcda-bridge";
 
 /// Plain, platform-neutral description of how the gateway should be
 /// registered with the SCM. Built and tested independent of the

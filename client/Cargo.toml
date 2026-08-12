@@ -4,7 +4,7 @@ version = "0.1.6"
 edition = "2024"
 description = "OPC DA cross-platform client"
 license = "MIT"
-repository = "https://github.com/mikeboiko/opcda-bridge"
+repository = "https://github.com/bytehound-labs/opcda-bridge"
 
 [dependencies]
 bridge-client-core = { path = "../bridge-client-core", version = "0.1.1" }

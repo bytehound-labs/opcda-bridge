@@ -4,7 +4,7 @@ version = "0.1.5"
 edition = "2024"
 description = "OPC DA gateway (Windows COM server)"
 license = "MIT"
-repository = "https://github.com/mikeboiko/opcda-bridge"
+repository = "https://github.com/bytehound-labs/opcda-bridge"
 
 [dependencies]
 bridge-proto = { path = "../bridge-proto", version = "0.1.0" }

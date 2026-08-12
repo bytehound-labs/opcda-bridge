@@ -87,17 +87,17 @@ pkgver=$pkgver
 pkgrel=$PKGREL
 pkgdesc='OPC DA cross-platform client'
 arch=('x86_64')
-url='https://github.com/mikeboiko/opcda-bridge'
+url='https://github.com/bytehound-labs/opcda-bridge'
 license=('MIT')
 provides=('opcda-bridge-client')
 conflicts=('opcda-bridge-client')
 
-source=("LICENSE::https://raw.githubusercontent.com/mikeboiko/opcda-bridge/$release_tag/LICENSE"
-        "README.md::https://raw.githubusercontent.com/mikeboiko/opcda-bridge/$release_tag/README.md")
+source=("LICENSE::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/LICENSE"
+        "README.md::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/README.md")
 sha256sums=('$LICENSE_SHA'
             '$README_SHA')
 
-source_x86_64=("\${pkgname}-\${pkgver}-x86_64.tar.gz::https://github.com/mikeboiko/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME")
+source_x86_64=("\${pkgname}-\${pkgver}-x86_64.tar.gz::https://github.com/bytehound-labs/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME")
 sha256sums_x86_64=('$X86_64_SHA')
 
 package() {
@@ -112,16 +112,16 @@ cat > "$OUTPUT_DIR/.SRCINFO" << SRCINFOEOF
 	pkgdesc = OPC DA cross-platform client
 	pkgver = $pkgver
 	pkgrel = $PKGREL
-	url = https://github.com/mikeboiko/opcda-bridge
+	url = https://github.com/bytehound-labs/opcda-bridge
 	arch = x86_64
 	license = MIT
-	source = LICENSE::https://raw.githubusercontent.com/mikeboiko/opcda-bridge/$release_tag/LICENSE
-	source = README.md::https://raw.githubusercontent.com/mikeboiko/opcda-bridge/$release_tag/README.md
+	source = LICENSE::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/LICENSE
+	source = README.md::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/README.md
 	sha256sums = $LICENSE_SHA
 	sha256sums = $README_SHA
 	provides = opcda-bridge-client
 	conflicts = opcda-bridge-client
-	source_x86_64 = opcda-bridge-client-bin-\$pkgver-x86_64.tar.gz::https://github.com/mikeboiko/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME
+	source_x86_64 = opcda-bridge-client-bin-\$pkgver-x86_64.tar.gz::https://github.com/bytehound-labs/opcda-bridge/releases/download/$release_tag/$ARCHIVE_NAME
 	sha256sums_x86_64 = $X86_64_SHA
 
 pkgname = opcda-bridge-client-bin
