@@ -14,7 +14,13 @@ thiserror = "2"
 
 [dev-dependencies]
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 tokio-stream = "0.1"
 
 [package.metadata.cargo-machete]

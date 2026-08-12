@@ -138,16 +138,32 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use crate::test_support::{MockBridgeService, start_mock_server};
+    use bridge_proto::bridge::bridge_server::Bridge;
     use bridge_proto::bridge::{BrowseResponse, bridge_client::BridgeClient as ProtoBridgeClient};
     use bridge_proto::bridge::{
         ListServersResponse, ReadResponse, TagValue as ProtoTagValue, WriteResponse,
     };
-    use tonic::Status;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tonic::{Request, Status};
 
     #[tokio::test]
     async fn test_connect_success() {
         let host = start_mock_server(MockBridgeService::default()).await;
         Client::connect(&host).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mock_server_shutdown_completes_background_task() {
+        let service = MockBridgeService::default();
+        let server_shutdown = Arc::clone(&service.server_shutdown);
+        let server_stopped = Arc::clone(&service.server_stopped);
+        let _host = start_mock_server(service).await;
+
+        server_shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), server_stopped.notified())
+            .await
+            .expect("mock server did not stop after shutdown");
     }
 
     #[tokio::test]
@@ -292,14 +308,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_browse_drop_with_many_items_breaks_server_send_loop() {
-        // `Client::browse` always fully drains the stream, so exercising
-        // the mock server's own early-disconnect handling (the `break` in
-        // `test_support::MockBridgeService::browse`'s background task when
-        // the receiver goes away) requires bypassing `Client` and talking
-        // to the raw generated `BridgeClient` directly, the same way
-        // `opcda-bridge-client`'s own `test_cmd_browse_drop_with_many_items`
-        // does against its own copy of the mock service.
+    async fn test_browse_drop_stops_server_send_loop() {
+        // Drop the service response directly instead of relying on gRPC
+        // buffering to propagate a remote client disconnect.
         let svc = MockBridgeService {
             browse_responses: (0..300)
                 .map(|i| BrowseResponse {
@@ -309,24 +320,20 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let host = start_mock_server(svc).await;
-        let mut client = ProtoBridgeClient::connect(format!("http://{host}"))
-            .await
-            .unwrap();
-        let mut stream = client
-            .browse(BrowseRequest {
+        let browse_send_failure = Arc::clone(&svc.browse_send_failure);
+        let response = svc
+            .browse(Request::new(BrowseRequest {
                 server: "S".into(),
                 flat: false,
                 path: String::new(),
                 max_tags: 1000,
-            })
+            }))
             .await
-            .unwrap()
-            .into_inner();
-        let _first = stream.message().await;
-        drop(stream);
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+            .unwrap();
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), browse_send_failure.notified())
+            .await
+            .expect("mock sender did not observe the dropped browse stream");
     }
 
     #[tokio::test]

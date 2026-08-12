@@ -17,7 +17,8 @@ use bridge_proto::bridge::{
     ReadResponse, WriteRequest, WriteResponse,
 };
 use std::net::SocketAddr;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -38,6 +39,9 @@ pub(crate) struct MockBridgeService {
     pub(crate) browse_responses: Vec<BrowseResponse>,
     pub(crate) browse_initial_error: Option<Status>,
     pub(crate) browse_stream_error: Option<Status>,
+    pub(crate) browse_send_failure: Arc<Notify>,
+    pub(crate) server_shutdown: Arc<Notify>,
+    pub(crate) server_stopped: Arc<Notify>,
     pub(crate) read_response: ReadResponse,
     pub(crate) read_error: Option<Status>,
     pub(crate) write_response: WriteResponse,
@@ -68,9 +72,11 @@ impl Bridge for MockBridgeService {
         let (tx, rx) = mpsc::channel(4);
         let items = self.browse_responses.clone();
         let stream_error = self.browse_stream_error.clone();
+        let browse_send_failure = Arc::clone(&self.browse_send_failure);
         tokio::spawn(async move {
             for item in items {
                 if tx.send(Ok(item)).await.is_err() {
+                    browse_send_failure.notify_one();
                     break;
                 }
             }
@@ -105,12 +111,18 @@ pub(crate) async fn start_mock_server(service: MockBridgeService) -> String {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let server_shutdown = Arc::clone(&service.server_shutdown);
+    let server_stopped = Arc::clone(&service.server_stopped);
     tokio::spawn(async move {
         Server::builder()
             .add_service(BridgeServer::new(service))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                server_shutdown.notified(),
+            )
             .await
             .unwrap();
+        server_stopped.notify_one();
     });
     format!("127.0.0.1:{port}")
 }
