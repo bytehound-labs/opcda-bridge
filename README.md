@@ -15,7 +15,8 @@ A lightweight Rust gateway bridging classic OPC DA (Windows/COM) servers to remo
 
 Active development. Gateway and client are functional end-to-end — OPC DA read/write/browse passing
 against a live Kepware server. The workspace publishes the reusable client library, protocol
-definitions, cross-platform CLI, and Windows gateway as separate crates.
+definitions, cross-platform CLI, and Windows gateway as separate crates. Release-plz publishes a
+new crate version only after its generated release pull request is merged.
 
 ## Why
 

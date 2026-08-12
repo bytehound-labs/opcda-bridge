@@ -64,10 +64,11 @@ The workspace publishes four crates to crates.io:
 - `opcda-bridge-client` — cross-platform CLI.
 - `opcda-bridge-gateway` — Windows OPC DA gateway.
 
-`release-plz` creates release pull requests, publishes crates in dependency order, and creates
-SemVer tags and GitHub releases. The binary release workflow uses the client and gateway tags to
-build platform archives. Published crate names and versions are permanent; a yanked version
-cannot be reused.
+`release-plz` creates release pull requests, publishes crates in dependency order only when a
+release pull request is merged, and creates SemVer tags and GitHub releases. Release-only commits
+do not create another release pull request. The binary release workflow uses the client and
+gateway tags to build platform archives. Published crate names and versions are permanent; a
+yanked version cannot be reused.
 
 ## License
 

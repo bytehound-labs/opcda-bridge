@@ -227,3 +227,6 @@ max_tags)`, `.read(server, tags)`, and `.write(server, tag, value)` return plain
 - **Published distribution**: `opcda-bridge` is consumed from crates.io with a normal SemVer
   dependency (`opcda-bridge = "0.2"`). Git dependencies are not part of the supported consumer
   path.
+- **Release automation**: release-plz publishes only after a merged release PR. The
+  `release_always = false` and `release_commits` settings prevent its own `chore: release ...`
+  commit from opening a spurious follow-up patch release.
