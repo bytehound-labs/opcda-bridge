@@ -296,6 +296,8 @@ console mode: `stop` drains in-flight requests before the SCM reports it `Stoppe
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding standards, and how to get set up.
+CI is change-aware: documentation-only changes do not rebuild the workspace, while required status
+checks still complete for branch protection.
 
 ## License
 

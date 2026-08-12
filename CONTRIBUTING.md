@@ -49,6 +49,11 @@ PRs must pass `cargo fmt --check --all`, `cargo clippy --workspace --all-targets
 -- -D warnings`, and `cargo test --workspace` before merge. The gateway crate is Windows-only
 (COM); the client crate should build and test on Linux, macOS, and Windows.
 
+The workflows are change-aware: compiled validation runs for Rust, workspace, dependency, script,
+or workflow changes; package verification also runs when crate metadata or packaged documentation
+changes. Documentation-only changes keep the required `check` and `coverage` statuses green
+without rebuilding the workspace.
+
 ## Pull requests
 
 - Keep PRs small and focused — one logical change each.
