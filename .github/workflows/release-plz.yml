@@ -1,12 +1,22 @@
 name: Release-plz
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
+
+concurrency:
+  group: release-plz-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   release-plz:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
         with:

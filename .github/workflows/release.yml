@@ -7,6 +7,10 @@ on:
       - 'opcda-bridge-gateway-v*'
       - 'opcda-bridge-client-v*'
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   release-gateway:
     if: startsWith(github.ref_name, 'opcda-bridge-gateway-v')

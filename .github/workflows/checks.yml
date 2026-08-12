@@ -7,9 +7,63 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  check:
+  changes:
+    name: Detect validation changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.rust == 'true' }}
+      package: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.package == 'true' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed paths
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'LICENSE'
+              - 'deny.toml'
+              - 'release-plz.toml'
+              - '.cargo/**'
+              - '.github/workflows/**'
+              - 'scripts/**'
+              - 'crates/**/*.rs'
+              - 'crates/**/build.rs'
+              - 'crates/**/Cargo.toml'
+              - 'crates/**/proto/**'
+            package:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'LICENSE'
+              - 'crates/**/Cargo.toml'
+              - 'crates/**/README.md'
+              - 'crates/**/LICENSE'
+              - 'crates/**/CHANGELOG.md'
+              - 'crates/**/*.rs'
+              - 'crates/**/build.rs'
+              - 'crates/**/proto/**'
+
+  windows:
+    name: Windows validation
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
@@ -28,10 +82,10 @@ jobs:
         run: cargo fmt --check --all
 
       - name: Lint with clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Run cargo-deny
         run: cargo deny check
@@ -40,7 +94,7 @@ jobs:
         run: cargo machete
 
       - name: Build gateway (release, 32-bit)
-        run: cargo build -p opcda-bridge-gateway --release --target i686-pc-windows-msvc
+        run: cargo build -p opcda-bridge-gateway --release --locked --target i686-pc-windows-msvc
 
       - uses: actions/upload-artifact@v4
         with:
@@ -48,7 +102,11 @@ jobs:
           path: target/i686-pc-windows-msvc/release/opcda-bridge-gateway.exe
 
   linux:
+    name: Linux tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -64,7 +122,11 @@ jobs:
         run: cargo test --workspace --locked
 
   package:
+    name: Package verification
+    needs: changes
+    if: needs.changes.outputs.package == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -80,7 +142,11 @@ jobs:
         run: cargo package --workspace --locked
 
   msrv:
+    name: MSRV
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -94,3 +160,47 @@ jobs:
 
       - name: Check the declared MSRV
         run: cargo check --workspace --all-targets --locked
+
+  check:
+    if: always()
+    needs: [changes, windows, linux, package, msrv]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if change detection failed
+        if: needs.changes.result != 'success'
+        run: |
+          echo "Change detection did not complete successfully."
+          exit 1
+
+      - name: Report skipped validation
+        if: needs.changes.outputs.rust != 'true' && needs.changes.outputs.package != 'true'
+        run: echo "No compiled or package-affecting files changed; heavy validation skipped."
+
+      - name: Verify validation results
+        if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.package == 'true'
+        env:
+          RUST_CHANGED: ${{ needs.changes.outputs.rust }}
+          PACKAGE_CHANGED: ${{ needs.changes.outputs.package }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+        run: |
+          failed=0
+
+          if [[ "$RUST_CHANGED" == "true" ]]; then
+            for result in "$WINDOWS_RESULT" "$LINUX_RESULT" "$MSRV_RESULT"; do
+              if [[ "$result" != "success" ]]; then
+                echo "A required Rust validation job ended with: $result"
+                failed=1
+              fi
+            done
+          fi
+
+          if [[ "$PACKAGE_CHANGED" == "true" && "$PACKAGE_RESULT" != "success" ]]; then
+            echo "Package verification ended with: $PACKAGE_RESULT"
+            failed=1
+          fi
+
+          exit "$failed"
