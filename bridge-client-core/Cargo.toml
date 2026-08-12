@@ -1,0 +1,27 @@
+[package]
+name = "bridge-client-core"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable async Rust client library for the opcda-bridge gateway's gRPC API"
+license = "MIT"
+repository = "https://github.com/mikeboiko/opcda-bridge"
+
+[dependencies]
+bridge-proto = { path = "../bridge-proto", version = "0.1.0" }
+tonic = "0.14"
+tonic-prost = "0.14"
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1"
+tokio = { version = "1", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tokio-stream = "0.1"
+
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost"]

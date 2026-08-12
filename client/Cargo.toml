@@ -7,11 +7,8 @@ license = "MIT"
 repository = "https://github.com/mikeboiko/opcda-bridge"
 
 [dependencies]
-bridge-proto = { path = "../bridge-proto", version = "0.1.0" }
-tonic = "0.14"
-tonic-prost = "0.14"
+bridge-client-core = { path = "../bridge-client-core", version = "0.1.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tokio-stream = "0.1"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tabled = "0.19"
@@ -20,7 +17,11 @@ serde_json = "1"
 toml = "1"
 
 [dev-dependencies]
+bridge-proto = { path = "../bridge-proto", version = "0.1.0" }
+tonic = "0.14"
+tonic-prost = "0.14"
+tokio-stream = "0.1"
 tempfile = "3"
 
 [package.metadata.cargo-machete]
-ignored = ["tonic", "tonic-prost"]
+ignored = ["tonic-prost"]

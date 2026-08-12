@@ -7,8 +7,9 @@ the network — a single static binary per side, no legacy dependency stack.
 ## Status
 
 Active development. Workspace is scaffolded with gateway (`opcda-bridge-gateway`), client
-(`opcda-bridge-client`), shared proto definitions (`bridge-proto`), and an umbrella root crate
-(`opcda-bridge`). Gateway and client are functional end-to-end against a live Kepware server.
+(`opcda-bridge-client`), a reusable client library (`bridge-client-core`), shared proto
+definitions (`bridge-proto`), and an umbrella root crate (`opcda-bridge`). Gateway and client are
+functional end-to-end against a live Kepware server.
 
 ## Origin and scope discipline
 
@@ -205,3 +206,56 @@ by `client/tests/main_integration.rs` spawning the real binary against a closed 
 run_with_cli() -> fail()` path executes at least once outside of unit tests, alongside the
 pre-existing `--help` integration test (which alone doesn't reach this: clap exits the process
 from inside `Cli::parse()` before `run_with_cli` is ever called).
+
+### Client library (`bridge-client-core`)
+
+`client/src/commands.rs` used to own the whole connect → gRPC call → typed-response path itself,
+fused directly to CLI presentation (`Tabled`/`Serialize` row structs, `println!`). That made it
+impossible for another async Rust program to get typed OPC DA read/write/browse/list-servers
+results back without shelling out to the CLI binary and scraping its stdout — the motivating
+consumer is `bhtune`, a from-scratch Rust rewrite of a legacy PID auto-tuning app. The
+connect/list-servers/browse/read/write surface is extracted into its own crate,
+`bridge-client-core`, mirroring the `OpcClient`-trait split already used on the gateway side (see
+"Test design for the gateway" above): a dependency-light, presentation-free core, with
+`opcda-bridge-client` reduced to a thin adapter on top of it.
+
+- **New crate, not a `pub mod` inside `client`**: a module re-exported from `client`'s `lib.rs`
+  would still force any consumer depending on `opcda-bridge-client` to pull in `clap`, `tabled`,
+  `serde_json`, and `toml` transitively just to call a gRPC method — exactly the problem this
+  split exists to solve. `bridge-client-core` depends on only `bridge-proto`, `tonic`,
+  `tonic-prost` (unused directly but kept for the same reason `client` and `gateway` already
+  carry it — see their own `cargo-machete` ignores), and `thiserror`. `tokio`/`tokio-stream` are
+  dev-dependencies only: `Client::browse` drains the response stream with
+  `tonic::Streaming::message()` (an inherent async method), not `tokio_stream::StreamExt`, so no
+  async-runtime crate is needed outside tests.
+- **Naming** follows `bridge-proto`'s precedent of dropping the `opcda-bridge-` prefix for
+  shared/library crates; `-core` distinguishes it from the `opcda-bridge-client` binary crate it
+  backs.
+- **API surface**: `Client::connect(host: &str)`, `.list_servers()`, `.browse(server, flat, path,
+max_tags)`, `.read(server, tags)`, `.write(server, tag, value)` — plain async methods returning
+  `Vec<String>` / `Vec<BrowseNode>` / `Vec<TagValue>` / `WriteResult`, fully materialized rather
+  than a raw `tonic` stream (every current caller wants a complete result before doing anything
+  else). `BrowseNode`/`TagValue`/`WriteResult` carry the same fields as `commands.rs`'s
+  `TagRow`/`ReadRow`/`WriteRow` minus the `Tabled`/`Serialize` derives; `WriteResult.error` stays
+  `Option<String>` rather than collapsing "no error" and `""` together, same reasoning as
+  `WriteRow.error` (see "Client output formats" above). `Value`/`parse_value` (bool/int/float/
+  string inference for a `write` value) moved here unchanged from `commands.rs`, since they were
+  never CLI-specific.
+- **Error type**: `Error::Connect(tonic::transport::Error)` / `Error::Rpc(tonic::Status)`, both
+  `#[error(transparent)]`. Transparent, not a wrapping message (e.g. `"failed to connect: {0}"`),
+  because `opcda-bridge-client`'s printed error text (the `Error: transport error` / `Caused by:
+...` chain in table mode, and the `{"error": "..."}` message in JSON mode) has to stay
+  byte-for-byte identical, and `anyhow`'s `Debug`/`Display` walk the `.source()` chain — a
+  non-transparent wrapper adds a level to that chain and changes the printed text.
+  `commands.rs` converts `bridge_client_core::Error` to `anyhow::Error` via a bare `?`, same as it
+  always has for `tonic`'s own error types.
+- **`opcda-bridge-client`'s `Cargo.toml`** now depends on `bridge-client-core` and keeps
+  `clap`/`tabled`/`serde`/`serde_json`/`toml` as its own (non-library) dependencies.
+  `bridge-proto`/`tonic`/`tonic-prost`/`tokio-stream` moved to `client`'s `[dev-dependencies]`:
+  once `commands.rs` talks only to `bridge_client_core::Client`, those crates are referenced only
+  from `client/src/test_support.rs` and the two tests that exercise the mock server's own
+  early-stream-disconnect handling directly against the raw generated `BridgeClient`.
+- **Released, not `release = false`**: unlike `opcda-bridge`/`bridge-proto`, `bridge-client-core`
+  is _not_ marked `release = false` in `release-plz.toml` — `bhtune` pins it via a `git`
+  dependency on its release tag (`bridge-client-core-vX.Y.Z`), so unlike the internal-only
+  root/proto crates, its tags have a real external consumer and need to exist.

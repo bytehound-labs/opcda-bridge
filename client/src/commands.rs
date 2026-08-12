@@ -1,18 +1,8 @@
 use crate::output::{self, OutputFormat};
-use bridge_proto::bridge::{
-    BrowseRequest, BrowseResponse, ListServersRequest, ReadRequest, WriteRequest,
-    bridge_client::BridgeClient,
-};
+use bridge_client_core::{BrowseNode, Client, parse_value};
 use serde::Serialize;
 use tabled::Tabled;
 use tabled::derive::display;
-
-/// Connect to the gateway. Extracted since every command repeats this line
-/// verbatim — also the natural place a future TLS or auth option would hook
-/// in.
-async fn connect(host: &str) -> anyhow::Result<BridgeClient<tonic::transport::Channel>> {
-    Ok(BridgeClient::connect(format!("http://{host}")).await?)
-}
 
 #[derive(Tabled, Serialize)]
 struct ServerRow {
@@ -21,13 +11,8 @@ struct ServerRow {
 }
 
 pub async fn cmd_servers(host: String, format: OutputFormat) -> anyhow::Result<()> {
-    let mut client = connect(&host).await?;
-    let response = client
-        .list_servers(ListServersRequest {
-            host: "localhost".to_string(),
-        })
-        .await?;
-    let servers = response.into_inner().servers;
+    let mut client = Client::connect(&host).await?;
+    let servers = client.list_servers().await?;
     let rows: Vec<ServerRow> = servers.into_iter().map(|name| ServerRow { name }).collect();
     println!("{}", output::render(rows, format)?);
     Ok(())
@@ -49,22 +34,8 @@ pub async fn cmd_browse(
     max_tags: u32,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&host).await?;
-    let mut stream = client
-        .browse(BrowseRequest {
-            server,
-            flat,
-            path: path.clone(),
-            max_tags,
-        })
-        .await?
-        .into_inner();
-
-    use tokio_stream::StreamExt;
-    let mut nodes = Vec::new();
-    while let Some(response) = stream.next().await {
-        nodes.push(response?);
-    }
+    let mut client = Client::connect(&host).await?;
+    let nodes = client.browse(server, flat, path.clone(), max_tags).await?;
 
     // JSON always renders as rows, regardless of `--flat`, since the tree
     // renderer produces a display-only string, not structured data.
@@ -89,7 +60,7 @@ pub async fn cmd_browse(
 /// `--path <tag_id>`; `Leaf` nodes get no suffix. Kept as a pure
 /// string-building function (rather than printing directly) so it can be
 /// unit tested without capturing stdout.
-fn render_tree(path: &str, nodes: &[BrowseResponse]) -> String {
+fn render_tree(path: &str, nodes: &[BrowseNode]) -> String {
     let mut out = String::new();
     out.push_str(if path.is_empty() { "/" } else { path });
     out.push('\n');
@@ -124,14 +95,8 @@ pub async fn cmd_read(
     tags: Vec<String>,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
-    let mut client = connect(&host).await?;
-    let response = client
-        .read(ReadRequest {
-            server,
-            tag_ids: tags,
-        })
-        .await?;
-    let values = response.into_inner().values;
+    let mut client = Client::connect(&host).await?;
+    let values = client.read(server, tags).await?;
     let rows: Vec<ReadRow> = values
         .into_iter()
         .map(|v| ReadRow {
@@ -166,57 +131,25 @@ pub async fn cmd_write(
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     let parsed = parse_value(&value);
-    let typed_value = match parsed {
-        Value::String(s) => bridge_proto::bridge::write_request::TypedValue::StringValue(s),
-        Value::Int(i) => bridge_proto::bridge::write_request::TypedValue::IntValue(i),
-        Value::Float(f) => bridge_proto::bridge::write_request::TypedValue::FloatValue(f),
-        Value::Bool(b) => bridge_proto::bridge::write_request::TypedValue::BoolValue(b),
-    };
-
-    let mut client = connect(&host).await?;
-    let response = client
-        .write(WriteRequest {
-            server,
-            tag_id: tag,
-            typed_value: Some(typed_value),
-        })
-        .await?;
-    let r = response.into_inner();
+    let mut client = Client::connect(&host).await?;
+    let result = client.write(server, tag, parsed).await?;
     let rows = vec![WriteRow {
-        tag_id: r.tag_id,
-        success: r.success,
-        error: r.error,
+        tag_id: result.tag_id,
+        success: result.success,
+        error: result.error,
     }];
     println!("{}", output::render(rows, format)?);
     Ok(())
-}
-
-enum Value {
-    String(String),
-    Int(i32),
-    Float(f64),
-    Bool(bool),
-}
-
-fn parse_value(raw: &str) -> Value {
-    if let Ok(b) = raw.parse::<bool>() {
-        return Value::Bool(b);
-    }
-    if let Ok(i) = raw.parse::<i32>() {
-        return Value::Int(i);
-    }
-    if let Ok(f) = raw.parse::<f64>() {
-        return Value::Float(f);
-    }
-    Value::String(raw.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{MockBridgeService, start_mock_server};
+    use bridge_client_core::Value;
     use bridge_proto::bridge::{
-        BrowseResponse, ListServersResponse, ReadResponse, TagValue as ProtoTagValue, WriteResponse,
+        BrowseRequest, BrowseResponse, ListServersResponse, ReadResponse,
+        TagValue as ProtoTagValue, WriteResponse, bridge_client::BridgeClient,
     };
 
     #[tokio::test]
@@ -652,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_render_tree_single_leaf_uses_last_connector_no_suffix() {
-        let nodes = vec![BrowseResponse {
+        let nodes = vec![BrowseNode {
             tag_id: "System".into(),
             node_type: "Leaf".into(),
         }];
@@ -662,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_render_tree_single_branch_uses_last_connector_with_suffix() {
-        let nodes = vec![BrowseResponse {
+        let nodes = vec![BrowseNode {
             tag_id: "Simulink".into(),
             node_type: "Branch".into(),
         }];
@@ -673,11 +606,11 @@ mod tests {
     #[test]
     fn test_render_tree_multiple_nodes_use_middle_and_last_connectors() {
         let nodes = vec![
-            BrowseResponse {
+            BrowseNode {
                 tag_id: "Simulink".into(),
                 node_type: "Branch".into(),
             },
-            BrowseResponse {
+            BrowseNode {
                 tag_id: "System".into(),
                 node_type: "Leaf".into(),
             },

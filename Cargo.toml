@@ -1,5 +1,5 @@
 [workspace]
-members = ["bridge-proto", "gateway", "client"]
+members = ["bridge-proto", "gateway", "client", "bridge-client-core"]
 resolver = "2"
 
 [package]

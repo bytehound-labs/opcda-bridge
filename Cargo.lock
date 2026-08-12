@@ -168,6 +168,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "bridge-client-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bridge-proto",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "bridge-proto"
 version = "0.1.0"
 dependencies = [
@@ -748,6 +761,7 @@ name = "opcda-bridge-client"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "bridge-client-core",
  "bridge-proto",
  "clap",
  "serde",
