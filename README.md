@@ -38,7 +38,7 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   `opcda-bridge-gateway-v*` release, extract it, and run `opcda-bridge-gateway.exe`. No installer
   needed. The binary targets 32-bit Windows (`i686`), matching the architecture most legacy OPC DA
   servers still require for COM interop.
-- **From source** (requires a Rust toolchain with 2024 edition support, i.e. Rust 1.85+, and the
+- **From source** (requires Rust 1.88+ and the
   Protocol Buffers compiler `protoc` on `PATH`):
   ```sh
   git clone https://github.com/bytehound-labs/opcda-bridge.git
@@ -46,7 +46,7 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   cargo build --release -p opcda-bridge-gateway
   ./target/release/opcda-bridge-gateway.exe
   ```
-- **Install from crates.io** (requires Rust 1.85+ and `protoc`):
+- **Install from crates.io** (requires Rust 1.88+ and `protoc`):
   ```sh
   cargo install opcda-bridge-gateway
   ```

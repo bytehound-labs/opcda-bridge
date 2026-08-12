@@ -10,7 +10,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/bytehound-labs/opcda-bridge"
 homepage = "https://github.com/bytehound-labs/opcda-bridge"
