@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/mikeboiko/opcda-bridge/compare/bridge-client-core-v0.1.0...bridge-client-core-v0.1.1) - 2026-08-12
+
+### Other
+
+- release ([#22](https://github.com/mikeboiko/opcda-bridge/pull/22))
+
 ## [0.1.0](https://github.com/mikeboiko/opcda-bridge/releases/tag/bridge-client-core-v0.1.0) - 2026-08-12
 
 ### Added
