@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Cargo workspace: root Cargo.toml covers every crate under crates/*, since they all
+  # share one Cargo.lock.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-dependencies:
+        patterns:
+          - '*'
+    labels:
+      - dependencies
+      - rust
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - '*'
+    labels:
+      - dependencies
+      - ci
