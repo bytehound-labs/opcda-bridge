@@ -1,0 +1,48 @@
+name: Bug report
+description: Report something that isn't working as expected.
+labels: ['bug']
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands/config used, if possible.
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `opcda-bridge-client --version` / `opcda-bridge-gateway --version`.
+    validations:
+      required: false
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: >-
+        OS and architecture for the client (Linux/macOS/Windows, x86_64/arm64). The gateway is
+        Windows-only, so also note the Windows version if the issue involves the gateway.
+    validations:
+      required: false
+  - type: input
+    id: opc-server
+    attributes:
+      label: OPC DA server
+      description: Vendor/product of the OPC DA server involved, if relevant (e.g. Matrikon, Kepware).
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: shell
+    validations:
+      required: false
