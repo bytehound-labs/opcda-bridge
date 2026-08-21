@@ -60,8 +60,11 @@ jobs:
         with:
           version: 1.50.0
 
+      - name: Fetch default branch baseline
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+
       - name: Reject breaking Protobuf changes
-        run: buf breaking --against '.git#branch=main' --against-config buf.yaml
+        run: buf breaking --against '.git#ref=refs/remotes/origin/main' --against-config buf.yaml
 
   security:
     name: Required Protobuf compatibility status

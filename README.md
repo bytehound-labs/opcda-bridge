@@ -299,10 +299,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding stan
 CI is change-aware: documentation-only changes do not rebuild the workspace, while required status
 checks still complete for branch protection.
 
-CI validates Rust code and package metadata, checks Protobuf compatibility with Buf, runs CodeQL
-and Semgrep analysis, scans complete Git history with the open-source Gitleaks CLI, and audits
-workflow files with actionlint and zizmor. Configuration, output, and protocol boundaries have
-property tests plus standalone cargo-fuzz smoke targets.
+CI validates Rust code and package metadata, checks Protobuf compatibility against `main` with Buf,
+runs CodeQL and Semgrep analysis, scans complete Git history with the open-source Gitleaks CLI,
+and audits workflow files with actionlint and zizmor. Configuration, output, and protocol
+boundaries have property tests plus standalone cargo-fuzz smoke targets.
 
 Tagged binary releases include SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures,
 and GitHub artifact provenance attestations. Running the release workflow manually builds and
