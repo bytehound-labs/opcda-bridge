@@ -54,6 +54,10 @@ or workflow changes; package verification also runs when crate metadata or packa
 changes. Documentation-only changes keep the required `check` and `coverage` statuses green
 without rebuilding the workspace.
 
+The planned security and release-integrity work is documented in
+[CI_SECURITY_HANDOVER.md](CI_SECURITY_HANDOVER.md). Keep that document aligned with the actual
+workflow design as each item lands.
+
 ## Pull requests
 
 - Keep PRs small and focused — one logical change each.

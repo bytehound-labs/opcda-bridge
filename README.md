@@ -298,6 +298,8 @@ console mode: `stop` drains in-flight requests before the SCM reports it `Stoppe
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding standards, and how to get set up.
 CI is change-aware: documentation-only changes do not rebuild the workspace, while required status
 checks still complete for branch protection.
+Maintainers planning CI, security scanning, protocol compatibility, or release-integrity work
+should follow the [CI/CD security hardening handover](CI_SECURITY_HANDOVER.md).
 
 ## License
 
