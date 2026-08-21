@@ -281,6 +281,8 @@ mod tests {
     #[test]
     fn test_cli_default_host() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // The mutex serializes these Rust 2024 unsafe environment mutations.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
         assert_eq!(args.host, None);
@@ -459,19 +461,25 @@ mod tests {
     #[test]
     fn test_cli_host_from_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // The mutex serializes these Rust 2024 unsafe environment mutations.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
         assert_eq!(args.host, Some("envhost:8888".to_string()));
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
     }
 
     #[test]
     fn test_cli_arg_overrides_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // The mutex serializes these Rust 2024 unsafe environment mutations.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888") };
         let args =
             Cli::try_parse_from(["opcda-bridge", "--host", "arghost:7777", "servers"]).unwrap();
         assert_eq!(args.host, Some("arghost:7777".to_string()));
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var("OPC_BRIDGE_HOST") };
     }
 
@@ -482,6 +490,8 @@ mod tests {
         // or a concurrently-running env-setting test in another thread
         // could leak a value in here.
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // The mutex serializes this Rust 2024 unsafe environment mutation.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
         assert_eq!(args.output, None);
@@ -505,6 +515,8 @@ mod tests {
         // See test_cli_default_output_is_none: args.output is asserted here
         // too, so this needs the same guard/clear.
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // The mutex serializes this Rust 2024 unsafe environment mutation.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
         let args = Cli::try_parse_from(["opcda-bridge", "--json", "servers"]).unwrap();
         assert!(args.json);
@@ -514,9 +526,12 @@ mod tests {
     #[test]
     fn test_cli_output_from_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // The mutex serializes these Rust 2024 unsafe environment mutations.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::set_var("OPC_BRIDGE_OUTPUT", "json") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
         assert_eq!(args.output, Some(OutputFormat::Json));
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
     }
 
@@ -526,6 +541,8 @@ mod tests {
         // clap conflicts: resolve_from_cli resolves the precedence in code
         // (--json always wins) instead, so both can be present here.
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // The mutex serializes these Rust 2024 unsafe environment mutations.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::set_var("OPC_BRIDGE_OUTPUT", "table") };
         let args = Cli::try_parse_from(["opcda-bridge", "--json", "servers"]).unwrap();
         assert!(args.json);
@@ -534,6 +551,7 @@ mod tests {
             crate::output::resolve_from_cli(&args),
             Some(OutputFormat::Json)
         );
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
     }
 
@@ -562,6 +580,8 @@ mod tests {
         // passed, so this needs the same guard/clear as
         // test_cli_default_output_is_none.
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // The mutex serializes this Rust 2024 unsafe environment mutation.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::remove_var("OPC_BRIDGE_OUTPUT") };
         let args = Cli::try_parse_from(["opcda-bridge", "servers"]).unwrap();
         assert_eq!(crate::output::resolve_from_cli(&args), None);

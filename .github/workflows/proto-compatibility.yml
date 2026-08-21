@@ -1,0 +1,89 @@
+name: Protobuf compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: proto-compatibility-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect protocol changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.proto == 'true' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect changed paths
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        with:
+          filters: |
+            proto:
+              - 'buf.yaml'
+              - 'crates/opcda-bridge-proto/proto/**'
+              - 'crates/opcda-bridge-proto/build.rs'
+              - 'crates/opcda-bridge-proto/Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/proto-compatibility.yml'
+
+  compatibility:
+    name: Check Protobuf compatibility
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Buf
+        uses: bufbuild/buf-setup-action@fbb91772b52752bd36ca8552d2ff4b94e111f24f # main
+        with:
+          version: 1.50.0
+
+      - name: Reject breaking Protobuf changes
+        run: buf breaking --against '.git#branch=main' --against-config buf.yaml
+
+  security:
+    name: Required Protobuf compatibility status
+    if: always()
+    needs: [changes, compatibility]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Fail if change detection failed
+        if: needs.changes.result != 'success'
+        run: |
+          echo "Protocol change detection did not complete successfully."
+          exit 1
+
+      - name: Report skipped compatibility check
+        if: needs.changes.outputs.run != 'true'
+        run: echo "No Protobuf-affecting files changed; compatibility check skipped."
+
+      - name: Verify compatibility result
+        if: needs.changes.outputs.run == 'true' && needs.compatibility.result != 'success'
+        run: |
+          echo "Protobuf compatibility ended with: ${{ needs.compatibility.result }}"
+          exit 1

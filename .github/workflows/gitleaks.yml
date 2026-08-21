@@ -1,0 +1,64 @@
+name: Gitleaks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 5 * * 1'
+
+concurrency:
+  group: gitleaks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Full-history secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Install Gitleaks CLI
+        run: go install github.com/zricethezav/gitleaks/v8@v8.9.0
+
+      - name: Scan complete repository history
+        run: |
+          "$(go env GOPATH)/bin/gitleaks" detect \
+            --source . \
+            --log-opts="--all" \
+            --redact \
+            --verbose
+
+  security:
+    name: Required Gitleaks status
+    if: always()
+    needs: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Verify secret scan result
+        if: needs.gitleaks.result != 'success'
+        run: |
+          echo "Gitleaks ended with: ${{ needs.gitleaks.result }}"
+          exit 1
+
+      - name: Report successful scan
+        run: echo "Full repository history passed Gitleaks."

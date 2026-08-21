@@ -41,6 +41,7 @@ opc-da-client.workspace = true
 windows-service.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
 
 [package.metadata.cargo-machete]

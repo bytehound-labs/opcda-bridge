@@ -1,0 +1,99 @@
+name: Fuzz smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect fuzz changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.fuzz == 'true' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Detect changed paths
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        with:
+          filters: |
+            fuzz:
+              - 'fuzz/**'
+              - 'crates/opcda-bridge-client/src/config.rs'
+              - 'crates/opcda-bridge-client/src/output.rs'
+              - 'crates/opcda-bridge-proto/**'
+              - 'Cargo.lock'
+              - '.github/workflows/fuzz.yml'
+
+  smoke:
+    name: Run bounded fuzz smoke tests
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly
+
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        with:
+          tool: protoc
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Fuzz configuration parsing
+        working-directory: fuzz
+        run: cargo fuzz run config_toml -- -runs=100
+
+      - name: Fuzz JSON error output
+        working-directory: fuzz
+        run: cargo fuzz run output_json -- -runs=100
+
+      - name: Fuzz Protobuf payload decoding
+        working-directory: fuzz
+        run: cargo fuzz run proto_payload -- -runs=100
+
+  security:
+    name: Required fuzz smoke status
+    if: always()
+    needs: [changes, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Fail if change detection failed
+        if: needs.changes.result != 'success'
+        run: |
+          echo "Fuzz change detection did not complete successfully."
+          exit 1
+
+      - name: Report skipped fuzz smoke
+        if: needs.changes.outputs.run != 'true'
+        run: echo "No fuzz-affecting files changed; smoke tests skipped."
+
+      - name: Verify fuzz smoke result
+        if: needs.changes.outputs.run == 'true' && needs.smoke.result != 'success'
+        run: |
+          echo "Fuzz smoke ended with: ${{ needs.smoke.result }}"
+          exit 1

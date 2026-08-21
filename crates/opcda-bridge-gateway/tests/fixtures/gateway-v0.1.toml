@@ -1,0 +1,4 @@
+port = 7700
+
+[log]
+level = "debug"

@@ -1,0 +1,3 @@
+host = "legacy-gateway:7600"
+server = "Kepware.KepServerEX.V5"
+max_tags = 250

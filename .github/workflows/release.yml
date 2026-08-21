@@ -11,30 +11,48 @@ concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
   release-gateway:
-    if: startsWith(github.ref_name, 'opcda-bridge-gateway-v')
+    if: startsWith(github.ref_name, 'opcda-bridge-gateway-v') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: protoc
 
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - id: package
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: opcda-bridge-gateway
           manifest_path: crates/opcda-bridge-gateway/Cargo.toml
           target: i686-pc-windows-msvc
           archive: opcda-bridge-gateway-windows-x86
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Upload gateway dry-run package
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: opcda-bridge-gateway-dry-run
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.sha256 }}
 
   release-client:
-    if: startsWith(github.ref_name, 'opcda-bridge-client-v')
+    if: startsWith(github.ref_name, 'opcda-bridge-client-v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
       contents: write
     strategy:
@@ -48,23 +66,120 @@ jobs:
             archive: opcda-bridge-client-windows-x86_64
       max-parallel: 1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: protoc
 
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - id: package
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: opcda-bridge-client
           manifest_path: crates/opcda-bridge-client/Cargo.toml
           archive: ${{ matrix.archive }}
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Upload Unix client dry-run package
+        if: github.event_name == 'workflow_dispatch' && runner.os != 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.archive }}-dry-run
+          path: |
+            ${{ steps.package.outputs.tar }}
+            ${{ steps.package.outputs.sha256 }}
+
+      - name: Upload Windows client dry-run package
+        if: github.event_name == 'workflow_dispatch' && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.archive }}-dry-run
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.sha256 }}
 
   aur-publish:
     needs: release-client
     if: startsWith(github.ref_name, 'opcda-bridge-client-v')
+    permissions:
+      contents: read
     uses: ./.github/workflows/aur-publish.yml
     with:
       release_tag: ${{ github.ref_name }}
-    secrets: inherit
+    secrets:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+  release-integrity:
+    needs: [release-gateway, release-client]
+    if: always() && github.event_name == 'push' && (startsWith(github.ref_name, 'opcda-bridge-gateway-v') || startsWith(github.ref_name, 'opcda-bridge-client-v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" --dir dist
+
+      - name: Generate release checksums
+        run: |
+          find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | sort -k2 > release-assets.sha256
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: release-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Create provenance attestation
+        id: provenance
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-checksums: release-assets.sha256
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.2
+
+      - name: Sign release integrity files
+        run: |
+          for artifact in dist/* release-assets.sha256 release-sbom.cdx.json; do
+            [ -f "$artifact" ] || continue
+            cosign sign-blob --yes --bundle "${artifact}.sigstore.json" "$artifact"
+          done
+
+      - name: Upload integrity metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            release-assets.sha256 \
+            release-sbom.cdx.json \
+            dist/*.sigstore.json \
+            release-assets.sha256.sigstore.json \
+            release-sbom.cdx.json.sigstore.json \
+            "$PROVENANCE_BUNDLE" \
+            --clobber

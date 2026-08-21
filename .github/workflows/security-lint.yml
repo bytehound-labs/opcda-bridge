@@ -1,0 +1,105 @@
+name: Workflow security lint
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '15 5 * * 1'
+
+concurrency:
+  group: security-lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect workflow changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.workflows == 'true' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Detect changed paths
+        id: filter
+        if: github.event_name != 'workflow_dispatch' && github.event_name != 'schedule'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        with:
+          filters: |
+            workflows:
+              - '.github/workflows/**'
+              - '.github/zizmor.yml'
+              - '.github/actionlint.yaml'
+
+  lint:
+    name: Audit workflows
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Install actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run actionlint
+        run: actionlint .github/workflows/*.yml
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install zizmor in an isolated environment
+        run: |
+          python -m venv "$RUNNER_TEMP/zizmor"
+          "$RUNNER_TEMP/zizmor/bin/python" -m pip install --disable-pip-version-check --no-cache-dir 'zizmor==1.29.0'
+
+      - name: Run zizmor
+        run: |
+          "$RUNNER_TEMP/zizmor/bin/zizmor" .github/workflows/*.yml
+
+  security:
+    name: Required workflow security status
+    if: always()
+    needs: [changes, lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Fail if change detection failed
+        if: needs.changes.result != 'success'
+        run: |
+          echo "Workflow change detection did not complete successfully."
+          exit 1
+
+      - name: Report skipped lint
+        if: needs.changes.outputs.run != 'true'
+        run: echo "No workflow-affecting files changed; lint skipped."
+
+      - name: Verify lint result
+        if: needs.changes.outputs.run == 'true' && needs.lint.result != 'success'
+        run: |
+          echo "Workflow lint ended with: ${{ needs.lint.result }}"
+          exit 1

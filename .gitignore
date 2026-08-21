@@ -28,3 +28,8 @@ target
 # Generated coverage reports
 lcov.info
 *.profraw
+
+# Local cargo-fuzz artifacts and corpora
+fuzz/artifacts
+fuzz/corpus
+fuzz/crashes

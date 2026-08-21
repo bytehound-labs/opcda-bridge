@@ -1,5 +1,5 @@
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Windows service management subcommands. Give flags such as `--port` or
@@ -68,7 +68,7 @@ pub struct Cli {
 /// Gateway configuration loaded from an optional TOML file. Every field is
 /// optional; a value missing from the file (or the file itself missing)
 /// falls back to the env var / CLI flag / built-in default resolution.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct GatewayConfig {
     pub port: Option<u16>,
     #[serde(default)]
@@ -76,7 +76,7 @@ pub struct GatewayConfig {
 }
 
 /// Logging configuration keys, consumed once file-based logging lands.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct LogConfig {
     pub level: Option<String>,
     pub dir: Option<String>,
@@ -124,6 +124,9 @@ pub fn load_config(explicit_path: Option<&Path>) -> anyhow::Result<GatewayConfig
     match explicit_path {
         Some(path) => load_config_file(path, true),
         None => {
+            // This path selects the adjacent user configuration file, not a
+            // security-sensitive executable or library.
+            // nosemgrep: rust.lang.security.current-exe.current-exe
             let exe = std::env::current_exe().expect("failed to resolve current executable path");
             load_config_file(&config_path_from_exe(&exe), false)
         }
@@ -142,6 +145,7 @@ pub fn resolve_port(cli_port: Option<u16>, config: &GatewayConfig) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::io::Write;
 
     #[test]
@@ -230,6 +234,15 @@ mod tests {
         // so this exercises the "missing, not an error" auto-discovery path.
         let config = load_config(None).unwrap();
         assert_eq!(config, GatewayConfig::default());
+    }
+
+    #[test]
+    fn test_previous_gateway_config_fixture_remains_compatible() {
+        let config: GatewayConfig =
+            toml::from_str(include_str!("../tests/fixtures/gateway-v0.1.toml")).unwrap();
+
+        assert_eq!(config.port, Some(7700));
+        assert_eq!(config.log.level.as_deref(), Some("debug"));
     }
 
     #[test]
@@ -354,5 +367,34 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_gateway_config_toml_round_trip(
+            port in proptest::option::of(any::<u16>()),
+            level in proptest::option::of("[a-zA-Z0-9=,._-]{0,32}"),
+            dir in proptest::option::of("[a-zA-Z0-9:/._-]{0,32}"),
+            format in proptest::option::of("[a-zA-Z]{0,12}"),
+            rotation in proptest::option::of("[a-zA-Z]{0,12}"),
+        ) {
+            let original = GatewayConfig {
+                port,
+                log: LogConfig {
+                    level,
+                    dir,
+                    format,
+                    rotation,
+                },
+            };
+            let encoded = toml::to_string(&original).unwrap();
+            let decoded: GatewayConfig = toml::from_str(&encoded).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+
+        #[test]
+        fn prop_malformed_gateway_toml_never_panics(input in any::<String>()) {
+            let _ = toml::from_str::<GatewayConfig>(&input);
+        }
     }
 }

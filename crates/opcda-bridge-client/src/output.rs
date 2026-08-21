@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tabled::{Table, Tabled};
 
 /// How a command's result is printed.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum, Deserialize)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     /// Human-readable table (default).
@@ -68,6 +68,7 @@ pub fn resolve_from_cli(cli: &crate::cli::Cli) -> Option<OutputFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[derive(Tabled, Serialize)]
     struct Row {
@@ -142,5 +143,14 @@ mod tests {
         assert_eq!(w.output, OutputFormat::Json);
         let w: Wrapper = toml::from_str("output = \"table\"").unwrap();
         assert_eq!(w.output, OutputFormat::Table);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_json_errors_are_parseable(message in any::<String>()) {
+            let err = anyhow::anyhow!(message);
+            let rendered = format_error(&err, OutputFormat::Json);
+            prop_assert!(serde_json::from_str::<serde_json::Value>(&rendered).is_ok());
+        }
     }
 }

@@ -81,6 +81,9 @@ pub async fn run_gateway(
     let config = crate::config::load_config(cli.config.as_deref())?;
     let port = crate::config::resolve_port(cli.port, &config);
 
+    // This path selects the adjacent log directory, not a security-sensitive
+    // executable or library.
+    // nosemgrep: rust.lang.security.current-exe.current-exe
     let exe = std::env::current_exe().expect("failed to resolve current executable path");
     let default_log_dir = crate::logging::log_dir_from_exe(&exe);
     let log_settings = crate::logging::resolve_log_settings(

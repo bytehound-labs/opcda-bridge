@@ -54,9 +54,11 @@ or workflow changes; package verification also runs when crate metadata or packa
 changes. Documentation-only changes keep the required `check` and `coverage` statuses green
 without rebuilding the workspace.
 
-The planned security and release-integrity work is documented in
-[CI_SECURITY_HANDOVER.md](CI_SECURITY_HANDOVER.md). Keep that document aligned with the actual
-workflow design as each item lands.
+Security workflows use immutable action pins and bounded aggregate statuses. They run CodeQL,
+Semgrep, full-history Gitleaks, actionlint, zizmor, Protobuf breaking-change checks, and bounded
+fuzz smoke tests when their inputs change. Tagged binary releases receive checksums, an SBOM,
+keyless signatures, and provenance; use the release workflow's manual dispatch for packaging
+validation without publishing.
 
 ## Pull requests
 

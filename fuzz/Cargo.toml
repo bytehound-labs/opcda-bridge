@@ -1,0 +1,40 @@
+[package]
+name = "opcda-bridge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+libfuzzer-sys = "0.4"
+opcda-bridge-client = { path = "../crates/opcda-bridge-client" }
+opcda-bridge-proto = { path = "../crates/opcda-bridge-proto" }
+prost = "0.14"
+serde_json = "1"
+toml = "1"
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "output_json"
+path = "fuzz_targets/output_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_payload"
+path = "fuzz_targets/proto_payload.rs"
+test = false
+doc = false
+bench = false

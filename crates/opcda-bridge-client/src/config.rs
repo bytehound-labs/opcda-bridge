@@ -1,5 +1,5 @@
 use crate::output::OutputFormat;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Default gateway host:port the client connects to when nothing else specifies one.
@@ -10,7 +10,7 @@ pub const DEFAULT_MAX_TAGS: u32 = 1000;
 /// Client configuration loaded from an optional TOML file. Every field is
 /// optional; a value missing from the file (or the file itself missing)
 /// falls back to the env var / CLI flag / built-in default resolution.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ClientConfig {
     pub host: Option<String>,
     pub server: Option<String>,
@@ -125,6 +125,7 @@ pub fn resolve_output(cli_output: Option<OutputFormat>, config: &ClientConfig) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::io::Write;
 
     #[test]
@@ -252,12 +253,16 @@ mod tests {
             std::env::var("HOME").ok(),
             std::env::var("APPDATA").ok(),
         ];
+        // ENV_MUTEX serializes these Rust 2024 environment mutations.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
             std::env::remove_var("HOME");
             std::env::remove_var("APPDATA");
         }
         let result = load_config(None);
+        // ENV_MUTEX serializes this Rust 2024 environment mutation block.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             for (var, value) in ["XDG_CONFIG_HOME", "HOME", "APPDATA"]
                 .iter()
@@ -388,5 +393,44 @@ mod tests {
         writeln!(file, "output = \"json\"").unwrap();
         let config = load_config_file(file.path(), true).unwrap();
         assert_eq!(config.output, Some(OutputFormat::Json));
+    }
+
+    #[test]
+    fn test_previous_client_config_fixture_remains_compatible() {
+        let config: ClientConfig =
+            toml::from_str(include_str!("../tests/fixtures/client-v0.1.toml")).unwrap();
+
+        assert_eq!(config.host.as_deref(), Some("legacy-gateway:7600"));
+        assert_eq!(config.server.as_deref(), Some("Kepware.KepServerEX.V5"));
+        assert_eq!(config.max_tags, Some(250));
+        assert_eq!(resolve_output(None, &config), OutputFormat::Table);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_client_config_toml_round_trip(
+            host in proptest::option::of("[a-zA-Z0-9:/._-]{0,32}"),
+            server in proptest::option::of("[a-zA-Z0-9._-]{0,32}"),
+            max_tags in proptest::option::of(any::<u32>()),
+            output in proptest::option::of(proptest::prop_oneof![
+                Just(OutputFormat::Table),
+                Just(OutputFormat::Json),
+            ]),
+        ) {
+            let original = ClientConfig {
+                host,
+                server,
+                max_tags,
+                output,
+            };
+            let encoded = toml::to_string(&original).unwrap();
+            let decoded: ClientConfig = toml::from_str(&encoded).unwrap();
+            prop_assert_eq!(decoded, original);
+        }
+
+        #[test]
+        fn prop_malformed_client_toml_never_panics(input in any::<String>()) {
+            let _ = toml::from_str::<ClientConfig>(&input);
+        }
     }
 }

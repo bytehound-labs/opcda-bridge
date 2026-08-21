@@ -64,6 +64,14 @@ target for early gateway development.
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - **Coverage**: `cargo llvm-cov --workspace --lcov`
 
+### Security and release validation
+
+All GitHub Actions in `.github/workflows/` are pinned to immutable commit SHAs. Change-aware
+security workflows run CodeQL, Semgrep, full-history Gitleaks, actionlint, zizmor, Buf
+Protobuf compatibility checks, and bounded cargo-fuzz smoke tests. Tagged binary releases
+publish SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures, and GitHub artifact
+provenance attestations; `workflow_dispatch` builds package artifacts without publishing.
+
 The gateway crate is Windows-only (COM); the client crate is cross-platform. Tests that require
 the `OpcClient` trait use a mock implementation so they run on all platforms.
 

@@ -28,6 +28,7 @@ toml.workspace = true
 
 [dev-dependencies]
 opcda-bridge-proto.workspace = true
+proptest.workspace = true
 tempfile.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true

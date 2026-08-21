@@ -182,6 +182,8 @@ mod windows_impl {
 
     /// Registers the gateway with the SCM (does not start it).
     pub fn install(cli: &Cli) -> anyhow::Result<()> {
+        // The SCM registration must point at the running gateway executable.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let exe = std::env::current_exe()?;
         let definition = build_service_definition(exe, cli);
         let manager = ServiceManager::local_computer(

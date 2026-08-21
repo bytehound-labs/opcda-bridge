@@ -1,0 +1,8 @@
+version: v2
+
+modules:
+  - path: crates/opcda-bridge-proto/proto
+
+breaking:
+  use:
+    - FILE

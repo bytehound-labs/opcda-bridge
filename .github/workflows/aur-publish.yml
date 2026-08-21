@@ -33,9 +33,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Check for AUR key
         id: check-key
@@ -59,29 +60,35 @@ jobs:
 
       - name: Download Linux release asset
         if: steps.check-key.outputs.configured == 'true'
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download "${{ inputs.release_tag }}" \
+          gh release download "$RELEASE_TAG" \
             --pattern "opcda-bridge-client-linux-*" \
             --dir assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute checksums
         if: steps.check-key.outputs.configured == 'true'
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           ARCHIVE=$(ls assets/opcda-bridge-client-linux-*.tar.gz)
           {
             echo "ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
-            echo "LICENSE_SHA=$(git show "${{ inputs.release_tag }}:LICENSE" | sha256sum | cut -d' ' -f1)"
-            echo "README_SHA=$(git show "${{ inputs.release_tag }}:README.md" | sha256sum | cut -d' ' -f1)"
+            echo "LICENSE_SHA=$(git show "${RELEASE_TAG}:LICENSE" | sha256sum | cut -d' ' -f1)"
+            echo "README_SHA=$(git show "${RELEASE_TAG}:README.md" | sha256sum | cut -d' ' -f1)"
           } >> "$GITHUB_ENV"
 
       - name: Generate PKGBUILD and .SRCINFO
         if: steps.check-key.outputs.configured == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          PKGREL: ${{ inputs.pkgrel }}
         run: |
           bash scripts/aurpkg \
-            --version "${{ steps.version.outputs.value }}" \
-            --pkgrel "${{ inputs.pkgrel }}" \
+            --version "$VERSION" \
+            --pkgrel "$PKGREL" \
             --license-sha256 "$LICENSE_SHA" \
             --readme-sha256 "$README_SHA" \
             --x86_64-sha256 "$ARCHIVE_SHA" \

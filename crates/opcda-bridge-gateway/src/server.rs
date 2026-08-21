@@ -295,6 +295,7 @@ mod tests {
     use crate::opc::{OpcValue, TagValue, WriteResult};
     use crate::test_support::MockOpcClient;
     use opcda_bridge_proto::bridge::write_request::TypedValue as ProtoTypedValue;
+    use proptest::prelude::*;
     use std::sync::{Arc, Mutex};
 
     fn new_bridge_service(
@@ -659,6 +660,29 @@ mod tests {
         assert_eq!(response.tag_id, "tag1");
         assert!(!response.success);
         assert_eq!(response.error, Some("write error".into()));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_browse_tree_is_deterministic_and_deduplicated(
+            path in any::<String>(),
+            discovered in proptest::collection::vec(any::<String>(), 0..64),
+        ) {
+            let first = browse_tree(&path, &discovered);
+            let second = browse_tree(&path, &discovered);
+            prop_assert_eq!(&first, &second);
+
+            let unique_ids = first
+                .iter()
+                .map(|node| node.tag_id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            prop_assert_eq!(unique_ids.len(), first.len());
+        }
+
+        #[test]
+        fn prop_nonzero_max_tags_is_preserved(max_tags in 1_u32..=u32::MAX) {
+            prop_assert_eq!(effective_max_tags(max_tags), max_tags as usize);
+        }
     }
 
     #[tokio::test]
