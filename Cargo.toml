@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # Keep recursive browsing for hierarchical OPC DA servers. The 0.1.2+ OPC_FLAT
 # fast path accepts branch-only results from some servers (including Yokogawa
 # CSHIS) as complete item IDs, so it cannot represent their child tags.
-opc-da-client = "=0.1.1"
+opc-da-client = "=0.2.0"
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.3" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.3" }
 prost = "0.14"
@@ -30,7 +30,7 @@ proptest = "1.11"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tabled = "0.19"
+tabled = "0.21"
 tempfile = "3"
 thiserror = "2"
 tonic = "0.14"
