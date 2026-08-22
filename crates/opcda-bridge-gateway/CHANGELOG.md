@@ -7,81 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.13](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.11...opcda-bridge-gateway-v0.2.13) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.12 ([#46](https://github.com/bytehound-labs/opcda-bridge/pull/46))
-
-## [0.2.12](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.10...opcda-bridge-gateway-v0.2.12) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.11 ([#45](https://github.com/bytehound-labs/opcda-bridge/pull/45))
-
-## [0.2.11](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.9...opcda-bridge-gateway-v0.2.11) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.10 ([#44](https://github.com/bytehound-labs/opcda-bridge/pull/44))
-
-## [0.2.10](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.8...opcda-bridge-gateway-v0.2.10) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.9 ([#43](https://github.com/bytehound-labs/opcda-bridge/pull/43))
-
-## [0.2.9](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.7...opcda-bridge-gateway-v0.2.9) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.8 ([#42](https://github.com/bytehound-labs/opcda-bridge/pull/42))
-
-## [0.2.8](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.6...opcda-bridge-gateway-v0.2.8) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.7 ([#41](https://github.com/bytehound-labs/opcda-bridge/pull/41))
-
-## [0.2.7](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.5...opcda-bridge-gateway-v0.2.7) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.6 ([#40](https://github.com/bytehound-labs/opcda-bridge/pull/40))
-
-## [0.2.6](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.4...opcda-bridge-gateway-v0.2.6) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.5 ([#39](https://github.com/bytehound-labs/opcda-bridge/pull/39))
-
-## [0.2.5](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.3...opcda-bridge-gateway-v0.2.5) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.4 ([#38](https://github.com/bytehound-labs/opcda-bridge/pull/38))
-
-## [0.2.4](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.2...opcda-bridge-gateway-v0.2.4) - 2026-08-22
-
-### Other
-
-- *(opcda-bridge-gateway)* release v0.2.3 ([#37](https://github.com/bytehound-labs/opcda-bridge/pull/37))
-
-## [0.2.3](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.1...opcda-bridge-gateway-v0.2.3) - 2026-08-22
-
 ### Fixed
 
-- *(browse)* support recursive hierarchical OPC DA tags
+- Prevented release-plz from reprocessing its own release commits.
 
-### Other
+### Notes
 
-- *(opcda-bridge-gateway)* release v0.2.2 ([#36](https://github.com/bytehound-labs/opcda-bridge/pull/36))
+- Versions 0.2.3 through 0.2.13 were published by mistake and contain no source changes beyond
+  generated release metadata. They are yanked on crates.io.
 
 ## [0.2.2](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.1...opcda-bridge-gateway-v0.2.2) - 2026-08-22
 
 ### Fixed
 
-- *(browse)* support recursive hierarchical OPC DA tags
+- _(browse)_ support recursive hierarchical OPC DA tags
 
 ## [0.2.1](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.0...opcda-bridge-gateway-v0.2.1) - 2026-08-21
 

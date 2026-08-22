@@ -2,5 +2,5 @@
 publish = true
 release = true
 release_always = false
-release_commits = "^(feat|fix|perf|refactor|docs|test|build|ci|revert)[(:]|^chore\\([^)]*\\)!?[(:]"
+release_commits = "^(feat|fix|perf|refactor|docs|test|build|ci|revert)[(:]|^chore\\((deps|deps-dev|github|actions|ci)\\)!?:"
 publish_timeout = "30m"
