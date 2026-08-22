@@ -34,6 +34,11 @@ a working opcda-bridge, not a redesign of it.
   `gbda_aut.dll` — both carry licensing terms incompatible with redistribution in an open-source
   project (the author's FalconTune/AccuTune `Main` repo hit this exact wall — see that repo's
   history if the reasoning needs re-deriving).
+- **Use recursive OPC DA browsing for hierarchical servers.** The workspace pins
+  `opc-da-client` to `=0.1.1` because its later `OPC_FLAT` fast path accepts branch-only results
+  from some servers, including Yokogawa CSHIS, as complete item IDs. The gateway's tree synthesis
+  accepts both dotted and slash-separated fully-qualified IDs and preserves the separator used by
+  each discovered item.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 

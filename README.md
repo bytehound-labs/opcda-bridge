@@ -111,6 +111,13 @@ config file — see [Configuration](#configuration) below.
   opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5
   opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 --path Simulink.Device1
   ```
+
+The Windows gateway recursively enumerates hierarchical OPC DA namespaces instead of relying on
+the optional `OPC_FLAT` result. This keeps servers that expose only top-level branch names through
+`OPC_FLAT` expandable, including Yokogawa CSHIS namespaces such as
+`FCS0201/Control/PV`. Dotted and slash-separated item IDs are both supported and preserved while
+drilling down the tree.
+
 - Read one or more tag values:
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 read --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D

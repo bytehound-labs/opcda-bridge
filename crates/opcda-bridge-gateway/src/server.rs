@@ -96,46 +96,35 @@ fn select_browse_nodes(
     }
 }
 
-/// Synthesize one level of tag hierarchy from a flat list of
-/// fully-qualified, dot-separated tag IDs (e.g. `"Simulink.Device1.Python.D"`).
-/// Upstream OPC DA browsing is flat-only, so hierarchy is synthesized here
-/// by splitting on `.` — the same convention most OPC tooling uses.
+/// Synthesize one level of tag hierarchy from a flat list of fully-qualified
+/// tag IDs (e.g. `"Simulink.Device1.Python.D"` or
+/// `"FCS0201/Block/PV"`). The OPC DA client performs the native recursive
+/// browse, then returns fully-qualified leaf IDs; this function turns those
+/// IDs into the one-level-at-a-time tree exposed by the gRPC API.
 ///
 /// Returns the distinct immediate children directly under `path` (each
 /// listed exactly once, in first-seen order), classified as `Branch` when
 /// at least one discovered tag extends further below that child, or `Leaf`
 /// when the child is itself the end of a tag ID. `path` is matched as a
-/// dot-separated prefix — `""` means the root level, `"Simulink"` means
-/// direct children of `"Simulink"`, and so on. A trailing `.` on `path` is
-/// tolerated and stripped.
+/// namespace-segment prefix — `""` means the root level, `"Simulink"` means
+/// direct children of `"Simulink"`, and so on. Both `.` and `/` are accepted
+/// as segment separators, and a trailing separator on `path` is tolerated.
 fn browse_tree(path: &str, discovered: &[String]) -> Vec<BrowseNode> {
-    let path = path.strip_suffix('.').unwrap_or(path);
-    let prefix = if path.is_empty() {
-        String::new()
-    } else {
-        format!("{path}.")
-    };
-
     let mut nodes: Vec<BrowseNode> = Vec::new();
     let mut index_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let path_segments = namespace_segments(path);
 
     for tag in discovered {
-        let Some(rest) = tag.strip_prefix(prefix.as_str()) else {
-            continue;
-        };
-        if rest.is_empty() {
-            // `tag` equals `path` itself exactly — nothing to list below a leaf.
+        let tag_segments = namespace_segments(tag);
+        if tag_segments.len() <= path_segments.len() || !tag_segments.starts_with(&path_segments) {
             continue;
         }
-        let next_segment = rest.split_once('.').map_or(rest, |(seg, _)| seg);
-        let is_branch = rest.len() > next_segment.len();
-        let child_id = if path.is_empty() {
-            next_segment.to_string()
-        } else {
-            format!("{path}.{next_segment}")
-        };
+        let child_segments = &tag_segments[..path_segments.len() + 1];
+        let child_key = child_segments.join(".");
+        let child_id = join_namespace_segments(child_segments, namespace_separator(tag));
+        let is_branch = tag_segments.len() > child_segments.len();
 
-        match index_of.get(&child_id) {
+        match index_of.get(&child_key) {
             Some(&i) => {
                 if is_branch {
                     // A later tag proves this child has children of its
@@ -145,7 +134,7 @@ fn browse_tree(path: &str, discovered: &[String]) -> Vec<BrowseNode> {
                 }
             }
             None => {
-                index_of.insert(child_id.clone(), nodes.len());
+                index_of.insert(child_key, nodes.len());
                 nodes.push(BrowseNode {
                     tag_id: child_id,
                     node_type: if is_branch {
@@ -158,6 +147,25 @@ fn browse_tree(path: &str, discovered: &[String]) -> Vec<BrowseNode> {
         }
     }
     nodes
+}
+
+fn namespace_segments(value: &str) -> Vec<&str> {
+    value
+        .split(['.', '/'])
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn namespace_separator(value: &str) -> char {
+    value
+        .chars()
+        .find(|character| matches!(character, '.' | '/'))
+        .unwrap_or('.')
+}
+
+fn join_namespace_segments(segments: &[&str], separator: char) -> String {
+    let separator = separator.to_string();
+    segments.join(&separator)
 }
 
 fn map_to_proto_tag_values(values: Vec<TagValue>) -> Vec<ProtoTagValue> {
@@ -479,6 +487,58 @@ mod tests {
             vec![BrowseNode {
                 tag_id: "Simulink.Device1.Python.D".to_string(),
                 node_type: NodeType::Leaf
+            }]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_supports_slash_separated_namespace() {
+        let discovered = vec![
+            "FCS0201/Control/PV".to_string(),
+            "FCS0201/Control/MV".to_string(),
+        ];
+
+        assert_eq!(
+            browse_tree("", &discovered),
+            vec![BrowseNode {
+                tag_id: "FCS0201".to_string(),
+                node_type: NodeType::Branch
+            }]
+        );
+        assert_eq!(
+            browse_tree("FCS0201", &discovered),
+            vec![BrowseNode {
+                tag_id: "FCS0201/Control".to_string(),
+                node_type: NodeType::Branch
+            }]
+        );
+        assert_eq!(
+            browse_tree("FCS0201/Control", &discovered),
+            vec![
+                BrowseNode {
+                    tag_id: "FCS0201/Control/PV".to_string(),
+                    node_type: NodeType::Leaf
+                },
+                BrowseNode {
+                    tag_id: "FCS0201/Control/MV".to_string(),
+                    node_type: NodeType::Leaf
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_browse_tree_matches_mixed_namespace_separators_by_segments() {
+        let discovered = vec![
+            "FCS0201/Control/PV".to_string(),
+            "FCS0201.Control/MV".to_string(),
+        ];
+
+        assert_eq!(
+            browse_tree("FCS0201", &discovered),
+            vec![BrowseNode {
+                tag_id: "FCS0201/Control".to_string(),
+                node_type: NodeType::Branch
             }]
         );
     }
