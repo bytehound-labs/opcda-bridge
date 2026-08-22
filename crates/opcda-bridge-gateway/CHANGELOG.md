@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.1...opcda-bridge-gateway-v0.2.3) - 2026-08-22
+
+### Fixed
+
+- *(browse)* support recursive hierarchical OPC DA tags
+
+### Other
+
+- *(opcda-bridge-gateway)* release v0.2.2 ([#36](https://github.com/bytehound-labs/opcda-bridge/pull/36))
+
 ## [0.2.2](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.1...opcda-bridge-gateway-v0.2.2) - 2026-08-22
 
 ### Fixed
