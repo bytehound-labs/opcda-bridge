@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "opcda-bridge-proto",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-client"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "prost",
  "tonic",
