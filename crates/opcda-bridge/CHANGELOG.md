@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-v0.2.2...opcda-bridge-v0.3.2) - 2026-08-23
+
+### Added
+
+- add scalable OPC DA browsing
+
+### Fixed
+
+- *(ci)* stop release automation loops ([#49](https://github.com/bytehound-labs/opcda-bridge/pull/49))
+
+### Other
+
+- release v0.3.1 ([#54](https://github.com/bytehound-labs/opcda-bridge/pull/54))
+
 ## [0.3.1](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-v0.2.2...opcda-bridge-v0.3.1) - 2026-08-23
 
 ### Fixed
