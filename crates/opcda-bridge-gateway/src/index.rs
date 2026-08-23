@@ -1829,7 +1829,10 @@ mod tests {
         assert_eq!(normalize_query("  FCS0201   PV "), "fcs0201 pv");
         assert_eq!(escape_like(r"a%b_c\d"), r"a\%b\_c\\d");
         assert!(parse_timestamp("not-a-timestamp").is_none());
-        assert!(parse_timestamp(u128::from(u64::MAX).to_string().as_str()).is_some());
+        assert_eq!(
+            parse_timestamp(u128::from(u64::MAX).to_string().as_str()),
+            UNIX_EPOCH.checked_add(Duration::from_millis(u64::MAX))
+        );
         assert!(parse_timestamp(u128::MAX.to_string().as_str()).is_none());
         assert_eq!(SearchMode::try_from(0), Ok(SearchMode::Unspecified));
         assert_eq!(SearchMode::try_from(1), Ok(SearchMode::Exact));
