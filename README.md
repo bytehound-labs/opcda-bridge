@@ -17,6 +17,9 @@ definitions, cross-platform CLI, and Windows gateway as separate crates. Release
 release pull request and publishes only after its generated metadata passes the required release
 integrity check.
 
+The 0.3 API line introduces a breaking gRPC browse contract. Upgrade the gateway and client
+together; 0.2 clients and gateways are not wire-compatible with 0.3.
+
 ## Why
 
 OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based industrial protocol still running on countless PLCs, DCSs, and SCADA systems that predate its successor, OPC UA.

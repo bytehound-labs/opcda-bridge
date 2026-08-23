@@ -412,6 +412,7 @@ mod tests {
     #[test]
     fn global_flags_and_environment_parse() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888");
             std::env::set_var("OPC_BRIDGE_OUTPUT", "json");
@@ -420,6 +421,7 @@ mod tests {
         assert_eq!(args.host.as_deref(), Some("envhost:8888"));
         assert_eq!(args.output, Some(OutputFormat::Json));
         assert!(args.json);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("OPC_BRIDGE_HOST");
             std::env::remove_var("OPC_BRIDGE_OUTPUT");
