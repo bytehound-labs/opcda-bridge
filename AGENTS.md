@@ -23,8 +23,8 @@ a working opcda-bridge, not a redesign of it.
 
 ## Key architectural decisions
 
-- **Build on the [`opc-da-client`](https://github.com/wends155/opc-cli) crate** (MIT,
-  async/trait-based, `windows-rs`-backed) for the COM/OPC DA layer, rather than reimplementing raw
+- **Build on the ByteHound-maintained [`bytehound-opc-da-client`](https://github.com/bytehound-labs/opc-cli/tree/main/opc-da-client)
+  package** (MIT, async/trait-based, `windows-rs`-backed) for the COM/OPC DA layer, rather than reimplementing raw
   OPC DA COM interfaces from scratch. Its lower-level sibling
   [`opc_da`](https://github.com/Ronbb/rust_opc) (also MIT) is a fallback/reference if
   `opc-da-client` proves insufficient. `opc_da`'s repo bundles OPC Foundation IDL files under the
@@ -34,11 +34,12 @@ a working opcda-bridge, not a redesign of it.
   `gbda_aut.dll` — both carry licensing terms incompatible with redistribution in an open-source
   project (the author's FalconTune/AccuTune `Main` repo hit this exact wall — see that repo's
   history if the reasoning needs re-deriving).
-- **Use recursive OPC DA browsing for hierarchical servers.** The workspace pins
-  `opc-da-client` to `=0.1.1` because its later `OPC_FLAT` fast path accepts branch-only results
-  from some servers, including Yokogawa CSHIS, as complete item IDs. The gateway's tree synthesis
-  accepts both dotted and slash-separated fully-qualified IDs and preserves the separator used by
-  each discovered item.
+- **Use native lazy OPC DA browsing for hierarchical servers.** The gateway requests one bounded
+  level at a time through the scalable browse API in the `opc-da-client` fork. DA 3.0 continuation
+  points and DA 2.x browse positions remain on their native session; the gRPC layer exposes only
+  gateway-owned opaque session, page, and node tokens. Flat namespaces are reported as flat rather
+  than reconstructed into a potentially incomplete hierarchy, and exact ItemIDs remain separate
+  from display names.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 
@@ -92,7 +93,7 @@ corresponding tests in the same PR to maintain 100% coverage.
 The gateway binary (`opcda-bridge-gateway`) depends on `opc-da-client` only on Windows
 (`#[cfg(target_os = "windows")]`). To keep the gateway's core logic testable on all platforms,
 an `OpcClient` trait (in `crates/opcda-bridge-gateway/src/opc.rs`) abstracts OPC DA operations. The concrete
-adapter (`opc_da_adapter.rs`) wraps `opc_da_client::OpcDaWrapper` and is Windows-only. The run
+adapter (`opc_da_adapter.rs`) wraps the native browse-session client and is Windows-only. The run
 loop (`crates/opcda-bridge-gateway/src/run.rs`) that serves the gRPC service and drains it on shutdown is generic
 over `OpcClient` too, so it runs under tests on any platform even though the gateway only ships
 for Windows. Both `server`'s and `run`'s tests share one `MockOpcClient`
@@ -181,9 +182,9 @@ invoked once at install time.
 
 `crates/opcda-bridge-client/src/output.rs` holds `OutputFormat` (`Table`/`Json`) and the two pure functions every
 command routes through: `render<T: Tabled + Serialize>(rows, format)` and `format_error(err,
-format)`. Every row struct (`ServerRow`, `TagRow`, `ReadRow`, `WriteRow`) derives both `Tabled`
-and `Serialize`, so JSON keys are the Rust field names — the external contract for scripted
-consumers — while table headers stay controlled separately via `#[tabled(rename = "...")]`.
+format)`. Command-specific rows and browse/search event structures derive serialization separately,
+so JSON keys remain the Rust field names — the external contract for scripted consumers — while
+table headers stay controlled separately via `#[tabled(rename = "...")]`.
 `WriteRow.error` is `Option<String>` rather than the pre-JSON code's `.unwrap_or_default()`
 collapse to `""`, so JSON can distinguish "no error" (`null`) from an actual empty string; the
 table rendering still shows an empty cell for `None` via `#[tabled(rename = "Error",
@@ -193,10 +194,8 @@ takes the fallback-for-`None` string as its second argument).
 `--json` is a plain boolean flag, not linked to `--output` via clap's `conflicts_with` —
 `conflicts_with` can misfire against env-sourced values, so precedence between the two is instead
 resolved once in code (`output::resolve_from_cli`: `--json` always wins if set, otherwise
-`--output`) rather than left to clap. `cmd_browse`'s branching checks `format ==
-OutputFormat::Json` before checking `flat`, so JSON output always bypasses `render_tree` and
-emits the same flat `TagRow` shape regardless of `--flat` — the indented tree is a display-only
-`String` builder with no structured equivalent.
+`--output`) rather than left to clap. Browse JSON emits page/session/completeness metadata, while
+search JSON emits newline-delimited progressive events.
 
 `host`/`config`/`output`/`json` on `Cli` are all `#[arg(..., global = true)]`, so they can be
 passed either before or after the subcommand (clap's default otherwise requires top-level flags
@@ -224,17 +223,21 @@ from inside `Cli::parse()` before `run_with_cli` is ever called).
 ### Client library (`opcda-bridge`)
 
 The reusable client library lives in `crates/opcda-bridge` and owns the typed
-connect/list-servers/browse/read/write API extracted from the CLI's
+capabilities, browse-session, search, connect/list-servers/read/write API extracted from the CLI's
 `crates/opcda-bridge-client/src/commands.rs`. It has no CLI presentation dependencies, so
-downstream Rust applications such as `bhtune` can depend on `opcda-bridge` without pulling in
-`clap`, `tabled`, `serde_json`, or `toml`.
+downstream Rust applications can depend on `opcda-bridge` without pulling in `clap`, `tabled`,
+`serde_json`, or `toml`.
 
-- **API surface**: `Client::connect(host: &str)`, `.list_servers()`, `.browse(server, flat, path,
-max_tags)`, `.read(server, tags)`, and `.write(server, tag, value)` return plain Rust values
-  (`Vec<String>`, `Vec<BrowseNode>`, `Vec<TagValue>`, and `WriteResult`).
+- **API surface**: `Client::connect(host: &str)`, `.capabilities(server)`, `.browse(server,
+page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.search_stream(request)`,
+  `.list_servers()`, `.read(server, tags)`, and `.write(server, tag, value)` return typed Rust values
+  (`Capabilities`, `BrowsePage`, `SearchStream`, `Vec<String>`, `Vec<TagValue>`, and `WriteResult`).
+- **Paging contract**: browse methods request one page and never automatically follow continuation
+  tokens. Use `BrowsePageRequest::next` or an explicit application-level collection loop when bulk
+  results are intended.
 - **Dependency boundary**: `opcda-bridge` depends on the published `opcda-bridge-proto`,
-  `tonic`, `tonic-prost`, and `thiserror`. Runtime crates such as `tokio` and `tokio-stream` are
-  only dev-dependencies because `Client::browse` drains `tonic::Streaming` directly.
+  `tonic`, `tonic-prost`, `uuid`, and `thiserror`. Runtime crates such as `tokio` and
+  `tokio-stream` are only dev-dependencies because browse and search use tonic streams directly.
 - **Error contract**: `Error::Connect(tonic::transport::Error)` and `Error::Rpc(tonic::Status)`
   use transparent error rendering so the CLI's existing error output remains unchanged.
 - **Published distribution**: `opcda-bridge` is consumed from crates.io with a normal SemVer

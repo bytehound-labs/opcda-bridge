@@ -6,7 +6,9 @@ applications should use the higher-level `opcda-bridge` client library instead.
 
 ```toml
 [dependencies]
-opcda-bridge-proto = "0.2"
+opcda-bridge-proto = "0.3"
 ```
 
-The protocol is generated from the crate's bundled `bridge.proto` definition.
+The protocol is generated from the crate's bundled `bridge.proto` definition. Browse is a unary,
+one-level page operation with opaque session and continuation tokens; namespace search is a
+separate progressive streaming operation.

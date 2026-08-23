@@ -14,6 +14,30 @@ fn test_client_help() {
 }
 
 #[test]
+fn test_browse_and_search_help_expose_scalable_options() {
+    let client_bin = env!("CARGO_BIN_EXE_opcda-bridge-client");
+    let browse = Command::new(client_bin)
+        .args(["browse", "--help"])
+        .output()
+        .unwrap();
+    assert!(browse.status.success());
+    let browse_help = String::from_utf8_lossy(&browse.stdout);
+    assert!(browse_help.contains("--page-size"));
+    assert!(browse_help.contains("--all"));
+    assert!(browse_help.contains("--parent-node-key"));
+
+    let search = Command::new(client_bin)
+        .args(["search", "--help"])
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let search_help = String::from_utf8_lossy(&search.stdout);
+    assert!(search_help.contains("--match-mode"));
+    assert!(search_help.contains("--max-results"));
+    assert!(search_help.contains("--include-branches"));
+}
+
+#[test]
 fn test_client_run_exercises_full_run_path_on_connection_failure() {
     // `--help` above exits inside `Cli::parse()`, before `lib::run()` ever
     // calls into `run_with_cli`. Connecting to a closed local port instead

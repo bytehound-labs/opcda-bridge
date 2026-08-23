@@ -19,16 +19,26 @@
 # Default: localhost:7600
 host = "localhost:7600"
 
-# Default OPC DA server ProgID for browse/read/write, used when --server
+# Default OPC DA server ProgID for capabilities/browse/search/read/write, used when --server
 # is omitted. Unlike the other keys, there is no built-in default — if
 # this is unset and --server is omitted, the command errors.
 # CLI flag: --server
 server = "Kepware.KepServerEX.V5"
 
-# Cap on the number of tags a `browse` streams back.
-# CLI flag: --max-tags
-# Default: 1000
-max_tags = 1000
+# Number of immediate children requested in each browse page.
+# CLI flag: browse --page-size
+# Default: 200
+page_size = 200
+
+# Total-result safety cap for the explicitly expensive `browse --all` mode.
+# CLI flag: browse --all --max-results
+# Default: 10000
+browse_all_limit = 10000
+
+# Maximum matches returned by `search`.
+# CLI flag: search --max-results
+# Default: 200
+search_max_results = 200
 
 # Output format: "table" (human-readable, default) or "json" (pretty-printed,
 # for scripting/piping into jq). --json is shorthand for --output json.

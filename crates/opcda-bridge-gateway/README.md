@@ -12,6 +12,7 @@ cargo install opcda-bridge-gateway
 The gateway must run on the Windows machine hosting the OPC DA server. See the repository README
 for service installation, configuration, and firewall setup.
 
-Tag browsing uses recursive branch/leaf enumeration for hierarchical OPC DA servers. The gateway
-preserves dotted and slash-separated item IDs so clients can expand namespaces such as
-`FCS0201/Control/PV` one level at a time.
+Tag browsing uses native one-level OPC DA enumeration with bounded pages. The gateway owns opaque
+browse sessions and continuation tokens, preserves exact ItemIDs separately from display names,
+and reports whether a page is complete. Namespace search is a bounded progressive operation that
+can be cancelled by dropping the client stream.

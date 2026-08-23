@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -19,10 +19,9 @@ homepage = "https://github.com/bytehound-labs/opcda-bridge"
 anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
-# Keep recursive browsing for hierarchical OPC DA servers. The 0.1.2+ OPC_FLAT
-# fast path accepts branch-only results from some servers (including Yokogawa
-# CSHIS) as complete item IDs, so it cannot represent their child tags.
-opc-da-client = "=0.1.1"
+# The bridge uses the ByteHound-published fork while retaining the upstream
+# dependency alias in Rust source (`opc_da_client`).
+opc-da-client = { package = "bytehound-opc-da-client", path = "../opc-cli/opc-da-client", version = "0.2.0" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.3" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.3" }
 prost = "0.14"
@@ -42,4 +41,5 @@ tokio-stream = "0.1"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4"] }
 windows-service = "0.8"

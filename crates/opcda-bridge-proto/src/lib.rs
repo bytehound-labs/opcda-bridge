@@ -10,8 +10,11 @@ mod tests {
     use super::DEFAULT_BRIDGE_PORT;
     use crate::bridge::write_request::TypedValue;
     use crate::bridge::{
-        BrowseRequest, BrowseResponse, ListServersRequest, ListServersResponse, ReadRequest,
-        ReadResponse, TagValue, WriteRequest, WriteResponse,
+        BrowseNode, BrowseNodeKind, BrowsePage, BrowseRequest, BrowseSource,
+        CloseBrowseSessionRequest, GetCapabilitiesRequest, GetCapabilitiesResponse,
+        ListServersRequest, ListServersResponse, NamespaceOrganization, ReadRequest, ReadResponse,
+        SearchCompleted, SearchEvent, SearchMatch, SearchMatchMode, SearchProgress, TagValue,
+        WriteRequest, WriteResponse,
     };
 
     #[test]
@@ -54,36 +57,103 @@ mod tests {
     fn test_browse_request() {
         let req = BrowseRequest {
             server: "MyServer".into(),
-            flat: true,
-            path: "/root".into(),
-            max_tags: 500,
+            session_id: Some("session".into()),
+            parent_node_key: Some("parent".into()),
+            page_token: Some("page".into()),
+            page_size: 500,
+            refresh: true,
         };
         assert_eq!(req.server, "MyServer");
-        assert!(req.flat);
-        assert_eq!(req.path, "/root");
-        assert_eq!(req.max_tags, 500);
+        assert_eq!(req.session_id.as_deref(), Some("session"));
+        assert_eq!(req.parent_node_key.as_deref(), Some("parent"));
+        assert_eq!(req.page_token.as_deref(), Some("page"));
+        assert_eq!(req.page_size, 500);
+        assert!(req.refresh);
     }
 
     #[test]
     fn test_browse_request_defaults() {
         let req = BrowseRequest {
             server: String::new(),
-            flat: false,
-            path: String::new(),
-            max_tags: 0,
+            session_id: None,
+            parent_node_key: None,
+            page_token: None,
+            page_size: 0,
+            refresh: false,
         };
-        assert!(!req.flat);
-        assert_eq!(req.max_tags, 0);
+        assert!(req.session_id.is_none());
+        assert_eq!(req.page_size, 0);
     }
 
     #[test]
-    fn test_browse_response() {
-        let resp = BrowseResponse {
-            tag_id: "Channel1.Device1.Tag1".into(),
-            node_type: "Leaf".into(),
+    fn test_browse_page_and_node() {
+        let node = BrowseNode {
+            node_key: "opaque".into(),
+            display_name: "PV".into(),
+            kind: BrowseNodeKind::BranchAndItem as i32,
+            item_id: Some("FCS0201!204FI00510.PV".into()),
         };
-        assert_eq!(resp.tag_id, "Channel1.Device1.Tag1");
-        assert_eq!(resp.node_type, "Leaf");
+        let page = BrowsePage {
+            session_id: "session".into(),
+            nodes: vec![node],
+            next_page_token: Some("next".into()),
+            complete: false,
+            organization: NamespaceOrganization::Hierarchical as i32,
+            source: BrowseSource::Da2 as i32,
+            warning: Some("partial".into()),
+        };
+        assert_eq!(page.nodes[0].display_name, "PV");
+        assert_eq!(page.next_page_token.as_deref(), Some("next"));
+        assert!(!page.complete);
+    }
+
+    #[test]
+    fn test_capabilities_and_close_request() {
+        let request = GetCapabilitiesRequest { server: "S".into() };
+        let response = GetCapabilitiesResponse {
+            application_version: "0.3.0".into(),
+            protocol_version: "2".into(),
+            max_page_size: 1000,
+            supports_browse_sessions: true,
+            supports_search: true,
+            organization: NamespaceOrganization::Flat as i32,
+            source: BrowseSource::Flat as i32,
+        };
+        let close = CloseBrowseSessionRequest {
+            session_id: "s".into(),
+        };
+        assert_eq!(request.server, "S");
+        assert_eq!(response.max_page_size, 1000);
+        assert_eq!(close.session_id, "s");
+    }
+
+    #[test]
+    fn test_search_messages() {
+        let match_message = SearchMatch {
+            node: None,
+            breadcrumbs: vec![],
+        };
+        let progress = SearchProgress {
+            visited_nodes: 4,
+            matches: 2,
+            partial: true,
+        };
+        let completed = SearchCompleted {
+            complete: false,
+            cancelled: false,
+            truncated: true,
+            warning: Some("capped".into()),
+        };
+        let event = SearchEvent {
+            event: Some(crate::bridge::search_event::Event::Progress(progress)),
+        };
+        assert!(event.event.is_some());
+        assert!(match_message.breadcrumbs.is_empty());
+        assert!(completed.truncated);
+        assert_eq!(
+            SearchMatchMode::Contains as i32,
+            SearchMatchMode::try_from(SearchMatchMode::Contains as i32).unwrap() as i32
+        );
     }
 
     #[test]

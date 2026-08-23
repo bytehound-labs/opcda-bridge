@@ -35,6 +35,7 @@ tracing-appender.workspace = true
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true
+uuid.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 opc-da-client.workspace = true

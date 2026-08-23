@@ -67,15 +67,13 @@ pub async fn shutdown_signal() {
 /// (plain `main` return vs. SCM status reporting) is handled around this
 /// call — not in how the gateway itself starts up.
 ///
-/// Windows-only, like the rest of the gateway's runtime setup: `ComGuard`
-/// and the real `OpcDaAdapter`-backed `BridgeService::default()` only exist
-/// on Windows.
+/// Windows-only, like the rest of the gateway's runtime setup: the real
+/// `OpcDaAdapter`-backed `BridgeService::default()` only exists on Windows.
 #[cfg(target_os = "windows")]
 pub async fn run_gateway(
     cli: crate::config::Cli,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    use opc_da_client::ComGuard;
     use std::net::SocketAddr;
 
     let config = crate::config::load_config(cli.config.as_deref())?;
@@ -97,9 +95,6 @@ pub async fn run_gateway(
     // Hold the guard for this call's lifetime: dropping it early would
     // silently truncate buffered log lines that haven't yet been flushed.
     let _log_guard = crate::logging::init_tracing(&log_settings)?;
-
-    let _guard = ComGuard::new().expect("COM initialization failed");
-    Box::leak(Box::new(_guard));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;

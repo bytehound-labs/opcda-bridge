@@ -1,19 +1,50 @@
-use opcda_bridge_proto::bridge::{BrowseRequest, ReadRequest, WriteResponse};
+use opcda_bridge_proto::bridge::{
+    BrowseNode, BrowseNodeKind, BrowsePage, BrowseRequest, BrowseSource, NamespaceOrganization,
+    ReadRequest, WriteResponse,
+};
 use prost::Message;
 
 #[test]
-fn decodes_previous_browse_request_without_newer_fields() {
-    let payload = [0x0a, 0x01, b'S', 0x10, 0x01, 0x1a, 0x03, b'A', b'/', b'B'];
-    let request = BrowseRequest::decode(payload.as_slice()).unwrap();
+fn round_trips_paged_browse_request_and_response() {
+    let request = BrowseRequest {
+        server: "S".into(),
+        session_id: Some("session".into()),
+        parent_node_key: Some("parent".into()),
+        page_token: Some("page".into()),
+        page_size: 200,
+        refresh: true,
+    };
+    let encoded_request = request.encode_to_vec();
+    let decoded_request = BrowseRequest::decode(encoded_request.as_slice()).unwrap();
+    assert_eq!(decoded_request, request);
 
-    assert_eq!(request.server, "S");
-    assert!(request.flat);
-    assert_eq!(request.path, "A/B");
-    assert_eq!(request.max_tags, 0);
+    let response = BrowsePage {
+        session_id: "session".into(),
+        nodes: vec![BrowseNode {
+            node_key: "node".into(),
+            display_name: "PV".into(),
+            kind: BrowseNodeKind::BranchAndItem as i32,
+            item_id: Some("FCS0201!204FI00510.PV".into()),
+        }],
+        next_page_token: Some("next".into()),
+        complete: false,
+        organization: NamespaceOrganization::Hierarchical as i32,
+        source: BrowseSource::Da2 as i32,
+        warning: None,
+    };
+    let encoded_response = response.encode_to_vec();
+    let decoded_response = BrowsePage::decode(encoded_response.as_slice()).unwrap();
+    assert_eq!(decoded_response, response);
 }
 
 #[test]
-fn decodes_previous_read_request_payload() {
+fn rejects_the_old_streaming_browse_wire_shape() {
+    let old_payload = [0x0a, 0x01, b'S', 0x10, 0x01, 0x1a, 0x03, b'A', b'/', b'B'];
+    assert!(BrowseRequest::decode(old_payload.as_slice()).is_err());
+}
+
+#[test]
+fn decodes_unchanged_read_request_payload() {
     let payload = [0x0a, 0x01, b'S', 0x12, 0x01, b'T'];
     let request = ReadRequest::decode(payload.as_slice()).unwrap();
 
@@ -22,7 +53,7 @@ fn decodes_previous_read_request_payload() {
 }
 
 #[test]
-fn decodes_previous_write_response_payload() {
+fn decodes_unchanged_write_response_payload() {
     let payload = [0x0a, 0x01, b'T', 0x10, 0x01];
     let response = WriteResponse::decode(payload.as_slice()).unwrap();
 
