@@ -13,14 +13,12 @@ Required flags:
   --output-dir <path>        Directory to write PKGBUILD and .SRCINFO into
 
 Optional flags:
-  --epoch <int>             Package epoch (default: 1)
   --pkgrel <int>             Package release number (default: 1)
 EOF
   exit 1
 }
 
 VERSION=""
-PKG_EPOCH="1"
 PKGREL="1"
 LICENSE_SHA=""
 README_SHA=""
@@ -30,7 +28,6 @@ OUTPUT_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
-    --epoch) PKG_EPOCH="$2"; shift 2 ;;
     --pkgrel) PKGREL="$2"; shift 2 ;;
     --license-sha256) LICENSE_SHA="$2"; shift 2 ;;
     --readme-sha256) README_SHA="$2"; shift 2 ;;
@@ -57,13 +54,6 @@ fi
 # Validate pkgrel is a positive integer
 if [[ ! "$PKGREL" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: --pkgrel must be a positive integer (got '$PKGREL')" >&2
-  exit 1
-fi
-
-# Keep the epoch stable so a withdrawn upstream version can be replaced by an older
-# retained release without leaving installed clients pinned to a broken package.
-if [[ ! "$PKG_EPOCH" =~ ^[1-9][0-9]*$ ]]; then
-  echo "ERROR: --epoch must be a positive integer (got '$PKG_EPOCH')" >&2
   exit 1
 fi
 
@@ -96,7 +86,6 @@ cat > "$OUTPUT_DIR/PKGBUILD" << BUILDEOF
 
 pkgname=opcda-bridge-client-bin
 pkgver=$pkgver
-epoch=$PKG_EPOCH
 pkgrel=$PKGREL
 pkgdesc='OPC DA cross-platform client'
 arch=('x86_64')
@@ -125,7 +114,6 @@ cat > "$OUTPUT_DIR/.SRCINFO" << SRCINFOEOF
 	pkgbase = opcda-bridge-client-bin
 	pkgdesc = OPC DA cross-platform client
 	pkgver = $pkgver
-	epoch = $PKG_EPOCH
 	pkgrel = $PKGREL
 	url = https://github.com/bytehound-labs/opcda-bridge
 	arch = x86_64
