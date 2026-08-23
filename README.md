@@ -66,7 +66,8 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   yay -S opcda-bridge-client-bin
   ```
   The package maintains Arch upgrade ordering with a stable package epoch when an upstream
-  release is withdrawn.
+  release is withdrawn, and uses versioned source filenames to avoid reusing stale local
+  `makepkg` or `yay` cache files between releases.
 - **From source** (same prerequisites as the gateway):
   ```sh
   git clone https://github.com/bytehound-labs/opcda-bridge.git
