@@ -1136,6 +1136,7 @@ mod tests {
                 .is_ok()
         );
         assert!(client.close_browse_session("native").await.is_ok());
+        assert!(client.start_inventory("S", 10).await.is_err());
         assert!(
             client
                 .read_tag_values("S", vec![])
