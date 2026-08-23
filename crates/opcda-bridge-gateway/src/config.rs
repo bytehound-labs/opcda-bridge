@@ -73,6 +73,8 @@ pub struct GatewayConfig {
     pub port: Option<u16>,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default)]
+    pub index: IndexConfig,
 }
 
 /// Logging configuration keys, consumed once file-based logging lands.
@@ -82,6 +84,145 @@ pub struct LogConfig {
     pub dir: Option<String>,
     pub format: Option<String>,
     pub rotation: Option<String>,
+}
+
+/// Persistent namespace-index settings.
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct IndexConfig {
+    /// Service-writable SQLite path. If omitted, the platform data directory
+    /// is used.
+    pub database_path: Option<String>,
+    /// Only these OPC DA ProgIDs may be indexed automatically.
+    #[serde(default)]
+    pub servers: Vec<String>,
+    /// Set false to disable automatic indexing while retaining manual APIs.
+    pub enabled: Option<bool>,
+    pub refresh_interval_seconds: Option<u64>,
+    pub batch_size: Option<u32>,
+    pub item_rate_limit: Option<u32>,
+    pub burst_size: Option<u32>,
+    pub duty_cycle_percent: Option<u8>,
+    pub quiet_period_seconds: Option<u64>,
+    pub health_probe_interval_seconds: Option<u64>,
+    pub health_latency_threshold_ms: Option<u64>,
+    #[serde(default)]
+    pub maintenance_windows: Vec<String>,
+    pub concurrency: Option<u32>,
+    pub query_cache_capacity: Option<usize>,
+    pub paused: Option<bool>,
+    pub max_results: Option<u32>,
+}
+
+/// Resolved index settings used by the gateway runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIndexConfig {
+    pub database_path: PathBuf,
+    pub servers: Vec<String>,
+    pub enabled: bool,
+    pub refresh_interval_seconds: u64,
+    pub batch_size: u32,
+    pub item_rate_limit: u32,
+    pub burst_size: u32,
+    pub duty_cycle_percent: u8,
+    pub quiet_period_seconds: u64,
+    pub health_probe_interval_seconds: u64,
+    pub health_latency_threshold_ms: u64,
+    pub maintenance_windows: Vec<String>,
+    pub concurrency: u32,
+    pub query_cache_capacity: usize,
+    pub paused: bool,
+    pub max_results: u32,
+}
+
+pub const DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS: u64 = 86_400;
+pub const DEFAULT_INDEX_BATCH_SIZE: u32 = 100;
+pub const DEFAULT_INDEX_ITEM_RATE: u32 = 250;
+pub const DEFAULT_INDEX_BURST_SIZE: u32 = 100;
+pub const DEFAULT_INDEX_DUTY_CYCLE_PERCENT: u8 = 20;
+pub const DEFAULT_INDEX_QUIET_PERIOD_SECONDS: u64 = 2;
+pub const DEFAULT_INDEX_HEALTH_PROBE_INTERVAL_SECONDS: u64 = 30;
+pub const DEFAULT_INDEX_HEALTH_LATENCY_THRESHOLD_MS: u64 = 500;
+pub const DEFAULT_INDEX_CONCURRENCY: u32 = 1;
+pub const DEFAULT_INDEX_QUERY_CACHE_CAPACITY: usize = 256;
+pub const DEFAULT_INDEX_MAX_RESULTS: u32 = 50;
+
+/// Return the platform data path used for the gateway-owned index.
+pub fn index_path_from(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    program_data: Option<&str>,
+    is_windows: bool,
+) -> Option<PathBuf> {
+    if is_windows {
+        return program_data.map(|dir| Path::new(dir).join("opcda-bridge").join("index.sqlite3"));
+    }
+    if let Some(dir) = xdg_data_home {
+        return Some(Path::new(dir).join("opcda-bridge").join("index.sqlite3"));
+    }
+    home.map(|dir| {
+        Path::new(dir)
+            .join(".local")
+            .join("share")
+            .join("opcda-bridge")
+            .join("index.sqlite3")
+    })
+}
+
+pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
+    let database_path = config
+        .database_path
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| {
+            index_path_from(
+                std::env::var("XDG_DATA_HOME").ok().as_deref(),
+                std::env::var("HOME").ok().as_deref(),
+                std::env::var("PROGRAMDATA").ok().as_deref(),
+                cfg!(target_os = "windows"),
+            )
+        })
+        .unwrap_or_else(|| PathBuf::from("opcda-bridge-index.sqlite3"));
+
+    ResolvedIndexConfig {
+        database_path,
+        servers: config.servers.clone(),
+        enabled: config.enabled.unwrap_or(true),
+        refresh_interval_seconds: config
+            .refresh_interval_seconds
+            .unwrap_or(DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS),
+        batch_size: config.batch_size.unwrap_or(DEFAULT_INDEX_BATCH_SIZE).max(1),
+        item_rate_limit: config.item_rate_limit.unwrap_or(DEFAULT_INDEX_ITEM_RATE),
+        burst_size: config.burst_size.unwrap_or(DEFAULT_INDEX_BURST_SIZE).max(1),
+        duty_cycle_percent: config
+            .duty_cycle_percent
+            .unwrap_or(DEFAULT_INDEX_DUTY_CYCLE_PERCENT)
+            .clamp(1, 100),
+        quiet_period_seconds: config
+            .quiet_period_seconds
+            .unwrap_or(DEFAULT_INDEX_QUIET_PERIOD_SECONDS),
+        health_probe_interval_seconds: config
+            .health_probe_interval_seconds
+            .unwrap_or(DEFAULT_INDEX_HEALTH_PROBE_INTERVAL_SECONDS)
+            .max(1),
+        health_latency_threshold_ms: config
+            .health_latency_threshold_ms
+            .unwrap_or(DEFAULT_INDEX_HEALTH_LATENCY_THRESHOLD_MS)
+            .max(1),
+        maintenance_windows: config.maintenance_windows.clone(),
+        concurrency: config
+            .concurrency
+            .unwrap_or(DEFAULT_INDEX_CONCURRENCY)
+            .max(1),
+        query_cache_capacity: config
+            .query_cache_capacity
+            .unwrap_or(DEFAULT_INDEX_QUERY_CACHE_CAPACITY)
+            .max(1),
+        paused: config.paused.unwrap_or(false),
+        max_results: config
+            .max_results
+            .unwrap_or(DEFAULT_INDEX_MAX_RESULTS)
+            .max(1),
+    }
 }
 
 /// Derive the gateway's default config path from its own executable path:
@@ -250,6 +391,7 @@ mod tests {
         let config = GatewayConfig {
             port: Some(1111),
             log: LogConfig::default(),
+            index: IndexConfig::default(),
         };
         assert_eq!(resolve_port(Some(2222), &config), 2222);
     }
@@ -259,6 +401,7 @@ mod tests {
         let config = GatewayConfig {
             port: Some(1111),
             log: LogConfig::default(),
+            index: IndexConfig::default(),
         };
         assert_eq!(resolve_port(None, &config), 1111);
     }
@@ -269,6 +412,94 @@ mod tests {
             resolve_port(None, &GatewayConfig::default()),
             opcda_bridge_proto::DEFAULT_BRIDGE_PORT
         );
+    }
+
+    #[test]
+    fn test_index_path_discovery_covers_platform_precedence() {
+        assert_eq!(
+            index_path_from(
+                Some("/xdg"),
+                Some("/home/mike"),
+                Some("/program-data"),
+                false
+            ),
+            Some(PathBuf::from("/xdg/opcda-bridge/index.sqlite3"))
+        );
+        assert_eq!(
+            index_path_from(None, Some("/home/mike"), Some("/program-data"), false),
+            Some(PathBuf::from(
+                "/home/mike/.local/share/opcda-bridge/index.sqlite3"
+            ))
+        );
+        assert_eq!(
+            index_path_from(None, None, Some("/program-data"), true),
+            Some(PathBuf::from("/program-data/opcda-bridge/index.sqlite3"))
+        );
+        assert_eq!(index_path_from(None, None, None, true), None);
+        assert_eq!(index_path_from(None, None, None, false), None);
+    }
+
+    #[test]
+    fn test_resolve_index_config_applies_defaults_and_safe_bounds() {
+        let config = IndexConfig {
+            database_path: Some("custom.sqlite3".into()),
+            servers: vec!["S".into()],
+            enabled: Some(false),
+            refresh_interval_seconds: Some(12),
+            batch_size: Some(0),
+            item_rate_limit: Some(0),
+            burst_size: Some(0),
+            duty_cycle_percent: Some(0),
+            quiet_period_seconds: Some(3),
+            health_probe_interval_seconds: Some(0),
+            health_latency_threshold_ms: Some(4),
+            maintenance_windows: vec!["22:00-06:00".into()],
+            concurrency: Some(0),
+            query_cache_capacity: Some(0),
+            paused: Some(true),
+            max_results: Some(0),
+        };
+        let resolved = resolve_index_config(&config);
+        assert_eq!(resolved.database_path, PathBuf::from("custom.sqlite3"));
+        assert_eq!(resolved.servers, vec!["S".to_string()]);
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.refresh_interval_seconds, 12);
+        assert_eq!(resolved.batch_size, 1);
+        assert_eq!(resolved.item_rate_limit, 0);
+        assert_eq!(resolved.burst_size, 1);
+        assert_eq!(resolved.duty_cycle_percent, 1);
+        assert_eq!(resolved.quiet_period_seconds, 3);
+        assert_eq!(resolved.health_probe_interval_seconds, 1);
+        assert_eq!(resolved.health_latency_threshold_ms, 4);
+        assert_eq!(resolved.maintenance_windows, vec!["22:00-06:00"]);
+        assert_eq!(resolved.concurrency, 1);
+        assert_eq!(resolved.query_cache_capacity, 1);
+        assert!(resolved.paused);
+        assert_eq!(resolved.max_results, 1);
+    }
+
+    #[test]
+    fn test_index_config_toml_round_trip() {
+        let original = IndexConfig {
+            database_path: Some("index.sqlite3".into()),
+            servers: vec!["S1".into(), "S2".into()],
+            enabled: Some(true),
+            refresh_interval_seconds: Some(60),
+            batch_size: Some(10),
+            item_rate_limit: Some(20),
+            burst_size: Some(5),
+            duty_cycle_percent: Some(50),
+            quiet_period_seconds: Some(2),
+            health_probe_interval_seconds: Some(30),
+            health_latency_threshold_ms: Some(500),
+            maintenance_windows: vec!["00:00-06:00".into()],
+            concurrency: Some(1),
+            query_cache_capacity: Some(10),
+            paused: Some(false),
+            max_results: Some(25),
+        };
+        let decoded: IndexConfig = toml::from_str(&toml::to_string(&original).unwrap()).unwrap();
+        assert_eq!(decoded, original);
     }
 
     #[test]
@@ -386,6 +617,7 @@ mod tests {
                     format,
                     rotation,
                 },
+                index: IndexConfig::default(),
             };
             let encoded = toml::to_string(&original).unwrap();
             let decoded: GatewayConfig = toml::from_str(&encoded).unwrap();

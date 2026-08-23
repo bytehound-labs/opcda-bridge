@@ -26,9 +26,22 @@ pub async fn serve<C: OpcClient>(
     service: BridgeService<C>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_with_ready(listener, service, shutdown, || {}).await
+}
+
+/// Like [`serve`], but invokes `ready` after the gRPC server is constructed
+/// and immediately before it begins accepting connections.
+pub async fn serve_with_ready<C: OpcClient>(
+    listener: TcpListener,
+    service: BridgeService<C>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce() + Send + 'static,
+) -> anyhow::Result<()> {
     let incoming = TcpListenerStream::new(listener);
-    Server::builder()
-        .add_service(opcda_bridge_proto::bridge::bridge_server::BridgeServer::new(service))
+    let server = Server::builder()
+        .add_service(opcda_bridge_proto::bridge::bridge_server::BridgeServer::new(service));
+    ready();
+    server
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await?;
     Ok(())
@@ -65,7 +78,8 @@ pub async fn shutdown_signal() {
 /// (`service::run_as_service`), so the two differ only in where their
 /// `shutdown` future comes from and how the process's overall lifecycle
 /// (plain `main` return vs. SCM status reporting) is handled around this
-/// call — not in how the gateway itself starts up.
+/// call — not in how the gateway itself starts up. `ready` runs after the
+/// listener and gRPC server are ready to accept connections.
 ///
 /// Windows-only, like the rest of the gateway's runtime setup: the real
 /// `OpcDaAdapter`-backed `BridgeService::default()` only exists on Windows.
@@ -73,6 +87,7 @@ pub async fn shutdown_signal() {
 pub async fn run_gateway(
     cli: crate::config::Cli,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce() + Send + 'static,
 ) -> anyhow::Result<()> {
     use std::net::SocketAddr;
 
@@ -100,8 +115,21 @@ pub async fn run_gateway(
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(addr = %listener.local_addr()?, "opcda-bridge gateway listening");
 
-    let bridge = BridgeService::default();
-    serve(listener, bridge, shutdown).await?;
+    let bridge =
+        BridgeService::with_index_config(crate::opc_da_adapter::OpcDaAdapter::default(), &config);
+    let background_indexing = bridge.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let serve_task = tokio::spawn(serve_with_ready(listener, bridge, shutdown, move || {
+        ready();
+        let _ = ready_tx.send(());
+    }));
+    ready_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("gateway server failed before becoming ready"))?;
+    background_indexing.start_background_indexing();
+    let serve_result = serve_task.await;
+    background_indexing.shutdown_background_indexing().await;
+    serve_result??;
     tracing::info!("opcda-bridge gateway shut down");
     Ok(())
 }
@@ -133,6 +161,45 @@ mod tests {
             let _ = shutdown_rx.await;
         }));
 
+        let mut client = BridgeClient::connect(addr).await.unwrap();
+        let response = client
+            .list_servers(ListServersRequest {
+                host: String::new(),
+            })
+            .await
+            .unwrap();
+        assert!(response.into_inner().servers.is_empty());
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serve_task)
+            .await
+            .expect("serve did not shut down in time")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_serve_with_ready_signals_before_accepting_requests() {
+        let (listener, addr) = bind_ephemeral().await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let service = BridgeService::new(MockOpcClient::default());
+
+        let serve_task = tokio::spawn(serve_with_ready(
+            listener,
+            service,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            move || {
+                let _ = ready_tx.send(());
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("server did not report readiness in time")
+            .unwrap();
         let mut client = BridgeClient::connect(addr).await.unwrap();
         let response = client
             .list_servers(ListServersRequest {

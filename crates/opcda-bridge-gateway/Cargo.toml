@@ -20,6 +20,7 @@ categories = [
 opcda-bridge-proto.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+chrono.workspace = true
 tokio = { workspace = true, features = [
   "macros",
   "rt-multi-thread",
@@ -34,8 +35,10 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 clap.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 uuid.workspace = true
+rusqlite.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 opc-da-client.workspace = true

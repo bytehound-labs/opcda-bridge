@@ -1,14 +1,18 @@
 use opc_da_client::{
     BrowseNamespace, BrowseNodeFilter, BrowseNodeKind as ExtBrowseNodeKind, BrowseNodeToken,
-    BrowsePageRequest, BrowsePageToken, BrowseSessionToken, OpcDaClient, OpcProvider,
-    OpcValue as ExtOpcValue, TagValue as ExtTagValue, WriteResult as ExtWriteResult,
+    BrowsePageRequest, BrowsePageToken, BrowseSessionToken,
+    InventoryControl as ExtInventoryControl, InventoryEvent as ExtInventoryEvent, InventoryOptions,
+    InventoryStream as ExtInventoryStream, OpcDaClient, OpcProvider, OpcValue as ExtOpcValue,
+    TagValue as ExtTagValue, WriteResult as ExtWriteResult,
 };
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::opc::{
-    BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource,
-    NamespaceOrganization, OpcClient, OpcValue, TagValue, WriteResult,
+    BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource, InventoryCompleted,
+    InventoryControl, InventoryEntry, InventoryEvent, InventoryHandle, InventoryNodeKind,
+    InventoryProgress, InventoryStream, NamespaceOrganization, OpcClient, OpcValue, TagValue,
+    WriteResult,
 };
 
 #[derive(Default)]
@@ -110,6 +114,28 @@ impl OpcClient for OpcDaAdapter {
         Ok(result?)
     }
 
+    async fn start_inventory(
+        &self,
+        server: &str,
+        batch_size: u32,
+    ) -> anyhow::Result<InventoryHandle> {
+        let stream = self
+            .client
+            .start_inventory(
+                server,
+                InventoryOptions {
+                    batch_size,
+                    max_entries: None,
+                },
+            )
+            .await?;
+        let control = stream.control();
+        Ok(InventoryHandle {
+            stream: Box::new(AdapterInventoryStream { inner: stream }),
+            control: Arc::new(AdapterInventoryControl { inner: control }),
+        })
+    }
+
     async fn read_tag_values(
         &self,
         server: &str,
@@ -130,6 +156,77 @@ impl OpcClient for OpcDaAdapter {
             .write_tag_value(server, tag_id, map_value(value))
             .await?;
         Ok(map_write_result(result))
+    }
+}
+
+struct AdapterInventoryControl {
+    inner: ExtInventoryControl,
+}
+
+impl InventoryControl for AdapterInventoryControl {
+    fn pause(&self) {
+        self.inner.pause();
+    }
+
+    fn resume(&self) {
+        self.inner.resume();
+    }
+
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+}
+
+struct AdapterInventoryStream {
+    inner: ExtInventoryStream,
+}
+
+#[async_trait::async_trait]
+impl InventoryStream for AdapterInventoryStream {
+    async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+        self.inner
+            .message()
+            .await
+            .map(|result| result.map(map_inventory_event).map_err(anyhow::Error::from))
+    }
+}
+
+fn map_inventory_event(event: ExtInventoryEvent) -> InventoryEvent {
+    match event {
+        ExtInventoryEvent::Entry(entry) => InventoryEvent::Entry(InventoryEntry {
+            display_name: entry.display_name,
+            item_id: entry.item_id,
+            kind: match entry.kind {
+                ExtBrowseNodeKind::Item => InventoryNodeKind::Item,
+                ExtBrowseNodeKind::BranchAndItem => InventoryNodeKind::BranchAndItem,
+                ExtBrowseNodeKind::Branch => InventoryNodeKind::Item,
+            },
+            breadcrumbs: entry.breadcrumbs,
+        }),
+        ExtInventoryEvent::Progress(progress) => InventoryEvent::Progress(InventoryProgress {
+            branches_visited: progress.branches_visited,
+            entries_seen: progress.entries_seen,
+            unique_items: progress.unique_items,
+            active_time_ms: progress.active_time_ms,
+            paused_time_ms: progress.paused_time_ms,
+            items_per_second: progress.items_per_second,
+            estimated_remaining_ms: progress.estimated_remaining_ms,
+        }),
+        ExtInventoryEvent::Completed(completed) => {
+            let (organization, source) = map_capabilities(&completed.capabilities);
+            InventoryEvent::Completed(InventoryCompleted {
+                complete: completed.complete,
+                cancelled: completed.cancelled,
+                truncated: completed.truncated,
+                warning: completed.warning,
+                organization,
+                source,
+            })
+        }
     }
 }
 

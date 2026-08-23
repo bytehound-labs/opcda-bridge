@@ -2,9 +2,11 @@
 
 use opcda_bridge_proto::bridge::bridge_server::{Bridge, BridgeServer};
 use opcda_bridge_proto::bridge::{
-    BrowsePage, BrowseRequest, CloseBrowseSessionRequest, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, ListServersRequest, ListServersResponse, ReadRequest, ReadResponse,
-    SearchEvent, SearchRequest, WriteRequest, WriteResponse,
+    BrowsePage, BrowseRequest, CloseBrowseSessionRequest, ControlSearchIndexRequest,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSearchIndexStatusRequest,
+    ListServersRequest, ListServersResponse, ReadRequest, ReadResponse, RefreshSearchIndexRequest,
+    SearchEvent, SearchIndexRequest, SearchIndexResponse, SearchIndexStatus, SearchRequest,
+    WriteRequest, WriteResponse,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +25,14 @@ pub(crate) struct MockBridgeService {
     pub(crate) close_requests: Arc<Mutex<Vec<CloseBrowseSessionRequest>>>,
     pub(crate) search_events: Vec<SearchEvent>,
     pub(crate) search_requests: Arc<Mutex<Vec<SearchRequest>>>,
+    pub(crate) search_index_status_response: SearchIndexStatus,
+    pub(crate) search_index_status_requests: Arc<Mutex<Vec<GetSearchIndexStatusRequest>>>,
+    pub(crate) refresh_search_index_response: SearchIndexStatus,
+    pub(crate) refresh_search_index_requests: Arc<Mutex<Vec<RefreshSearchIndexRequest>>>,
+    pub(crate) control_search_index_response: SearchIndexStatus,
+    pub(crate) control_search_index_requests: Arc<Mutex<Vec<ControlSearchIndexRequest>>>,
+    pub(crate) search_index_response: SearchIndexResponse,
+    pub(crate) search_index_requests: Arc<Mutex<Vec<SearchIndexRequest>>>,
     pub(crate) read_response: ReadResponse,
     pub(crate) write_response: WriteResponse,
     pub(crate) server_shutdown: Arc<Notify>,
@@ -43,6 +53,17 @@ impl Default for MockBridgeService {
             close_requests: Arc::default(),
             search_events: Vec::new(),
             search_requests: Arc::default(),
+            search_index_status_response: SearchIndexStatus::default(),
+            search_index_status_requests: Arc::default(),
+            refresh_search_index_response: SearchIndexStatus::default(),
+            refresh_search_index_requests: Arc::default(),
+            control_search_index_response: SearchIndexStatus::default(),
+            control_search_index_requests: Arc::default(),
+            search_index_response: SearchIndexResponse {
+                status: Some(SearchIndexStatus::default()),
+                ..Default::default()
+            },
+            search_index_requests: Arc::default(),
             read_response: ReadResponse::default(),
             write_response: WriteResponse::default(),
             server_shutdown: Arc::default(),
@@ -110,6 +131,50 @@ impl Bridge for MockBridgeService {
         _request: Request<ListServersRequest>,
     ) -> Result<Response<ListServersResponse>, Status> {
         Ok(Response::new(self.list_servers_response.clone()))
+    }
+
+    async fn get_search_index_status(
+        &self,
+        request: Request<GetSearchIndexStatusRequest>,
+    ) -> Result<Response<SearchIndexStatus>, Status> {
+        self.search_index_status_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        Ok(Response::new(self.search_index_status_response.clone()))
+    }
+
+    async fn refresh_search_index(
+        &self,
+        request: Request<RefreshSearchIndexRequest>,
+    ) -> Result<Response<SearchIndexStatus>, Status> {
+        self.refresh_search_index_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        Ok(Response::new(self.refresh_search_index_response.clone()))
+    }
+
+    async fn control_search_index(
+        &self,
+        request: Request<ControlSearchIndexRequest>,
+    ) -> Result<Response<SearchIndexStatus>, Status> {
+        self.control_search_index_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        Ok(Response::new(self.control_search_index_response.clone()))
+    }
+
+    async fn search_index(
+        &self,
+        request: Request<SearchIndexRequest>,
+    ) -> Result<Response<SearchIndexResponse>, Status> {
+        self.search_index_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        Ok(Response::new(self.search_index_response.clone()))
     }
 
     async fn read(&self, _request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {

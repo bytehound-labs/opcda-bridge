@@ -5,14 +5,16 @@
 //! extracted from `opcda-bridge-client`'s `commands.rs`: no `clap`, no
 //! `tabled`, no `serde_json`/`toml` — just [`Client`], the parameters its
 //! methods take, and the plain result types they return ([`BrowsePage`],
-//! [`SearchEvent`], [`TagValue`], [`WriteResult`], [`Value`]). `opcda-bridge-client` depends
+//! [`SearchEvent`], [`SearchIndexResponse`], [`TagValue`], [`WriteResult`], [`Value`]). `opcda-bridge-client` depends
 //! on this crate and adds only CLI parsing and table/JSON rendering on top
 //! of it; any other async Rust program that needs typed OPC DA
 //! reads/writes/browses without shelling out to the CLI binary and parsing
 //! its output can depend on this crate directly instead.
 //!
 //! ```no_run
-//! use opcda_bridge::{BrowsePageRequest, SearchMatchMode, SearchRequest};
+//! use opcda_bridge::{
+//!     BrowsePageRequest, SearchIndexRequest, SearchMatchMode, SearchRequest,
+//! };
 //!
 //! # async fn example() -> opcda_bridge::Result<()> {
 //! let mut client = opcda_bridge::Client::connect("localhost:7600").await?;
@@ -32,6 +34,16 @@
 //!     .await?;
 //! while let Some(event) = search.message().await? {
 //!     println!("{event:?}");
+//! }
+//! let indexed = client
+//!     .search_index(SearchIndexRequest::new(
+//!         servers[0].clone(),
+//!         "Some PV",
+//!         SearchMatchMode::Contains,
+//!     ))
+//!     .await?;
+//! for found in indexed.matches {
+//!     println!("{}: {}", found.display_name, found.item_id);
 //! }
 //! let values = client
 //!     .read(servers[0].clone(), vec!["Some.Tag".into()])
@@ -55,7 +67,9 @@ pub use error::{Error, Result};
 pub use opcda_bridge_proto::DEFAULT_BRIDGE_PORT;
 pub use types::{
     BrowseBreadcrumb, BrowseNode, BrowseNodeKind, BrowsePage, BrowsePageRequest, BrowseSource,
-    Capabilities, DEFAULT_PAGE_SIZE, DEFAULT_SEARCH_MAX_RESULTS, NamespaceOrganization,
-    SearchCompleted, SearchEvent, SearchMatch, SearchMatchMode, SearchProgress, SearchRequest,
-    TagValue, Value, WriteResult, parse_value,
+    Capabilities, DEFAULT_INDEX_SEARCH_MAX_RESULTS, DEFAULT_PAGE_SIZE, DEFAULT_SEARCH_MAX_RESULTS,
+    IndexedSearchMatch, IndexedSearchProgress, NamespaceOrganization, SearchCompleted, SearchEvent,
+    SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse, SearchIndexState,
+    SearchIndexStatus, SearchMatch, SearchMatchMode, SearchProgress, SearchRequest, TagValue,
+    Value, WriteResult, parse_value,
 };

@@ -9,6 +9,7 @@ pub enum NamespaceOrganization {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowseSource {
+    Unspecified,
     Da3,
     Da2,
     Flat,
@@ -49,6 +50,67 @@ pub struct BrowsePage {
     pub warning: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryNodeKind {
+    Item,
+    BranchAndItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryEntry {
+    pub display_name: String,
+    pub item_id: String,
+    pub kind: InventoryNodeKind,
+    pub breadcrumbs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventoryProgress {
+    pub branches_visited: u64,
+    pub entries_seen: u64,
+    pub unique_items: u64,
+    pub active_time_ms: u64,
+    pub paused_time_ms: u64,
+    pub items_per_second: f64,
+    pub estimated_remaining_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryCompleted {
+    pub complete: bool,
+    pub cancelled: bool,
+    pub truncated: bool,
+    pub warning: Option<String>,
+    pub organization: NamespaceOrganization,
+    pub source: BrowseSource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InventoryEvent {
+    Entry(InventoryEntry),
+    Progress(InventoryProgress),
+    Completed(InventoryCompleted),
+}
+
+#[async_trait::async_trait]
+pub trait InventoryStream: Send {
+    async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>>;
+}
+
+pub trait InventoryControl: Send + Sync {
+    fn pause(&self);
+    fn resume(&self);
+    fn cancel(&self);
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+pub struct InventoryHandle {
+    pub stream: Box<dyn InventoryStream>,
+    pub control: Arc<dyn InventoryControl>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagValue {
     pub tag_id: String,
@@ -86,6 +148,11 @@ pub trait OpcClient: Send + Sync + 'static {
         refresh: bool,
     ) -> anyhow::Result<BrowsePage>;
     async fn close_browse_session(&self, session_id: &str) -> anyhow::Result<()>;
+    async fn start_inventory(
+        &self,
+        server: &str,
+        batch_size: u32,
+    ) -> anyhow::Result<InventoryHandle>;
     async fn read_tag_values(
         &self,
         server: &str,
@@ -100,3 +167,33 @@ pub trait OpcClient: Send + Sync + 'static {
 }
 
 pub type SharedOpcClient<C> = Arc<C>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DefaultInventoryControl;
+
+    impl InventoryControl for DefaultInventoryControl {
+        fn pause(&self) {
+            std::hint::black_box(());
+        }
+
+        fn resume(&self) {
+            std::hint::black_box(());
+        }
+
+        fn cancel(&self) {
+            std::hint::black_box(());
+        }
+    }
+
+    #[test]
+    fn inventory_control_is_not_cancelled_by_default() {
+        let control = DefaultInventoryControl;
+        control.pause();
+        control.resume();
+        control.cancel();
+        assert!(!control.is_cancelled());
+    }
+}

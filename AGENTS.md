@@ -147,7 +147,8 @@ the real Windows type in a thin shim" pattern as `logging.rs`. The top of the fi
 platform-neutral and covered by Linux tests: `ServiceDefinition`/`build_service_definition` (what
 to register), `service_launch_arguments` (which CLI flags become the service's permanent launch
 arguments), `ServiceLifecycle` (a plain mirror of `windows_service::service::ServiceState` that
-pins down the intended `StartPending → Running → StopPending → Stopped` reporting order), and
+pins down the intended `StartPending → Running → StopPending → Stopped` reporting order, with
+`Running` emitted only after listener readiness), and
 `is_scm_launch_error_code` (the raw `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` check, kept as a
 plain `Option<i32>` comparison rather than matching on the Windows-only `windows_service::Error`
 directly). Only the `#[cfg(target_os = "windows")] mod windows_impl` submodule — the actual
@@ -241,7 +242,7 @@ page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.sea
 - **Error contract**: `Error::Connect(tonic::transport::Error)` and `Error::Rpc(tonic::Status)`
   use transparent error rendering so the CLI's existing error output remains unchanged.
 - **Published distribution**: `opcda-bridge` is consumed from crates.io with a normal SemVer
-  dependency (`opcda-bridge = "0.3"`). Git dependencies are not part of the supported consumer
+  dependency (`opcda-bridge = "0.4"`). Git dependencies are not part of the supported consumer
   path.
 - **Release automation**: release-plz runs separate release-PR and publish jobs and publishes only
   after a merged release PR. The `release_commits` allowlist excludes both scoped and unscoped

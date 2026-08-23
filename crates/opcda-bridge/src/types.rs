@@ -8,6 +8,8 @@ use std::fmt;
 pub const DEFAULT_PAGE_SIZE: u32 = 200;
 /// Default maximum number of matches requested by a search.
 pub const DEFAULT_SEARCH_MAX_RESULTS: u32 = 200;
+/// Default maximum number of matches requested from the persistent index.
+pub const DEFAULT_INDEX_SEARCH_MAX_RESULTS: u32 = 50;
 
 /// How the OPC server organizes its namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +101,40 @@ impl fmt::Display for SearchMatchMode {
     }
 }
 
+/// Readiness of a gateway-owned persistent namespace index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchIndexState {
+    Unspecified,
+    NotIndexed,
+    Partial,
+    Ready,
+    Stale,
+    Refreshing,
+    Failed,
+}
+
+impl fmt::Display for SearchIndexState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unspecified => "unspecified",
+            Self::NotIndexed => "not-indexed",
+            Self::Partial => "partial",
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+            Self::Refreshing => "refreshing",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+/// Operator action applied to an active namespace-index build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchIndexControlAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
 /// Gateway and namespace features reported for one OPC server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
@@ -109,6 +145,10 @@ pub struct Capabilities {
     pub supports_search: bool,
     pub organization: NamespaceOrganization,
     pub source: BrowseSource,
+    pub supports_indexed_search: bool,
+    pub indexed_search_protocol_version: String,
+    pub max_indexed_search_results: u32,
+    pub search_index_state: SearchIndexState,
 }
 
 /// One child returned by a browse page.
@@ -233,6 +273,77 @@ impl SearchRequest {
     }
 }
 
+/// Parameters for one persistent-index query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchIndexRequest {
+    pub server: String,
+    pub query: String,
+    pub match_mode: SearchMatchMode,
+    pub max_results: u32,
+}
+
+impl SearchIndexRequest {
+    pub fn new(
+        server: impl Into<String>,
+        query: impl Into<String>,
+        match_mode: SearchMatchMode,
+    ) -> Self {
+        Self {
+            server: server.into(),
+            query: query.into(),
+            match_mode,
+            max_results: DEFAULT_INDEX_SEARCH_MAX_RESULTS,
+        }
+    }
+}
+
+/// Progress reported for a running persistent namespace inventory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedSearchProgress {
+    pub branches_visited: u64,
+    pub entries_seen: u64,
+    pub unique_items: u64,
+    pub active_time_ms: u64,
+    pub paused_time_ms: u64,
+    pub items_per_second: f64,
+    pub estimated_remaining_ms: Option<u64>,
+}
+
+/// Persistent namespace-index state and build metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchIndexStatus {
+    pub server: String,
+    pub state: SearchIndexState,
+    pub configured: bool,
+    pub active_generation: u64,
+    pub entry_count: u64,
+    pub unique_item_count: u64,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub last_error: Option<String>,
+    pub database_bytes: u64,
+    pub organization: NamespaceOrganization,
+    pub source: BrowseSource,
+    pub progress: Option<IndexedSearchProgress>,
+}
+
+/// One selectable result from the persistent namespace index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedSearchMatch {
+    pub item_id: String,
+    pub display_name: String,
+    pub kind: BrowseNodeKind,
+    pub breadcrumbs: Vec<String>,
+}
+
+/// Ranked persistent-index matches plus snapshot readiness metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchIndexResponse {
+    pub matches: Vec<IndexedSearchMatch>,
+    pub has_more: bool,
+    pub status: SearchIndexStatus,
+}
+
 /// One navigation step associated with a search match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowseBreadcrumb {
@@ -347,6 +458,20 @@ fn node_kind(value: i32) -> Result<BrowseNodeKind> {
     }
 }
 
+fn search_index_state(value: i32) -> Result<SearchIndexState> {
+    match proto::SearchIndexState::try_from(value)
+        .map_err(|_| invalid_enum("search index state", value))?
+    {
+        proto::SearchIndexState::Unspecified => Ok(SearchIndexState::Unspecified),
+        proto::SearchIndexState::NotIndexed => Ok(SearchIndexState::NotIndexed),
+        proto::SearchIndexState::Partial => Ok(SearchIndexState::Partial),
+        proto::SearchIndexState::Ready => Ok(SearchIndexState::Ready),
+        proto::SearchIndexState::Stale => Ok(SearchIndexState::Stale),
+        proto::SearchIndexState::Refreshing => Ok(SearchIndexState::Refreshing),
+        proto::SearchIndexState::Failed => Ok(SearchIndexState::Failed),
+    }
+}
+
 impl TryFrom<proto::GetCapabilitiesResponse> for Capabilities {
     type Error = Error;
 
@@ -359,6 +484,10 @@ impl TryFrom<proto::GetCapabilitiesResponse> for Capabilities {
             supports_search: value.supports_search,
             organization: organization(value.organization)?,
             source: source(value.source)?,
+            supports_indexed_search: value.supports_indexed_search,
+            indexed_search_protocol_version: value.indexed_search_protocol_version,
+            max_indexed_search_results: value.max_indexed_search_results,
+            search_index_state: search_index_state(value.search_index_state)?,
         })
     }
 }
@@ -450,6 +579,113 @@ impl From<SearchRequest> for proto::SearchRequest {
     }
 }
 
+impl From<SearchIndexRequest> for proto::SearchIndexRequest {
+    fn from(value: SearchIndexRequest) -> Self {
+        let match_mode = match value.match_mode {
+            SearchMatchMode::Exact => proto::SearchMatchMode::Exact,
+            SearchMatchMode::Prefix => proto::SearchMatchMode::Prefix,
+            SearchMatchMode::Contains => proto::SearchMatchMode::Contains,
+        };
+        Self {
+            server: value.server,
+            query: value.query,
+            match_mode: match_mode as i32,
+            max_results: value.max_results,
+        }
+    }
+}
+
+impl From<SearchIndexControlAction> for proto::SearchIndexControlAction {
+    fn from(value: SearchIndexControlAction) -> Self {
+        match value {
+            SearchIndexControlAction::Pause => Self::Pause,
+            SearchIndexControlAction::Resume => Self::Resume,
+            SearchIndexControlAction::Cancel => Self::Cancel,
+        }
+    }
+}
+
+impl From<proto::IndexedSearchProgress> for IndexedSearchProgress {
+    fn from(value: proto::IndexedSearchProgress) -> Self {
+        Self {
+            branches_visited: value.branches_visited,
+            entries_seen: value.entries_seen,
+            unique_items: value.unique_items,
+            active_time_ms: value.active_time_ms,
+            paused_time_ms: value.paused_time_ms,
+            items_per_second: value.items_per_second,
+            estimated_remaining_ms: value.estimated_remaining_ms,
+        }
+    }
+}
+
+impl TryFrom<proto::SearchIndexStatus> for SearchIndexStatus {
+    type Error = Error;
+
+    fn try_from(value: proto::SearchIndexStatus) -> Result<Self> {
+        Ok(Self {
+            server: value.server,
+            state: search_index_state(value.state)?,
+            configured: value.configured,
+            active_generation: value.active_generation,
+            entry_count: value.entry_count,
+            unique_item_count: value.unique_item_count,
+            started_at: value.started_at,
+            completed_at: value.completed_at,
+            last_error: value.last_error,
+            database_bytes: value.database_bytes,
+            organization: organization(value.organization)?,
+            source: source(value.source)?,
+            progress: value.progress.map(Into::into),
+        })
+    }
+}
+
+impl TryFrom<proto::IndexedSearchMatch> for IndexedSearchMatch {
+    type Error = Error;
+
+    fn try_from(value: proto::IndexedSearchMatch) -> Result<Self> {
+        let kind = node_kind(value.kind)?;
+        if !kind.is_item() {
+            return Err(Error::Protocol(
+                "gateway returned a non-selectable indexed search match".into(),
+            ));
+        }
+        if value.item_id.is_empty() {
+            return Err(Error::Protocol(
+                "gateway returned an indexed search match without an ItemID".into(),
+            ));
+        }
+        Ok(Self {
+            item_id: value.item_id,
+            display_name: value.display_name,
+            kind,
+            breadcrumbs: value.breadcrumbs,
+        })
+    }
+}
+
+impl TryFrom<proto::SearchIndexResponse> for SearchIndexResponse {
+    type Error = Error;
+
+    fn try_from(value: proto::SearchIndexResponse) -> Result<Self> {
+        Ok(Self {
+            matches: value
+                .matches
+                .into_iter()
+                .map(IndexedSearchMatch::try_from)
+                .collect::<Result<_>>()?,
+            has_more: value.has_more,
+            status: value
+                .status
+                .ok_or_else(|| {
+                    Error::Protocol("gateway returned indexed search results without status".into())
+                })?
+                .try_into()?,
+        })
+    }
+}
+
 impl TryFrom<proto::SearchEvent> for SearchEvent {
     type Error = Error;
 
@@ -530,6 +766,13 @@ mod tests {
         assert_eq!(SearchMatchMode::Exact.to_string(), "exact");
         assert_eq!(SearchMatchMode::Prefix.to_string(), "prefix");
         assert_eq!(SearchMatchMode::Contains.to_string(), "contains");
+        assert_eq!(SearchIndexState::Unspecified.to_string(), "unspecified");
+        assert_eq!(SearchIndexState::NotIndexed.to_string(), "not-indexed");
+        assert_eq!(SearchIndexState::Partial.to_string(), "partial");
+        assert_eq!(SearchIndexState::Ready.to_string(), "ready");
+        assert_eq!(SearchIndexState::Stale.to_string(), "stale");
+        assert_eq!(SearchIndexState::Refreshing.to_string(), "refreshing");
+        assert_eq!(SearchIndexState::Failed.to_string(), "failed");
         assert!(BrowseNodeKind::Branch.is_branch());
         assert!(!BrowseNodeKind::Branch.is_item());
         assert!(BrowseNodeKind::Item.is_item());
@@ -568,6 +811,36 @@ mod tests {
             assert_eq!(request.max_results, DEFAULT_SEARCH_MAX_RESULTS);
             let mapped: proto::SearchRequest = request.into();
             assert_eq!(mapped.match_mode, expected as i32);
+        }
+    }
+
+    #[test]
+    fn indexed_search_request_and_controls_map_all_variants() {
+        for (mode, expected) in [
+            (SearchMatchMode::Exact, proto::SearchMatchMode::Exact),
+            (SearchMatchMode::Prefix, proto::SearchMatchMode::Prefix),
+            (SearchMatchMode::Contains, proto::SearchMatchMode::Contains),
+        ] {
+            let request = SearchIndexRequest::new("S", "query", mode);
+            assert_eq!(request.max_results, DEFAULT_INDEX_SEARCH_MAX_RESULTS);
+            let mapped: proto::SearchIndexRequest = request.into();
+            assert_eq!(mapped.match_mode, expected as i32);
+        }
+        for (action, expected) in [
+            (
+                SearchIndexControlAction::Pause,
+                proto::SearchIndexControlAction::Pause,
+            ),
+            (
+                SearchIndexControlAction::Resume,
+                proto::SearchIndexControlAction::Resume,
+            ),
+            (
+                SearchIndexControlAction::Cancel,
+                proto::SearchIndexControlAction::Cancel,
+            ),
+        ] {
+            assert_eq!(proto::SearchIndexControlAction::from(action), expected);
         }
     }
 
@@ -624,6 +897,27 @@ mod tests {
         assert!(matches!(organization(99), Err(Error::Protocol(_))));
         assert!(matches!(source(99), Err(Error::Protocol(_))));
         assert!(matches!(node_kind(99), Err(Error::Protocol(_))));
+        for (proto_state, state) in [
+            (
+                proto::SearchIndexState::Unspecified,
+                SearchIndexState::Unspecified,
+            ),
+            (
+                proto::SearchIndexState::NotIndexed,
+                SearchIndexState::NotIndexed,
+            ),
+            (proto::SearchIndexState::Partial, SearchIndexState::Partial),
+            (proto::SearchIndexState::Ready, SearchIndexState::Ready),
+            (proto::SearchIndexState::Stale, SearchIndexState::Stale),
+            (
+                proto::SearchIndexState::Refreshing,
+                SearchIndexState::Refreshing,
+            ),
+            (proto::SearchIndexState::Failed, SearchIndexState::Failed),
+        ] {
+            assert_eq!(search_index_state(proto_state as i32).unwrap(), state);
+        }
+        assert!(matches!(search_index_state(99), Err(Error::Protocol(_))));
 
         let missing_item_id = proto::BrowseNode {
             kind: proto::BrowseNodeKind::Item as i32,
@@ -721,6 +1015,83 @@ mod tests {
         };
         assert!(matches!(
             SearchEvent::try_from(missing_node),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn indexed_search_response_preserves_identity_and_status() {
+        let response = proto::SearchIndexResponse {
+            matches: vec![proto::IndexedSearchMatch {
+                item_id: "FCS0201!204FI00510.PV".into(),
+                display_name: "PV".into(),
+                kind: proto::BrowseNodeKind::BranchAndItem as i32,
+                breadcrumbs: vec!["FCS0201".into(), "204FI00510".into()],
+            }],
+            has_more: true,
+            status: Some(proto::SearchIndexStatus {
+                server: "Yokogawa.CSHIS_OPC.1".into(),
+                state: proto::SearchIndexState::Refreshing as i32,
+                configured: true,
+                active_generation: 7,
+                entry_count: 100_001,
+                unique_item_count: 100_000,
+                started_at: Some("start".into()),
+                completed_at: Some("complete".into()),
+                last_error: Some("prior error".into()),
+                database_bytes: 4096,
+                organization: proto::NamespaceOrganization::Hierarchical as i32,
+                source: proto::BrowseSource::Da2 as i32,
+                progress: Some(proto::IndexedSearchProgress {
+                    branches_visited: 10,
+                    entries_seen: 20,
+                    unique_items: 19,
+                    active_time_ms: 30,
+                    paused_time_ms: 40,
+                    items_per_second: 12.5,
+                    estimated_remaining_ms: Some(50),
+                }),
+            }),
+        };
+        let typed = SearchIndexResponse::try_from(response).unwrap();
+        assert_eq!(typed.matches[0].item_id, "FCS0201!204FI00510.PV");
+        assert_eq!(typed.matches[0].kind, BrowseNodeKind::BranchAndItem);
+        assert_eq!(typed.status.state, SearchIndexState::Refreshing);
+        assert_eq!(
+            typed
+                .status
+                .progress
+                .as_ref()
+                .unwrap()
+                .estimated_remaining_ms,
+            Some(50)
+        );
+        assert!(typed.has_more);
+
+        let item = IndexedSearchMatch::try_from(proto::IndexedSearchMatch {
+            kind: proto::BrowseNodeKind::Item as i32,
+            item_id: "id".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(item.kind, BrowseNodeKind::Item);
+        assert!(matches!(
+            IndexedSearchMatch::try_from(proto::IndexedSearchMatch {
+                kind: proto::BrowseNodeKind::Item as i32,
+                ..Default::default()
+            }),
+            Err(Error::Protocol(_))
+        ));
+
+        assert!(matches!(
+            IndexedSearchMatch::try_from(proto::IndexedSearchMatch {
+                kind: proto::BrowseNodeKind::Branch as i32,
+                ..Default::default()
+            }),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            SearchIndexResponse::try_from(proto::SearchIndexResponse::default()),
             Err(Error::Protocol(_))
         ));
     }

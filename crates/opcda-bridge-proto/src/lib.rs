@@ -11,10 +11,13 @@ mod tests {
     use crate::bridge::write_request::TypedValue;
     use crate::bridge::{
         BrowseNode, BrowseNodeKind, BrowsePage, BrowseRequest, BrowseSource,
-        CloseBrowseSessionRequest, GetCapabilitiesRequest, GetCapabilitiesResponse,
-        ListServersRequest, ListServersResponse, NamespaceOrganization, ReadRequest, ReadResponse,
-        SearchCompleted, SearchEvent, SearchMatch, SearchMatchMode, SearchProgress, TagValue,
-        WriteRequest, WriteResponse,
+        CloseBrowseSessionRequest, ControlSearchIndexRequest, GetCapabilitiesRequest,
+        GetCapabilitiesResponse, GetSearchIndexStatusRequest, IndexedSearchMatch,
+        IndexedSearchProgress, ListServersRequest, ListServersResponse, NamespaceOrganization,
+        ReadRequest, ReadResponse, RefreshSearchIndexRequest, SearchCompleted, SearchEvent,
+        SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse, SearchIndexState,
+        SearchIndexStatus, SearchMatch, SearchMatchMode, SearchProgress, TagValue, WriteRequest,
+        WriteResponse,
     };
 
     #[test]
@@ -118,6 +121,10 @@ mod tests {
             supports_search: true,
             organization: NamespaceOrganization::Flat as i32,
             source: BrowseSource::Flat as i32,
+            supports_indexed_search: true,
+            indexed_search_protocol_version: "1".into(),
+            max_indexed_search_results: 50,
+            search_index_state: SearchIndexState::Ready as i32,
         };
         let close = CloseBrowseSessionRequest {
             session_id: "s".into(),
@@ -125,6 +132,8 @@ mod tests {
         assert_eq!(request.server, "S");
         assert_eq!(response.max_page_size, 1000);
         assert_eq!(close.session_id, "s");
+        assert!(response.supports_indexed_search);
+        assert_eq!(response.max_indexed_search_results, 50);
     }
 
     #[test]
@@ -154,6 +163,68 @@ mod tests {
             SearchMatchMode::Contains as i32,
             SearchMatchMode::try_from(SearchMatchMode::Contains as i32).unwrap() as i32
         );
+    }
+
+    #[test]
+    fn test_indexed_search_messages() {
+        let status_request = GetSearchIndexStatusRequest { server: "S".into() };
+        let refresh_request = RefreshSearchIndexRequest {
+            server: "S".into(),
+            force: true,
+        };
+        let control_request = ControlSearchIndexRequest {
+            server: "S".into(),
+            action: SearchIndexControlAction::Pause as i32,
+        };
+        let search_request = SearchIndexRequest {
+            server: "S".into(),
+            query: "PV".into(),
+            match_mode: SearchMatchMode::Prefix as i32,
+            max_results: 50,
+        };
+        let status = SearchIndexStatus {
+            server: "S".into(),
+            state: SearchIndexState::Refreshing as i32,
+            configured: true,
+            active_generation: 2,
+            entry_count: 100,
+            unique_item_count: 99,
+            started_at: Some("start".into()),
+            completed_at: Some("complete".into()),
+            last_error: None,
+            database_bytes: 1024,
+            organization: NamespaceOrganization::Hierarchical as i32,
+            source: BrowseSource::Da3 as i32,
+            progress: Some(IndexedSearchProgress {
+                branches_visited: 1,
+                entries_seen: 2,
+                unique_items: 2,
+                active_time_ms: 3,
+                paused_time_ms: 4,
+                items_per_second: 5.0,
+                estimated_remaining_ms: Some(6),
+            }),
+        };
+        let response = SearchIndexResponse {
+            matches: vec![IndexedSearchMatch {
+                item_id: "Exact.ItemID".into(),
+                display_name: "PV".into(),
+                kind: BrowseNodeKind::Item as i32,
+                breadcrumbs: vec!["Area".into()],
+            }],
+            has_more: true,
+            status: Some(status),
+        };
+
+        assert_eq!(status_request.server, "S");
+        assert!(refresh_request.force);
+        assert_eq!(
+            control_request.action,
+            SearchIndexControlAction::Pause as i32
+        );
+        assert_eq!(search_request.max_results, 50);
+        assert!(response.has_more);
+        assert_eq!(response.matches[0].item_id, "Exact.ItemID");
     }
 
     #[test]

@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if service::is_run_outside_scm(&e) => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run::run_gateway(cli, run::shutdown_signal()))
+            rt.block_on(run::run_gateway(cli, run::shutdown_signal(), || {}))
         }
         Err(e) => Err(e.into()),
     }

@@ -38,3 +38,54 @@ format = "pretty"
 # CLI flag: --log-rotation
 # Default: daily
 rotation = "daily"
+
+[index]
+# SQLite database path. If omitted, use the platform data directory:
+#   Linux/macOS: $XDG_DATA_HOME/opcda-bridge/index.sqlite3
+#                (falls back to $HOME/.local/share/opcda-bridge/index.sqlite3)
+#   Windows:     %PROGRAMDATA%\opcda-bridge\index.sqlite3
+# database_path = "opcda-bridge-index.sqlite3"
+
+# Only these OPC DA server ProgIDs are eligible for automatic indexing.
+# A server must be listed here for status, manual operations, or automatic
+# scans; an empty list disables all index operations.
+servers = ["Kepware.KepServerEX.V5"]
+
+# Automatic indexing is enabled by default. Set false to disable startup and
+# scheduled refreshes without removing the server allow-list.
+enabled = true
+
+# A successful generation is refreshed once per day by default.
+refresh_interval_seconds = 86400
+
+# Maximum native inventory entries requested per bounded operation.
+batch_size = 100
+
+# Average inventory item rate and initial burst allowance.
+item_rate_limit = 250
+burst_size = 100
+
+# Maximum percentage of time spent actively indexing between foreground
+# operations. Lower values reduce OPC server load.
+duty_cycle_percent = 20
+
+# Keep indexing paused for this many seconds after foreground traffic ends.
+quiet_period_seconds = 2
+
+# Health-probe cadence and latency threshold used to defer inventory work.
+health_probe_interval_seconds = 30
+health_latency_threshold_ms = 500
+
+# Optional local-time windows in which indexing is permitted. Entries use
+# 24-hour ranges such as "22:00-06:00"; an empty list permits indexing at any time.
+maintenance_windows = []
+
+# Number of inventories allowed at once and the in-memory query-cache bound.
+concurrency = 1
+query_cache_capacity = 256
+
+# Set true to keep automatic indexing paused after gateway startup.
+paused = false
+
+# Maximum indexed results returned by one query.
+max_results = 50

@@ -2,13 +2,15 @@
 
 use crate::error::{Error, Result};
 use crate::types::{
-    BrowsePage, BrowsePageRequest, Capabilities, SearchEvent, SearchRequest, TagValue, Value,
+    BrowsePage, BrowsePageRequest, Capabilities, SearchEvent, SearchIndexControlAction,
+    SearchIndexRequest, SearchIndexResponse, SearchIndexStatus, SearchRequest, TagValue, Value,
     WriteResult,
 };
 use opcda_bridge_proto::bridge::bridge_client::BridgeClient;
 use opcda_bridge_proto::bridge::write_request::TypedValue;
 use opcda_bridge_proto::bridge::{
-    CloseBrowseSessionRequest, GetCapabilitiesRequest, ListServersRequest, ReadRequest,
+    CloseBrowseSessionRequest, ControlSearchIndexRequest, GetCapabilitiesRequest,
+    GetSearchIndexStatusRequest, ListServersRequest, ReadRequest, RefreshSearchIndexRequest,
     WriteRequest,
 };
 use tonic::Code;
@@ -134,6 +136,72 @@ impl Client {
         Ok(events)
     }
 
+    /// Return the persistent namespace-index status for `server`.
+    pub async fn search_index_status(
+        &mut self,
+        server: impl Into<String>,
+    ) -> Result<SearchIndexStatus> {
+        self.inner
+            .get_search_index_status(GetSearchIndexStatusRequest {
+                server: server.into(),
+            })
+            .await
+            .map_err(|status| feature_error("indexed-search status", status))?
+            .into_inner()
+            .try_into()
+    }
+
+    /// Start or coalesce a persistent namespace-index refresh.
+    pub async fn refresh_search_index(
+        &mut self,
+        server: impl Into<String>,
+        force: bool,
+    ) -> Result<SearchIndexStatus> {
+        self.inner
+            .refresh_search_index(RefreshSearchIndexRequest {
+                server: server.into(),
+                force,
+            })
+            .await
+            .map_err(|status| feature_error("indexed-search refresh", status))?
+            .into_inner()
+            .try_into()
+    }
+
+    /// Pause, resume, or cancel a persistent namespace-index build.
+    pub async fn control_search_index(
+        &mut self,
+        server: impl Into<String>,
+        action: SearchIndexControlAction,
+    ) -> Result<SearchIndexStatus> {
+        self.inner
+            .control_search_index(ControlSearchIndexRequest {
+                server: server.into(),
+                action: opcda_bridge_proto::bridge::SearchIndexControlAction::from(action) as i32,
+            })
+            .await
+            .map_err(|status| feature_error("indexed-search control", status))?
+            .into_inner()
+            .try_into()
+    }
+
+    /// Search the gateway-owned persistent namespace index.
+    ///
+    /// This never falls back to live namespace traversal.
+    pub async fn search_index(
+        &mut self,
+        request: SearchIndexRequest,
+    ) -> Result<SearchIndexResponse> {
+        self.inner
+            .search_index(opcda_bridge_proto::bridge::SearchIndexRequest::from(
+                request,
+            ))
+            .await
+            .map_err(|status| feature_error("indexed search", status))?
+            .into_inner()
+            .try_into()
+    }
+
     /// Read one or more exact OPC DA ItemIDs from `server`.
     pub async fn read(&mut self, server: String, tags: Vec<String>) -> Result<Vec<TagValue>> {
         let response = self
@@ -199,13 +267,18 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use crate::test_support::{MockBridgeService, start_mock_server};
-    use crate::{BrowseNodeKind, BrowseSource, NamespaceOrganization, SearchMatchMode};
+    use crate::{
+        BrowseNodeKind, BrowseSource, NamespaceOrganization, SearchIndexControlAction,
+        SearchIndexRequest, SearchIndexState, SearchMatchMode,
+    };
     use opcda_bridge_proto::bridge::search_event;
     use opcda_bridge_proto::bridge::{
         BrowseNode as ProtoBrowseNode, BrowsePage as ProtoBrowsePage,
-        BrowseSource as ProtoBrowseSource, GetCapabilitiesResponse, ListServersResponse,
-        NamespaceOrganization as ProtoOrganization, ReadResponse, SearchCompleted,
-        SearchEvent as ProtoSearchEvent, SearchProgress, TagValue as ProtoTagValue, WriteResponse,
+        BrowseSource as ProtoBrowseSource, GetCapabilitiesResponse, IndexedSearchMatch,
+        IndexedSearchProgress, ListServersResponse, NamespaceOrganization as ProtoOrganization,
+        ReadResponse, SearchCompleted, SearchEvent as ProtoSearchEvent, SearchIndexResponse,
+        SearchIndexState as ProtoSearchIndexState, SearchIndexStatus, SearchProgress,
+        TagValue as ProtoTagValue, WriteResponse,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -253,6 +326,10 @@ mod tests {
                 supports_search: true,
                 organization: ProtoOrganization::Hierarchical as i32,
                 source: ProtoBrowseSource::Da2 as i32,
+                supports_indexed_search: true,
+                indexed_search_protocol_version: "1".into(),
+                max_indexed_search_results: 50,
+                search_index_state: ProtoSearchIndexState::Ready as i32,
             },
             ..Default::default()
         };
@@ -265,6 +342,10 @@ mod tests {
             NamespaceOrganization::Hierarchical
         );
         assert_eq!(capabilities.source, BrowseSource::Da2);
+        assert!(capabilities.supports_indexed_search);
+        assert_eq!(capabilities.indexed_search_protocol_version, "1");
+        assert_eq!(capabilities.max_indexed_search_results, 50);
+        assert_eq!(capabilities.search_index_state, SearchIndexState::Ready);
         assert_eq!(requests.lock().unwrap()[0].server, "S");
     }
 
@@ -500,6 +581,125 @@ mod tests {
             feature_error("test", Status::unimplemented("old")),
             Error::IncompatibleGateway { .. }
         ));
+    }
+
+    fn index_status(state: ProtoSearchIndexState) -> SearchIndexStatus {
+        SearchIndexStatus {
+            server: "S".into(),
+            state: state as i32,
+            configured: true,
+            active_generation: 4,
+            entry_count: 100,
+            unique_item_count: 99,
+            started_at: Some("start".into()),
+            completed_at: Some("complete".into()),
+            last_error: None,
+            database_bytes: 1024,
+            organization: ProtoOrganization::Hierarchical as i32,
+            source: ProtoBrowseSource::Da3 as i32,
+            progress: Some(IndexedSearchProgress {
+                branches_visited: 2,
+                entries_seen: 3,
+                unique_items: 3,
+                active_time_ms: 4,
+                paused_time_ms: 5,
+                items_per_second: 6.0,
+                estimated_remaining_ms: Some(7),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_search_methods_map_requests_responses_and_errors() {
+        let service = MockBridgeService {
+            search_index_status_response: index_status(ProtoSearchIndexState::Ready),
+            refresh_search_index_response: index_status(ProtoSearchIndexState::Refreshing),
+            control_search_index_response: index_status(ProtoSearchIndexState::Partial),
+            search_index_response: SearchIndexResponse {
+                matches: vec![IndexedSearchMatch {
+                    item_id: "Exact.ItemID".into(),
+                    display_name: "PV".into(),
+                    kind: opcda_bridge_proto::bridge::BrowseNodeKind::Item as i32,
+                    breadcrumbs: vec!["Area".into()],
+                }],
+                has_more: true,
+                status: Some(index_status(ProtoSearchIndexState::Stale)),
+            },
+            ..Default::default()
+        };
+        let status_requests = Arc::clone(&service.search_index_status_requests);
+        let refresh_requests = Arc::clone(&service.refresh_search_index_requests);
+        let control_requests = Arc::clone(&service.control_search_index_requests);
+        let search_requests = Arc::clone(&service.search_index_requests);
+        let host = start_mock_server(service).await;
+        let mut client = Client::connect(&host).await.unwrap();
+
+        assert_eq!(
+            client.search_index_status("S").await.unwrap().state,
+            SearchIndexState::Ready
+        );
+        assert_eq!(
+            client.refresh_search_index("S", true).await.unwrap().state,
+            SearchIndexState::Refreshing
+        );
+        assert_eq!(
+            client
+                .control_search_index("S", SearchIndexControlAction::Pause)
+                .await
+                .unwrap()
+                .state,
+            SearchIndexState::Partial
+        );
+        let mut request = SearchIndexRequest::new("S", "PV", SearchMatchMode::Contains);
+        request.max_results = 25;
+        let response = client.search_index(request).await.unwrap();
+        assert_eq!(response.matches[0].item_id, "Exact.ItemID");
+        assert!(response.has_more);
+
+        assert_eq!(status_requests.lock().unwrap()[0].server, "S");
+        assert!(refresh_requests.lock().unwrap()[0].force);
+        assert_eq!(
+            control_requests.lock().unwrap()[0].action,
+            opcda_bridge_proto::bridge::SearchIndexControlAction::Pause as i32
+        );
+        assert_eq!(search_requests.lock().unwrap()[0].max_results, 25);
+
+        for (field, operation) in [
+            ("search_index_status_error", "status"),
+            ("refresh_search_index_error", "refresh"),
+            ("control_search_index_error", "control"),
+            ("search_index_error", "search"),
+        ] {
+            let mut service = MockBridgeService::default();
+            let error = Some(Status::unimplemented("old gateway"));
+            match field {
+                "search_index_status_error" => service.search_index_status_error = error,
+                "refresh_search_index_error" => service.refresh_search_index_error = error,
+                "control_search_index_error" => service.control_search_index_error = error,
+                "search_index_error" => service.search_index_error = error,
+                _ => unreachable!(),
+            }
+            let host = start_mock_server(service).await;
+            let mut client = Client::connect(&host).await.unwrap();
+            let error = match operation {
+                "status" => client.search_index_status("S").await.unwrap_err(),
+                "refresh" => client.refresh_search_index("S", false).await.unwrap_err(),
+                "control" => client
+                    .control_search_index("S", SearchIndexControlAction::Cancel)
+                    .await
+                    .unwrap_err(),
+                "search" => client
+                    .search_index(SearchIndexRequest::new(
+                        "S",
+                        "PV",
+                        SearchMatchMode::Contains,
+                    ))
+                    .await
+                    .unwrap_err(),
+                _ => unreachable!(),
+            };
+            assert!(matches!(error, Error::IncompatibleGateway { .. }));
+        }
     }
 
     #[tokio::test]
