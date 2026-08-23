@@ -87,6 +87,8 @@ pkgver="${VERSION#v}"
 release_tag="opcda-bridge-client-$VERSION"
 
 ARCHIVE_NAME="opcda-bridge-client-linux-x86_64.tar.gz"
+LICENSE_SOURCE="LICENSE-$pkgver"
+README_SOURCE="README-$pkgver.md"
 
 cat > "$OUTPUT_DIR/PKGBUILD" << BUILDEOF
 # Maintainer: Mike Boiko <mike@boiko.ca>
@@ -104,8 +106,8 @@ options=('!debug')
 provides=('opcda-bridge-client')
 conflicts=('opcda-bridge-client')
 
-source=("LICENSE::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/LICENSE"
-        "README.md::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/README.md")
+source=("$LICENSE_SOURCE::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/LICENSE"
+        "$README_SOURCE::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/README.md")
 sha256sums=('$LICENSE_SHA'
             '$README_SHA')
 
@@ -114,8 +116,8 @@ sha256sums_x86_64=('$X86_64_SHA')
 
 package() {
     install -Dm755 "opcda-bridge-client" "\${pkgdir}/usr/bin/opcda-bridge-client"
-    install -Dm644 "LICENSE" "\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE"
-    install -Dm644 "README.md" "\${pkgdir}/usr/share/doc/\${pkgname}/README.md"
+    install -Dm644 "$LICENSE_SOURCE" "\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE"
+    install -Dm644 "$README_SOURCE" "\${pkgdir}/usr/share/doc/\${pkgname}/README.md"
 }
 BUILDEOF
 
@@ -128,8 +130,8 @@ cat > "$OUTPUT_DIR/.SRCINFO" << SRCINFOEOF
 	url = https://github.com/bytehound-labs/opcda-bridge
 	arch = x86_64
 	license = MIT
-	source = LICENSE::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/LICENSE
-	source = README.md::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/README.md
+	source = $LICENSE_SOURCE::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/LICENSE
+	source = $README_SOURCE::https://raw.githubusercontent.com/bytehound-labs/opcda-bridge/$release_tag/README.md
 	sha256sums = $LICENSE_SHA
 	sha256sums = $README_SHA
 	provides = opcda-bridge-client
