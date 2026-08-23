@@ -2,7 +2,7 @@
 
 /// Errors that can occur while talking to an opcda-bridge gateway.
 ///
-/// Both variants use `#[error(transparent)]`: `Display` and `source()`
+/// The transport variants use `#[error(transparent)]`: `Display` and `source()`
 /// forward straight through to the wrapped `tonic` error with no added
 /// prefix or extra chain link. This matters because `opcda-bridge-client`'s
 /// CLI commands convert this type into an `anyhow::Error` with a bare `?`
@@ -17,17 +17,27 @@
 /// A dedicated `thiserror` enum (rather than reusing `anyhow::Error` here
 /// the way `opcda-bridge-client`'s own commands do) still lets a downstream
 /// consumer that does *not* want an `anyhow` dependency match on
-/// [`Error::Connect`] / [`Error::Rpc`] directly.
+/// [`Error::Connect`] / [`Error::Rpc`] directly. [`Error::Protocol`] reports
+/// malformed or internally inconsistent responses from an incompatible gateway.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Failed to establish the gRPC channel to the gateway (e.g. connection
     /// refused, DNS failure, invalid address).
     #[error(transparent)]
     Connect(#[from] tonic::transport::Error),
-    /// The gateway returned a gRPC error for a `ListServers`/`Browse`/
-    /// `Read`/`Write` call, or for a `Browse` response-stream item.
+    /// The gateway returned a gRPC error for a `GetCapabilities`/`Browse`/
+    /// `CloseBrowseSession`/`Search`/`ListServers`/`Read`/`Write` call, or
+    /// for a search response-stream item.
     #[error(transparent)]
     Rpc(#[from] tonic::Status),
+    /// The connected gateway predates a required RPC.
+    #[error(
+        "gateway does not support {operation}; upgrade the gateway and client to compatible protocol versions"
+    )]
+    IncompatibleGateway { operation: &'static str },
+    /// The gateway returned a response that violates the negotiated protocol.
+    #[error("protocol error: {0}")]
+    Protocol(String),
 }
 
 /// A `Result` alias using [`Error`], mirroring the ergonomics of
@@ -72,6 +82,20 @@ mod tests {
         let wrapped = anyhow::Error::from(Error::from(status));
         assert_eq!(format!("{bare:?}"), format!("{wrapped:?}"));
         assert_eq!(bare.to_string(), wrapped.to_string());
+    }
+
+    #[test]
+    fn test_protocol_error_is_actionable() {
+        let err = Error::Protocol("unknown browse node kind".into());
+        assert_eq!(err.to_string(), "protocol error: unknown browse node kind");
+    }
+
+    #[test]
+    fn test_incompatible_gateway_error_is_actionable() {
+        let err = Error::IncompatibleGateway {
+            operation: "paged browse",
+        };
+        assert!(err.to_string().contains("upgrade the gateway and client"));
     }
 
     // `Error::Connect`'s transparency (both the plain and anyhow-wrapped

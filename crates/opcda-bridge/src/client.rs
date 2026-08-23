@@ -1,34 +1,63 @@
-//! The connected gRPC client: [`Client`] and its typed methods.
+//! The connected gRPC client and typed search stream.
 
-use crate::error::Result;
-use crate::types::{BrowseNode, TagValue, Value, WriteResult};
+use crate::error::{Error, Result};
+use crate::types::{
+    BrowsePage, BrowsePageRequest, Capabilities, SearchEvent, SearchRequest, TagValue, Value,
+    WriteResult,
+};
 use opcda_bridge_proto::bridge::bridge_client::BridgeClient;
 use opcda_bridge_proto::bridge::write_request::TypedValue;
-use opcda_bridge_proto::bridge::{BrowseRequest, ListServersRequest, ReadRequest, WriteRequest};
+use opcda_bridge_proto::bridge::{
+    CloseBrowseSessionRequest, GetCapabilitiesRequest, ListServersRequest, ReadRequest,
+    WriteRequest,
+};
+use tonic::Code;
+use tonic::codec::Streaming;
 use tonic::transport::Channel;
 
 /// A connected client for an opcda-bridge gateway's gRPC API.
-///
-/// Every method takes `&mut self`, matching the generated `BridgeClient`'s
-/// own requirement (it buffers per-call codec state); the underlying
-/// `tonic` channel itself is a cheap-to-reuse, multiplexed HTTP/2
-/// connection, so a single `Client` is meant to be held and reused across
-/// many calls rather than reconnected per request (unlike
-/// `opcda-bridge-client`'s CLI, which is a fresh process per invocation and
-/// so never notices the difference).
 #[derive(Debug)]
 pub struct Client {
     inner: BridgeClient<Channel>,
 }
 
+/// A cancellable stream of typed namespace-search events.
+///
+/// Dropping this value drops the underlying gRPC stream, allowing the gateway
+/// to stop scheduling further search work.
+#[derive(Debug)]
+pub struct SearchStream {
+    inner: Streaming<opcda_bridge_proto::bridge::SearchEvent>,
+}
+
+impl SearchStream {
+    /// Wait for the next event. `None` means the server closed the stream.
+    pub async fn message(&mut self) -> Result<Option<SearchEvent>> {
+        self.inner
+            .message()
+            .await?
+            .map(SearchEvent::try_from)
+            .transpose()
+    }
+}
+
 impl Client {
-    /// Connect to a gateway at `host` (e.g. `"localhost:7600"`).
-    ///
-    /// Matches `opcda-bridge-client`'s long-standing `http://{host}` scheme
-    /// assumption: the gateway only ever serves plaintext HTTP/2 (no TLS).
+    /// Connect to a plaintext gateway at `host` (for example, `localhost:7600`).
     pub async fn connect(host: &str) -> Result<Self> {
         let inner = BridgeClient::connect(format!("http://{host}")).await?;
         Ok(Self { inner })
+    }
+
+    /// Report protocol, paging, browse-session, search, and namespace support.
+    pub async fn capabilities(&mut self, server: impl Into<String>) -> Result<Capabilities> {
+        self.inner
+            .get_capabilities(GetCapabilitiesRequest {
+                server: server.into(),
+            })
+            .await
+            .map_err(|status| feature_error("capability discovery", status))?
+            .into_inner()
+            .try_into()
     }
 
     /// List the OPC DA servers registered on the gateway's host.
@@ -42,46 +71,70 @@ impl Client {
         Ok(response.into_inner().servers)
     }
 
-    /// Browse one level of `server`'s tag tree rooted at `path` (empty for
-    /// the top level), fully materialized into a `Vec` rather than a raw
-    /// stream. Every current caller (the CLI, and any bhtune-style
-    /// consumer) wants a complete result before doing anything else, so
-    /// this drains the stream internally rather than exposing it, sparing
-    /// callers a dependency on `tokio-stream`/`futures` just to consume it.
-    ///
-    /// `flat` and `max_tags` are forwarded to the gateway unchanged; the
-    /// gateway alone decides how they affect what's returned (e.g. `flat`
-    /// yielding every descendant tag instead of one level). `path` selects
-    /// which branch of the tree to browse.
+    /// Open a browse session and return only its first root page.
     pub async fn browse(
         &mut self,
-        server: String,
-        flat: bool,
-        path: String,
-        max_tags: u32,
-    ) -> Result<Vec<BrowseNode>> {
-        let mut stream = self
-            .inner
-            .browse(BrowseRequest {
-                server,
-                flat,
-                path,
-                max_tags,
-            })
-            .await?
-            .into_inner();
-
-        let mut nodes = Vec::new();
-        while let Some(response) = stream.message().await? {
-            nodes.push(BrowseNode {
-                tag_id: response.tag_id,
-                node_type: response.node_type,
-            });
-        }
-        Ok(nodes)
+        server: impl Into<String>,
+        page_size: u32,
+    ) -> Result<BrowsePage> {
+        self.open_browse(server, page_size).await
     }
 
-    /// Read one or more tag values from `server`.
+    /// Open a browse session and return only its first root page.
+    pub async fn open_browse(
+        &mut self,
+        server: impl Into<String>,
+        page_size: u32,
+    ) -> Result<BrowsePage> {
+        self.browse_page(BrowsePageRequest::root(server, page_size))
+            .await
+    }
+
+    /// Request exactly one root, child, or continuation page.
+    ///
+    /// This method never follows `next_page_token` automatically.
+    pub async fn browse_page(&mut self, request: BrowsePageRequest) -> Result<BrowsePage> {
+        self.inner
+            .browse(opcda_bridge_proto::bridge::BrowseRequest::from(request))
+            .await
+            .map_err(|status| feature_error("paged browse", status))?
+            .into_inner()
+            .try_into()
+    }
+
+    /// Explicitly release a gateway browse session.
+    pub async fn close_browse_session(&mut self, session_id: impl Into<String>) -> Result<()> {
+        self.inner
+            .close_browse_session(CloseBrowseSessionRequest {
+                session_id: session_id.into(),
+            })
+            .await
+            .map_err(|status| feature_error("browse-session close", status))?;
+        Ok(())
+    }
+
+    /// Start a bounded search and return its progressive event stream.
+    pub async fn search_stream(&mut self, request: SearchRequest) -> Result<SearchStream> {
+        let inner = self
+            .inner
+            .search(opcda_bridge_proto::bridge::SearchRequest::from(request))
+            .await
+            .map_err(|status| feature_error("namespace search", status))?
+            .into_inner();
+        Ok(SearchStream { inner })
+    }
+
+    /// Explicitly collect a complete search stream into memory.
+    pub async fn search(&mut self, request: SearchRequest) -> Result<Vec<SearchEvent>> {
+        let mut stream = self.search_stream(request).await?;
+        let mut events = Vec::new();
+        while let Some(event) = stream.message().await? {
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    /// Read one or more exact OPC DA ItemIDs from `server`.
     pub async fn read(&mut self, server: String, tags: Vec<String>) -> Result<Vec<TagValue>> {
         let response = self
             .inner
@@ -103,7 +156,7 @@ impl Client {
             .collect())
     }
 
-    /// Write `value` to `tag` on `server`.
+    /// Write `value` to one exact OPC DA ItemID on `server`.
     pub async fn write(
         &mut self,
         server: String,
@@ -124,12 +177,20 @@ impl Client {
                 typed_value: Some(typed_value),
             })
             .await?;
-        let r = response.into_inner();
+        let result = response.into_inner();
         Ok(WriteResult {
-            tag_id: r.tag_id,
-            success: r.success,
-            error: r.error,
+            tag_id: result.tag_id,
+            success: result.success,
+            error: result.error,
         })
+    }
+}
+
+fn feature_error(operation: &'static str, status: tonic::Status) -> Error {
+    if status.code() == Code::Unimplemented {
+        Error::IncompatibleGateway { operation }
+    } else {
+        Error::Rpc(status)
     }
 }
 
@@ -138,217 +199,312 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use crate::test_support::{MockBridgeService, start_mock_server};
-    use opcda_bridge_proto::bridge::bridge_server::Bridge;
+    use crate::{BrowseNodeKind, BrowseSource, NamespaceOrganization, SearchMatchMode};
+    use opcda_bridge_proto::bridge::search_event;
     use opcda_bridge_proto::bridge::{
-        BrowseResponse, bridge_client::BridgeClient as ProtoBridgeClient,
-    };
-    use opcda_bridge_proto::bridge::{
-        ListServersResponse, ReadResponse, TagValue as ProtoTagValue, WriteResponse,
+        BrowseNode as ProtoBrowseNode, BrowsePage as ProtoBrowsePage,
+        BrowseSource as ProtoBrowseSource, GetCapabilitiesResponse, ListServersResponse,
+        NamespaceOrganization as ProtoOrganization, ReadResponse, SearchCompleted,
+        SearchEvent as ProtoSearchEvent, SearchProgress, TagValue as ProtoTagValue, WriteResponse,
     };
     use std::sync::Arc;
     use std::time::Duration;
-    use tonic::{Request, Status};
+    use tonic::Status;
+
+    fn item_node() -> ProtoBrowseNode {
+        ProtoBrowseNode {
+            node_key: "node".into(),
+            display_name: "PV".into(),
+            kind: opcda_bridge_proto::bridge::BrowseNodeKind::Item as i32,
+            item_id: Some("FCS!TAG.PV".into()),
+        }
+    }
 
     #[tokio::test]
-    async fn test_connect_success() {
+    async fn connect_success_and_failure_are_typed() {
         let host = start_mock_server(MockBridgeService::default()).await;
         Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            Client::connect("127.0.0.1:1").await.unwrap_err(),
+            Error::Connect(_)
+        ));
     }
 
     #[tokio::test]
-    async fn test_mock_server_shutdown_completes_background_task() {
+    async fn mock_server_shutdown_completes() {
         let service = MockBridgeService::default();
-        let server_shutdown = Arc::clone(&service.server_shutdown);
-        let server_stopped = Arc::clone(&service.server_stopped);
+        let shutdown = Arc::clone(&service.server_shutdown);
+        let stopped = Arc::clone(&service.server_stopped);
         let _host = start_mock_server(service).await;
-
-        server_shutdown.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), server_stopped.notified())
+        shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
             .await
-            .expect("mock server did not stop after shutdown");
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn test_connect_failure_is_connect_variant() {
-        let err = Client::connect("127.0.0.1:1").await.unwrap_err();
-        assert!(matches!(err, Error::Connect(_)));
-    }
-
-    #[tokio::test]
-    async fn test_connect_failure_anyhow_debug_matches_bare_transport_error() {
-        // `opcda-bridge-client`'s commands convert this crate's `Error`
-        // into `anyhow::Error` via a bare `?`; this must render identically
-        // to today's direct `tonic::transport::Error` -> `anyhow::Error`
-        // conversion (the connect helper's pre-this-crate implementation),
-        // or the CLI's printed error text would silently change.
-        let bare_err = ProtoBridgeClient::connect("http://127.0.0.1:1".to_string())
-            .await
-            .unwrap_err();
-        let bare = anyhow::Error::from(bare_err);
-
-        let wrapped_err = Client::connect("127.0.0.1:1").await.unwrap_err();
-        let wrapped = anyhow::Error::from(wrapped_err);
-
-        assert_eq!(format!("{bare:?}"), format!("{wrapped:?}"));
-        assert_eq!(bare.to_string(), wrapped.to_string());
-    }
-
-    #[tokio::test]
-    async fn test_list_servers_empty() {
-        let host = start_mock_server(MockBridgeService::default()).await;
-        let mut client = Client::connect(&host).await.unwrap();
-        assert_eq!(client.list_servers().await.unwrap(), Vec::<String>::new());
-    }
-
-    #[tokio::test]
-    async fn test_list_servers_with_data() {
-        let svc = MockBridgeService {
-            list_servers_response: ListServersResponse {
-                servers: vec!["Server1".into(), "Server2".into()],
+    async fn capabilities_maps_fields_and_request() {
+        let service = MockBridgeService {
+            capabilities_response: GetCapabilitiesResponse {
+                application_version: "0.3.0".into(),
+                protocol_version: "0.3".into(),
+                max_page_size: 1000,
+                supports_browse_sessions: true,
+                supports_search: true,
+                organization: ProtoOrganization::Hierarchical as i32,
+                source: ProtoBrowseSource::Da2 as i32,
             },
             ..Default::default()
         };
-        let host = start_mock_server(svc).await;
+        let requests = Arc::clone(&service.capabilities_requests);
+        let host = start_mock_server(service).await;
         let mut client = Client::connect(&host).await.unwrap();
+        let capabilities = client.capabilities("S").await.unwrap();
         assert_eq!(
-            client.list_servers().await.unwrap(),
-            vec!["Server1".to_string(), "Server2".to_string()]
+            capabilities.organization,
+            NamespaceOrganization::Hierarchical
         );
+        assert_eq!(capabilities.source, BrowseSource::Da2);
+        assert_eq!(requests.lock().unwrap()[0].server, "S");
     }
 
     #[tokio::test]
-    async fn test_list_servers_rpc_error() {
-        let svc = MockBridgeService {
+    async fn capabilities_rpc_error_is_typed() {
+        let host = start_mock_server(MockBridgeService {
+            capabilities_error: Some(Status::unimplemented("old gateway")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client.capabilities("S").await.unwrap_err(),
+            Error::IncompatibleGateway { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_servers_maps_data_and_errors() {
+        let host = start_mock_server(MockBridgeService {
+            list_servers_response: ListServersResponse {
+                servers: vec!["S1".into(), "S2".into()],
+            },
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert_eq!(client.list_servers().await.unwrap(), ["S1", "S2"]);
+
+        let host = start_mock_server(MockBridgeService {
             list_servers_error: Some(Status::internal("boom")),
             ..Default::default()
-        };
-        let host = start_mock_server(svc).await;
+        })
+        .await;
         let mut client = Client::connect(&host).await.unwrap();
-        let err = client.list_servers().await.unwrap_err();
-        assert!(matches!(err, Error::Rpc(_)));
+        assert!(matches!(
+            client.list_servers().await.unwrap_err(),
+            Error::Rpc(_)
+        ));
     }
 
     #[tokio::test]
-    async fn test_browse_empty() {
-        let host = start_mock_server(MockBridgeService::default()).await;
-        let mut client = Client::connect(&host).await.unwrap();
-        let nodes = client
-            .browse("S".into(), false, String::new(), 1000)
-            .await
-            .unwrap();
-        assert!(nodes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_browse_with_data_maps_fields() {
-        let svc = MockBridgeService {
-            browse_responses: vec![
-                BrowseResponse {
-                    tag_id: "tag1".into(),
-                    node_type: "Leaf".into(),
-                },
-                BrowseResponse {
-                    tag_id: "tag2".into(),
-                    node_type: "Branch".into(),
-                },
-            ],
+    async fn browse_returns_one_typed_page_without_draining() {
+        let service = MockBridgeService {
+            browse_response: ProtoBrowsePage {
+                session_id: "session".into(),
+                nodes: vec![item_node()],
+                next_page_token: Some("next".into()),
+                complete: false,
+                organization: ProtoOrganization::Hierarchical as i32,
+                source: ProtoBrowseSource::Da3 as i32,
+                warning: None,
+            },
             ..Default::default()
         };
-        let host = start_mock_server(svc).await;
+        let requests = Arc::clone(&service.browse_requests);
+        let host = start_mock_server(service).await;
         let mut client = Client::connect(&host).await.unwrap();
-        let nodes = client
-            .browse("S".into(), true, String::new(), 1000)
+        let page = client.browse("S", 25).await.unwrap();
+        assert_eq!(page.nodes[0].kind, BrowseNodeKind::Item);
+        assert_eq!(page.next_page_token.as_deref(), Some("next"));
+        let request = &requests.lock().unwrap()[0];
+        assert_eq!(request.page_size, 25);
+        assert!(request.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn browse_page_forwards_session_parent_token_and_refresh() {
+        let service = MockBridgeService::default();
+        let requests = Arc::clone(&service.browse_requests);
+        let host = start_mock_server(service).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        client
+            .browse_page(
+                BrowsePageRequest::next("S", "session", Some("parent".into()), "token", 10)
+                    .with_refresh(true),
+            )
             .await
             .unwrap();
+        let request = &requests.lock().unwrap()[0];
+        assert_eq!(request.session_id.as_deref(), Some("session"));
+        assert_eq!(request.parent_node_key.as_deref(), Some("parent"));
+        assert_eq!(request.page_token.as_deref(), Some("token"));
+        assert!(request.refresh);
+    }
+
+    #[tokio::test]
+    async fn browse_rpc_and_protocol_errors_are_typed() {
+        let host = start_mock_server(MockBridgeService {
+            browse_error: Some(Status::failed_precondition("expired")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client.open_browse("S", 20).await.unwrap_err(),
+            Error::Rpc(_)
+        ));
+
+        let host = start_mock_server(MockBridgeService {
+            browse_response: ProtoBrowsePage::default(),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client.open_browse("S", 20).await.unwrap_err(),
+            Error::Protocol(_)
+        ));
+
+        let host = start_mock_server(MockBridgeService {
+            browse_error: Some(Status::unimplemented("old gateway")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client.open_browse("S", 20).await.unwrap_err(),
+            Error::IncompatibleGateway { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_browse_session_forwards_id_and_error() {
+        let service = MockBridgeService::default();
+        let requests = Arc::clone(&service.close_requests);
+        let host = start_mock_server(service).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        client.close_browse_session("session").await.unwrap();
+        assert_eq!(requests.lock().unwrap()[0].session_id, "session");
+
+        let host = start_mock_server(MockBridgeService {
+            close_error: Some(Status::not_found("missing")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client.close_browse_session("missing").await.unwrap_err(),
+            Error::Rpc(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_stream_and_collect_map_events_and_request() {
+        let events = vec![
+            ProtoSearchEvent {
+                event: Some(search_event::Event::Progress(SearchProgress {
+                    visited_nodes: 5,
+                    matches: 0,
+                    partial: true,
+                })),
+            },
+            ProtoSearchEvent {
+                event: Some(search_event::Event::Completed(SearchCompleted {
+                    complete: true,
+                    cancelled: false,
+                    truncated: false,
+                    warning: None,
+                })),
+            },
+        ];
+        let service = MockBridgeService {
+            search_events: events,
+            ..Default::default()
+        };
+        let requests = Arc::clone(&service.search_requests);
+        let host = start_mock_server(service).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        let mut request = SearchRequest::new("S", "PV", SearchMatchMode::Prefix);
+        request.session_id = Some("session".into());
+        request.scope_node_key = Some("scope".into());
+        request.max_results = 50;
+        request.include_branches = true;
+        request.refresh = true;
+        let found = client.search(request).await.unwrap();
+        assert_eq!(found.len(), 2);
+        let request = &requests.lock().unwrap()[0];
+        assert_eq!(request.query, "PV");
         assert_eq!(
-            nodes,
-            vec![
-                BrowseNode {
-                    tag_id: "tag1".into(),
-                    node_type: "Leaf".into(),
-                },
-                BrowseNode {
-                    tag_id: "tag2".into(),
-                    node_type: "Branch".into(),
-                },
-            ]
+            request.match_mode,
+            opcda_bridge_proto::bridge::SearchMatchMode::Prefix as i32
         );
+        assert!(request.include_branches);
+        assert!(request.refresh);
     }
 
     #[tokio::test]
-    async fn test_browse_initial_rpc_error() {
-        let svc = MockBridgeService {
-            browse_initial_error: Some(Status::unavailable("gateway down")),
+    async fn search_initial_stream_and_protocol_errors_are_typed() {
+        let host = start_mock_server(MockBridgeService {
+            search_initial_error: Some(Status::unavailable("down")),
             ..Default::default()
-        };
-        let host = start_mock_server(svc).await;
+        })
+        .await;
         let mut client = Client::connect(&host).await.unwrap();
-        let err = client
-            .browse("S".into(), false, String::new(), 1000)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Rpc(_)));
-    }
+        assert!(matches!(
+            client
+                .search_stream(SearchRequest::new("S", "PV", SearchMatchMode::Exact))
+                .await
+                .unwrap_err(),
+            Error::Rpc(_)
+        ));
 
-    #[tokio::test]
-    async fn test_browse_stream_error_after_items() {
-        let svc = MockBridgeService {
-            browse_responses: vec![BrowseResponse {
-                tag_id: "tag1".into(),
-                node_type: "Leaf".into(),
-            }],
-            browse_stream_error: Some(Status::internal("stream broke")),
+        let host = start_mock_server(MockBridgeService {
+            search_stream_error: Some(Status::deadline_exceeded("slow")),
             ..Default::default()
-        };
-        let host = start_mock_server(svc).await;
+        })
+        .await;
         let mut client = Client::connect(&host).await.unwrap();
-        let err = client
-            .browse("S".into(), false, String::new(), 1000)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Rpc(_)));
-    }
+        assert!(matches!(
+            client
+                .search(SearchRequest::new("S", "PV", SearchMatchMode::Exact))
+                .await
+                .unwrap_err(),
+            Error::Rpc(_)
+        ));
 
-    #[tokio::test]
-    async fn test_browse_drop_stops_server_send_loop() {
-        // Drop the service response directly instead of relying on gRPC
-        // buffering to propagate a remote client disconnect.
-        let svc = MockBridgeService {
-            browse_responses: (0..300)
-                .map(|i| BrowseResponse {
-                    tag_id: format!("tag{i}"),
-                    node_type: "Leaf".into(),
-                })
-                .collect(),
+        let host = start_mock_server(MockBridgeService {
+            search_events: vec![ProtoSearchEvent::default()],
             ..Default::default()
-        };
-        let browse_send_failure = Arc::clone(&svc.browse_send_failure);
-        let response = svc
-            .browse(Request::new(BrowseRequest {
-                server: "S".into(),
-                flat: false,
-                path: String::new(),
-                max_tags: 1000,
-            }))
-            .await
-            .unwrap();
-        drop(response);
-        tokio::time::timeout(Duration::from_secs(1), browse_send_failure.notified())
-            .await
-            .expect("mock sender did not observe the dropped browse stream");
-    }
-
-    #[tokio::test]
-    async fn test_read_empty() {
-        let host = start_mock_server(MockBridgeService::default()).await;
+        })
+        .await;
         let mut client = Client::connect(&host).await.unwrap();
-        let values = client.read("S".into(), vec![]).await.unwrap();
-        assert!(values.is_empty());
+        assert!(matches!(
+            client
+                .search(SearchRequest::new("S", "PV", SearchMatchMode::Exact))
+                .await
+                .unwrap_err(),
+            Error::Protocol(_)
+        ));
+
+        assert!(matches!(
+            feature_error("test", Status::unimplemented("old")),
+            Error::IncompatibleGateway { .. }
+        ));
     }
 
     #[tokio::test]
-    async fn test_read_with_data_maps_fields() {
-        let svc = MockBridgeService {
+    async fn read_maps_data_and_errors() {
+        let host = start_mock_server(MockBridgeService {
             read_response: ReadResponse {
                 values: vec![ProtoTagValue {
                     tag_id: "t1".into(),
@@ -358,141 +514,65 @@ mod tests {
                 }],
             },
             ..Default::default()
-        };
-        let host = start_mock_server(svc).await;
+        })
+        .await;
         let mut client = Client::connect(&host).await.unwrap();
-        let values = client.read("S".into(), vec!["t1".into()]).await.unwrap();
         assert_eq!(
-            values,
-            vec![TagValue {
-                tag_id: "t1".into(),
-                value: "42".into(),
-                quality: "Good".into(),
-                timestamp: "now".into(),
-            }]
+            client.read("S".into(), vec![]).await.unwrap()[0].value,
+            "42"
         );
-    }
 
-    #[tokio::test]
-    async fn test_read_rpc_error() {
-        let svc = MockBridgeService {
+        let host = start_mock_server(MockBridgeService {
             read_error: Some(Status::internal("boom")),
             ..Default::default()
-        };
-        let host = start_mock_server(svc).await;
+        })
+        .await;
         let mut client = Client::connect(&host).await.unwrap();
-        let err = client.read("S".into(), vec![]).await.unwrap_err();
-        assert!(matches!(err, Error::Rpc(_)));
+        assert!(matches!(
+            client.read("S".into(), vec![]).await.unwrap_err(),
+            Error::Rpc(_)
+        ));
     }
 
     #[tokio::test]
-    async fn test_write_bool_value() {
-        let host = start_mock_server(MockBridgeService::default()).await;
-        let mut client = Client::connect(&host).await.unwrap();
-        client
-            .write("S".into(), "tag1".into(), Value::Bool(true))
-            .await
-            .unwrap();
-    }
+    async fn write_maps_every_value_and_result_or_error() {
+        for value in [
+            Value::Bool(true),
+            Value::Int(42),
+            Value::Float(3.5),
+            Value::String("text".into()),
+        ] {
+            let host = start_mock_server(MockBridgeService {
+                write_response: WriteResponse {
+                    tag_id: "t".into(),
+                    success: true,
+                    error: None,
+                },
+                ..Default::default()
+            })
+            .await;
+            let mut client = Client::connect(&host).await.unwrap();
+            assert!(
+                client
+                    .write("S".into(), "t".into(), value)
+                    .await
+                    .unwrap()
+                    .success
+            );
+        }
 
-    #[tokio::test]
-    async fn test_write_int_value() {
-        let host = start_mock_server(MockBridgeService::default()).await;
-        let mut client = Client::connect(&host).await.unwrap();
-        client
-            .write("S".into(), "tag1".into(), Value::Int(42))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_write_float_value() {
-        let host = start_mock_server(MockBridgeService::default()).await;
-        let mut client = Client::connect(&host).await.unwrap();
-        client
-            .write("S".into(), "tag1".into(), Value::Float(9.5))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_write_string_value() {
-        let host = start_mock_server(MockBridgeService::default()).await;
-        let mut client = Client::connect(&host).await.unwrap();
-        client
-            .write(
-                "S".into(),
-                "tag1".into(),
-                Value::String("hello world".into()),
-            )
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_write_maps_success_result() {
-        let svc = MockBridgeService {
-            write_response: WriteResponse {
-                tag_id: "t1".into(),
-                success: true,
-                error: None,
-            },
-            ..Default::default()
-        };
-        let host = start_mock_server(svc).await;
-        let mut client = Client::connect(&host).await.unwrap();
-        let result = client
-            .write("S".into(), "t1".into(), Value::Int(1))
-            .await
-            .unwrap();
-        assert_eq!(
-            result,
-            WriteResult {
-                tag_id: "t1".into(),
-                success: true,
-                error: None,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn test_write_maps_failure_result_with_error() {
-        let svc = MockBridgeService {
-            write_response: WriteResponse {
-                tag_id: "bad".into(),
-                success: false,
-                error: Some("access denied".into()),
-            },
-            ..Default::default()
-        };
-        let host = start_mock_server(svc).await;
-        let mut client = Client::connect(&host).await.unwrap();
-        let result = client
-            .write("S".into(), "bad".into(), Value::Int(0))
-            .await
-            .unwrap();
-        assert_eq!(
-            result,
-            WriteResult {
-                tag_id: "bad".into(),
-                success: false,
-                error: Some("access denied".into()),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn test_write_rpc_error() {
-        let svc = MockBridgeService {
+        let host = start_mock_server(MockBridgeService {
             write_error: Some(Status::internal("boom")),
             ..Default::default()
-        };
-        let host = start_mock_server(svc).await;
+        })
+        .await;
         let mut client = Client::connect(&host).await.unwrap();
-        let err = client
-            .write("S".into(), "t1".into(), Value::Int(1))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Rpc(_)));
+        assert!(matches!(
+            client
+                .write("S".into(), "t".into(), Value::Int(1))
+                .await
+                .unwrap_err(),
+            Error::Rpc(_)
+        ));
     }
 }

@@ -2,11 +2,30 @@ syntax = "proto3";
 
 package bridge;
 
+import "google/protobuf/empty.proto";
+
 service Bridge {
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  rpc Browse(BrowseRequest) returns (BrowsePage);
+  rpc CloseBrowseSession(CloseBrowseSessionRequest) returns (google.protobuf.Empty);
+  rpc Search(SearchRequest) returns (stream SearchEvent);
   rpc ListServers(ListServersRequest) returns (ListServersResponse);
-  rpc Browse(BrowseRequest) returns (stream BrowseResponse);
   rpc Read(ReadRequest) returns (ReadResponse);
   rpc Write(WriteRequest) returns (WriteResponse);
+}
+
+message GetCapabilitiesRequest {
+  string server = 1;
+}
+
+message GetCapabilitiesResponse {
+  string application_version = 1;
+  string protocol_version = 2;
+  uint32 max_page_size = 3;
+  bool supports_browse_sessions = 4;
+  bool supports_search = 5;
+  NamespaceOrganization organization = 6;
+  BrowseSource source = 7;
 }
 
 message ListServersRequest {
@@ -19,14 +38,102 @@ message ListServersResponse {
 
 message BrowseRequest {
   string server = 1;
-  bool flat = 2;
-  string path = 3;
-  uint32 max_tags = 4;
+  optional string session_id = 2;
+  optional string parent_node_key = 3;
+  optional string page_token = 4;
+  uint32 page_size = 5;
+  bool refresh = 6;
 }
 
-message BrowseResponse {
-  string tag_id = 1;
-  string node_type = 2;
+message BrowsePage {
+  string session_id = 1;
+  repeated BrowseNode nodes = 2;
+  optional string next_page_token = 3;
+  bool complete = 4;
+  NamespaceOrganization organization = 5;
+  BrowseSource source = 6;
+  optional string warning = 7;
+}
+
+message BrowseNode {
+  string node_key = 1;
+  string display_name = 2;
+  BrowseNodeKind kind = 3;
+  optional string item_id = 4;
+}
+
+message CloseBrowseSessionRequest {
+  string session_id = 1;
+}
+
+enum NamespaceOrganization {
+  NAMESPACE_ORGANIZATION_UNSPECIFIED = 0;
+  NAMESPACE_ORGANIZATION_FLAT = 1;
+  NAMESPACE_ORGANIZATION_HIERARCHICAL = 2;
+}
+
+enum BrowseSource {
+  BROWSE_SOURCE_UNSPECIFIED = 0;
+  BROWSE_SOURCE_DA3 = 1;
+  BROWSE_SOURCE_DA2 = 2;
+  BROWSE_SOURCE_FLAT = 3;
+  BROWSE_SOURCE_DERIVED = 4;
+}
+
+enum BrowseNodeKind {
+  BROWSE_NODE_KIND_UNSPECIFIED = 0;
+  BROWSE_NODE_KIND_BRANCH = 1;
+  BROWSE_NODE_KIND_ITEM = 2;
+  BROWSE_NODE_KIND_BRANCH_AND_ITEM = 3;
+}
+
+message SearchRequest {
+  string server = 1;
+  string query = 2;
+  SearchMatchMode match_mode = 3;
+  optional string session_id = 4;
+  optional string scope_node_key = 5;
+  uint32 max_results = 6;
+  bool include_branches = 7;
+  bool refresh = 8;
+}
+
+enum SearchMatchMode {
+  SEARCH_MATCH_MODE_UNSPECIFIED = 0;
+  SEARCH_MATCH_MODE_EXACT = 1;
+  SEARCH_MATCH_MODE_PREFIX = 2;
+  SEARCH_MATCH_MODE_CONTAINS = 3;
+}
+
+message SearchEvent {
+  oneof event {
+    SearchMatch match = 1;
+    SearchProgress progress = 2;
+    SearchCompleted completed = 3;
+  }
+}
+
+message SearchMatch {
+  BrowseNode node = 1;
+  repeated BrowseBreadcrumb breadcrumbs = 2;
+}
+
+message BrowseBreadcrumb {
+  string node_key = 1;
+  string display_name = 2;
+}
+
+message SearchProgress {
+  uint32 visited_nodes = 1;
+  uint32 matches = 2;
+  bool partial = 3;
+}
+
+message SearchCompleted {
+  bool complete = 1;
+  bool cancelled = 2;
+  bool truncated = 3;
+  optional string warning = 4;
 }
 
 message ReadRequest {

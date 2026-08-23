@@ -1,0 +1,5 @@
+host = "gateway:7600"
+server = "Kepware.KepServerEX.V5"
+page_size = 250
+browse_all_limit = 2000
+search_max_results = 100

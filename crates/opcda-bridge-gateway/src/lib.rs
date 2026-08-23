@@ -1,3 +1,4 @@
+pub mod browse;
 pub mod config;
 pub mod logging;
 pub mod opc;

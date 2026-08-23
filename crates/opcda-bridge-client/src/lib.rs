@@ -80,9 +80,13 @@ mod tests {
         // before any network call is made.
         let cli = base_cli(Commands::Browse {
             server: None,
-            flat: false,
-            path: String::new(),
-            max_tags: None,
+            session_id: None,
+            parent_node_key: None,
+            page_token: None,
+            page_size: None,
+            all: false,
+            max_results: None,
+            refresh: false,
         });
         assert_eq!(run_with_cli(cli).await, ExitCode::FAILURE);
     }

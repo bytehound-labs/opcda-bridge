@@ -4,8 +4,12 @@ use std::path::{Path, PathBuf};
 
 /// Default gateway host:port the client connects to when nothing else specifies one.
 pub const DEFAULT_HOST: &str = "localhost:7600";
-/// Default cap on the number of tags a `browse` streams back.
-pub const DEFAULT_MAX_TAGS: u32 = 1000;
+/// Default number of children requested per browse page.
+pub const DEFAULT_PAGE_SIZE: u32 = opcda_bridge::DEFAULT_PAGE_SIZE;
+/// Default safety cap for the explicitly expensive `browse --all` mode.
+pub const DEFAULT_BROWSE_ALL_LIMIT: u32 = 10_000;
+/// Default maximum number of matches requested by `search`.
+pub const DEFAULT_SEARCH_MAX_RESULTS: u32 = opcda_bridge::DEFAULT_SEARCH_MAX_RESULTS;
 
 /// Client configuration loaded from an optional TOML file. Every field is
 /// optional; a value missing from the file (or the file itself missing)
@@ -14,7 +18,9 @@ pub const DEFAULT_MAX_TAGS: u32 = 1000;
 pub struct ClientConfig {
     pub host: Option<String>,
     pub server: Option<String>,
-    pub max_tags: Option<u32>,
+    pub page_size: Option<u32>,
+    pub browse_all_limit: Option<u32>,
+    pub search_max_results: Option<u32>,
     pub output: Option<OutputFormat>,
 }
 
@@ -109,9 +115,25 @@ pub fn resolve_server(cli_server: Option<String>, config: &ClientConfig) -> anyh
     })
 }
 
-/// Resolve the browse tag cap with `CLI flag > config file > default` precedence.
-pub fn resolve_max_tags(cli_max_tags: Option<u32>, config: &ClientConfig) -> u32 {
-    cli_max_tags.or(config.max_tags).unwrap_or(DEFAULT_MAX_TAGS)
+/// Resolve the browse page size with `CLI flag > config file > default` precedence.
+pub fn resolve_page_size(cli_page_size: Option<u32>, config: &ClientConfig) -> u32 {
+    cli_page_size
+        .or(config.page_size)
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+}
+
+/// Resolve the `browse --all` safety cap.
+pub fn resolve_browse_all_limit(cli_limit: Option<u32>, config: &ClientConfig) -> u32 {
+    cli_limit
+        .or(config.browse_all_limit)
+        .unwrap_or(DEFAULT_BROWSE_ALL_LIMIT)
+}
+
+/// Resolve the search result cap.
+pub fn resolve_search_max_results(cli_limit: Option<u32>, config: &ClientConfig) -> u32 {
+    cli_limit
+        .or(config.search_max_results)
+        .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
 }
 
 /// Resolve the output format with `CLI flag/env > config file > default`
@@ -178,13 +200,15 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "host = \"example:1234\"\nserver = \"S1\"\nmax_tags = 50"
+            "host = \"example:1234\"\nserver = \"S1\"\npage_size = 50\nbrowse_all_limit = 500\nsearch_max_results = 75"
         )
         .unwrap();
         let config = load_config_file(file.path(), true).unwrap();
         assert_eq!(config.host, Some("example:1234".to_string()));
         assert_eq!(config.server, Some("S1".to_string()));
-        assert_eq!(config.max_tags, Some(50));
+        assert_eq!(config.page_size, Some(50));
+        assert_eq!(config.browse_all_limit, Some(500));
+        assert_eq!(config.search_max_results, Some(75));
     }
 
     #[test]
@@ -197,7 +221,7 @@ mod tests {
     #[test]
     fn test_load_config_file_malformed() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(file, "max_tags = \"not a number\"").unwrap();
+        writeln!(file, "page_size = \"not a number\"").unwrap();
         let err = load_config_file(file.path(), true).unwrap_err();
         assert!(err.to_string().contains("failed to parse config file"));
     }
@@ -333,28 +357,56 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_max_tags_cli_wins() {
+    fn test_resolve_page_size_cli_wins() {
         let config = ClientConfig {
-            max_tags: Some(10),
+            page_size: Some(10),
             ..Default::default()
         };
-        assert_eq!(resolve_max_tags(Some(20), &config), 20);
+        assert_eq!(resolve_page_size(Some(20), &config), 20);
     }
 
     #[test]
-    fn test_resolve_max_tags_config_wins_over_default() {
+    fn test_resolve_page_size_config_wins_over_default() {
         let config = ClientConfig {
-            max_tags: Some(10),
+            page_size: Some(10),
             ..Default::default()
         };
-        assert_eq!(resolve_max_tags(None, &config), 10);
+        assert_eq!(resolve_page_size(None, &config), 10);
     }
 
     #[test]
-    fn test_resolve_max_tags_default() {
+    fn test_resolve_page_size_default() {
         assert_eq!(
-            resolve_max_tags(None, &ClientConfig::default()),
-            DEFAULT_MAX_TAGS
+            resolve_page_size(None, &ClientConfig::default()),
+            DEFAULT_PAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn test_resolve_browse_all_limit_precedence() {
+        let config = ClientConfig {
+            browse_all_limit: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(resolve_browse_all_limit(Some(600), &config), 600);
+        assert_eq!(resolve_browse_all_limit(None, &config), 500);
+        assert_eq!(
+            resolve_browse_all_limit(None, &ClientConfig::default()),
+            DEFAULT_BROWSE_ALL_LIMIT
+        );
+    }
+
+    #[test]
+    fn test_resolve_search_max_results_precedence() {
+        let config = ClientConfig {
+            search_max_results: Some(50),
+            ..Default::default()
+        };
+        assert_eq!(resolve_search_max_results(Some(60), &config), 60);
+        assert_eq!(resolve_search_max_results(None, &config), 50);
+        assert_eq!(
+            resolve_search_max_results(None, &ClientConfig::default()),
+            DEFAULT_SEARCH_MAX_RESULTS
         );
     }
 
@@ -396,13 +448,15 @@ mod tests {
     }
 
     #[test]
-    fn test_previous_client_config_fixture_remains_compatible() {
+    fn test_client_config_fixture() {
         let config: ClientConfig =
-            toml::from_str(include_str!("../tests/fixtures/client-v0.1.toml")).unwrap();
+            toml::from_str(include_str!("../tests/fixtures/client-v0.3.toml")).unwrap();
 
-        assert_eq!(config.host.as_deref(), Some("legacy-gateway:7600"));
+        assert_eq!(config.host.as_deref(), Some("gateway:7600"));
         assert_eq!(config.server.as_deref(), Some("Kepware.KepServerEX.V5"));
-        assert_eq!(config.max_tags, Some(250));
+        assert_eq!(config.page_size, Some(250));
+        assert_eq!(config.browse_all_limit, Some(2_000));
+        assert_eq!(config.search_max_results, Some(100));
         assert_eq!(resolve_output(None, &config), OutputFormat::Table);
     }
 
@@ -411,7 +465,9 @@ mod tests {
         fn prop_client_config_toml_round_trip(
             host in proptest::option::of("[a-zA-Z0-9:/._-]{0,32}"),
             server in proptest::option::of("[a-zA-Z0-9._-]{0,32}"),
-            max_tags in proptest::option::of(any::<u32>()),
+            page_size in proptest::option::of(any::<u32>()),
+            browse_all_limit in proptest::option::of(any::<u32>()),
+            search_max_results in proptest::option::of(any::<u32>()),
             output in proptest::option::of(proptest::prop_oneof![
                 Just(OutputFormat::Table),
                 Just(OutputFormat::Json),
@@ -420,7 +476,9 @@ mod tests {
             let original = ClientConfig {
                 host,
                 server,
-                max_tags,
+                page_size,
+                browse_all_limit,
+                search_max_results,
                 output,
             };
             let encoded = toml::to_string(&original).unwrap();

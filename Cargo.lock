@@ -195,6 +195,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
+name = "bytehound-opc-da-client"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13f9222253c28bee35f5847e384dcdd9f5c5e2622720db1c828f2e29a82e8dd1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows",
+ "windows-core 0.61.2",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,23 +744,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "opc-da-client"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2eb356562363fb8b59fe348c0e267498546a89e0255252ab16991e3f6e057b7a"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "tokio",
- "tracing",
- "windows",
- "windows-core 0.61.2",
-]
-
-[[package]]
 name = "opcda-bridge"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "opcda-bridge-proto",
@@ -758,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-client"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -778,12 +780,12 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytehound-opc-da-client",
  "clap",
- "opc-da-client",
  "opcda-bridge-proto",
  "proptest",
  "serde",
@@ -796,12 +798,13 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "windows-service",
 ]
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "prost",
  "tonic",
@@ -1692,6 +1695,17 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "uuid"
+version = "1.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
+dependencies = [
+ "getrandom 0.4.3",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"

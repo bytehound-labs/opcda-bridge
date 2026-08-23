@@ -44,7 +44,7 @@ jobs:
   compatibility:
     name: Check Protobuf compatibility
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: needs.changes.outputs.run == 'true' && !contains(github.event.pull_request.labels.*.name, 'breaking-protobuf')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -85,8 +85,12 @@ jobs:
         if: needs.changes.outputs.run != 'true'
         run: echo "No Protobuf-affecting files changed; compatibility check skipped."
 
+      - name: Report approved breaking change
+        if: needs.changes.outputs.run == 'true' && contains(github.event.pull_request.labels.*.name, 'breaking-protobuf')
+        run: echo "Intentional breaking Protobuf change approved by the breaking-protobuf label."
+
       - name: Verify compatibility result
-        if: needs.changes.outputs.run == 'true' && needs.compatibility.result != 'success'
+        if: needs.changes.outputs.run == 'true' && !contains(github.event.pull_request.labels.*.name, 'breaking-protobuf') && needs.compatibility.result != 'success'
         run: |
           echo "Protobuf compatibility ended with: ${{ needs.compatibility.result }}"
           exit 1

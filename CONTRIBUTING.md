@@ -58,7 +58,9 @@ Security workflows use immutable action pins and bounded aggregate statuses. The
 Semgrep, full-history Gitleaks, actionlint, zizmor, Protobuf breaking-change checks, and bounded
 fuzz smoke tests when their inputs change. Tagged binary releases receive checksums, an SBOM,
 keyless signatures, and provenance; use the release workflow's manual dispatch for packaging
-validation without publishing.
+validation without publishing. Intentional Protobuf wire-contract breaks must carry the
+`breaking-protobuf` label; without that explicit approval, the Buf compatibility check blocks the
+pull request.
 
 ## Pull requests
 

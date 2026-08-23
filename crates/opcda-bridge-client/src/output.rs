@@ -1,11 +1,8 @@
 //! Output format selection and rendering for client command results.
 //!
-//! Every command builds a `Vec` of row structs that derive both `Tabled`
-//! (for the default human-readable table) and `Serialize` (for `--output
-//! json`), then routes them through [`render`] — the single place that
-//! decides how a result becomes text. This mirrors `commands::render_tree`,
-//! which the codebase deliberately made return a `String` rather than print
-//! directly, so both paths are unit-testable without capturing stdout.
+//! Simple commands build row structs and route them through [`render`].
+//! Browse uses a metadata-bearing JSON object, while search uses
+//! newline-delimited JSON events so progressive results remain streaming.
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -17,9 +14,7 @@ use tabled::{Table, Tabled};
 pub enum OutputFormat {
     /// Human-readable table (default).
     Table,
-    /// Pretty-printed JSON: a bare array of objects, one per row, using the
-    /// Rust field names as keys. This is the external contract for
-    /// programmatic consumers, so it must not change silently.
+    /// Machine-readable JSON. Search emits newline-delimited event objects.
     Json,
 }
 

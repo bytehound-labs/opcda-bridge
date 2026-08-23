@@ -17,6 +17,9 @@ definitions, cross-platform CLI, and Windows gateway as separate crates. Release
 release pull request and publishes only after its generated metadata passes the required release
 integrity check.
 
+The 0.3 API line introduces a breaking gRPC browse contract. Upgrade the gateway and client
+together; 0.2 clients and gateways are not wire-compatible with 0.3.
+
 ## Why
 
 OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based industrial protocol still running on countless PLCs, DCSs, and SCADA systems that predate its successor, OPC UA.
@@ -106,20 +109,33 @@ config file — see [Configuration](#configuration) below.
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 servers
   ```
-- Browse a server's tags. Default output is one level of the tag tree, rooted at `--path`
-  (the top level if omitted); `Branch` entries are suffixed `/` — pass one back in as `--path` to
-  drill down a level further. Add `--flat` for a flat list of every tag instead, and `--max-tags`
-  to cap how many are streamed back (default 1000):
+- Inspect the gateway's browse/search capabilities for a server:
   ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5
-  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 --path Simulink.Device1
+  opcda-bridge-client --host 192.168.1.50:7600 capabilities --server Kepware.KepServerEX.V5
   ```
+- Browse one bounded page of immediate children. The root request opens a session; use the returned
+  opaque session, node, and continuation values unchanged to expand a branch or load another page:
+  ```sh
+  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 --page-size 200
+  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 \
+    --session-id SESSION --parent-node-key NODE_KEY
+  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 \
+    --session-id SESSION --page-token PAGE_TOKEN
+  ```
+  `--all` follows continuation tokens explicitly and stops at the `--max-results` safety cap
+  (10,000 by default). It can be expensive and is not used for normal tree navigation.
+- Search independently of tree browsing. Results arrive progressively; progress is written to
+  stderr, and Ctrl+C drops the active stream. Exact ItemIDs in results remain the identities used
+  for read/write:
+  ```sh
+  opcda-bridge-client --host 192.168.1.50:7600 search Device1 \
+    --server Kepware.KepServerEX.V5 --match-mode contains
+  ```
+- Release a browse session before its gateway-side expiry:
 
-The Windows gateway recursively enumerates hierarchical OPC DA namespaces instead of relying on
-the optional `OPC_FLAT` result. This keeps servers that expose only top-level branch names through
-`OPC_FLAT` expandable, including Yokogawa CSHIS namespaces such as
-`FCS0201/Control/PV`. Dotted and slash-separated item IDs are both supported and preserved while
-drilling down the tree.
+  ```sh
+  opcda-bridge-client --host 192.168.1.50:7600 close-browse-session SESSION
+  ```
 
 - Read one or more tag values:
   ```sh
@@ -130,9 +146,10 @@ drilling down the tree.
   opcda-bridge-client --host 192.168.1.50:7600 write --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D 42
   ```
 
-Every command prints its result as a table by default, except `browse` in its default tree mode,
-which prints an indented tree instead (pass `--flat` for the tabular form). Pass `--output json`
-(or its shorthand, `--json`) for machine-readable output instead — see
+Every command prints human-readable output by default. Browse output includes the session ID,
+namespace organization/source, completeness, warning, and next-page token so partial results are
+never presented as complete. Pass `--output json` (or its shorthand, `--json`) for machine-readable
+output instead — see
 [JSON output](#json-output) below. `--host`, `--config`, `--output`, and `--json` may be placed
 either before or after the subcommand (e.g. both `--json read ...` and `read ... --json` work).
 Run `opcda-bridge-client --help` or `opcda-bridge-client <command> --help` for the full flag
@@ -140,9 +157,8 @@ reference.
 
 ### JSON output
 
-Every command accepts `--output json` (or the shorthand `--json`) to print a pretty-printed JSON
-array instead of a table, for shell scripting, CI, or piping into `jq`. Field names are the same
-across both formats:
+Every command accepts `--output json` (or the shorthand `--json`) for scripting, CI, or piping
+into `jq`. Most commands print a pretty-printed JSON array:
 
 ```sh
 opcda-bridge-client --host 192.168.1.50:7600 --json read --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D
@@ -159,10 +175,12 @@ opcda-bridge-client --host 192.168.1.50:7600 --json read --server Kepware.KepSer
 ]
 ```
 
-`browse` always emits a flat JSON array of `{"tag_id": ..., "node_type": ...}` objects in this
-mode, regardless of `--flat` — the indented tree is a display-only rendering with no JSON
-equivalent. Commands that fail print a structured `{"error": "..."}` object to stderr instead of
-the usual `Error: ...` text, and the process still exits non-zero.
+`browse` emits a metadata object containing `session_id`, `nodes`, `next_page_token`, `complete`,
+`organization`, `source`, `warning`, and `pages`. Each node keeps its opaque `node_key`, local
+`display_name`, typed `kind`, and optional exact `item_id` separate. `search` emits newline-delimited
+JSON events so matches and progress remain streaming rather than waiting for the full search.
+Commands that fail print a structured `{"error": "..."}` object to stderr instead of the usual
+`Error: ...` text, and the process still exits non-zero.
 
 `--output`/`--json` follow the same `CLI flag > environment variable > config file > default`
 precedence as every other setting (env var `OPC_BRIDGE_OUTPUT`, config key `output`), so a script
@@ -182,11 +200,11 @@ client needs to opt in explicitly with
 connecting.
 
 For a Rust program, skip both of the above and depend on
-[`opcda-bridge`](https://crates.io/crates/opcda-bridge) directly instead: it's the same typed
-connect/list-servers/browse/read/write API `opcda-bridge-client` itself is built on, returning
-plain Rust values (`Vec<String>`, `Vec<BrowseNode>`, `Vec<TagValue>`, `WriteResult`) with no
-`clap`, `tabled`, `serde_json`, or `toml` pulled in transitively — just `opcda-bridge-proto`,
-`tonic`, and `thiserror`. Add it to a project with:
+[`opcda-bridge`](https://crates.io/crates/opcda-bridge) directly instead. It exposes typed
+capabilities, one-page browse requests/responses, explicit session close, cancellable search
+streams, and read/write operations without `clap`, `tabled`, `serde_json`, or `toml` pulled in
+transitively — just `opcda-bridge-proto`, `tonic`, `tonic-prost`, `uuid`, and `thiserror`. Add it
+to a project with:
 
 ```sh
 cargo add opcda-bridge
@@ -232,15 +250,17 @@ See
 [`crates/opcda-bridge-client/client.example.toml`](crates/opcda-bridge-client/client.example.toml)
 for every available key.
 
-| Setting               | CLI flag              | Env var             | Config key | Default                               |
-| --------------------- | --------------------- | ------------------- | ---------- | ------------------------------------- |
-| Gateway address       | `--host`              | `OPC_BRIDGE_HOST`   | `host`     | `localhost:7600`                      |
-| Default OPC DA server | `--server`            | —                   | `server`   | none — must be set one way or another |
-| Browse tag cap        | `--max-tags`          | —                   | `max_tags` | `1000`                                |
-| Output format         | `--output` / `--json` | `OPC_BRIDGE_OUTPUT` | `output`   | `table`                               |
+| Setting               | CLI flag                     | Env var             | Config key           | Default                               |
+| --------------------- | ---------------------------- | ------------------- | -------------------- | ------------------------------------- |
+| Gateway address       | `--host`                     | `OPC_BRIDGE_HOST`   | `host`               | `localhost:7600`                      |
+| Default OPC DA server | `--server`                   | —                   | `server`             | none — must be set one way or another |
+| Browse page size      | `browse --page-size`         | —                   | `page_size`          | `200`                                 |
+| Browse `--all` cap    | `browse --all --max-results` | —                   | `browse_all_limit`   | `10000`                               |
+| Search result cap     | `search --max-results`       | —                   | `search_max_results` | `200`                                 |
+| Output format         | `--output` / `--json`        | `OPC_BRIDGE_OUTPUT` | `output`             | `table`                               |
 
-`server` has no built-in default: if it is left unset by every source, `browse`/`read`/`write`
-fail with an error rather than guessing a server.
+`server` has no built-in default: if it is left unset by every source,
+`capabilities`/`browse`/`search`/`read`/`write` fail rather than guessing a server.
 
 ## Logging
 
@@ -299,7 +319,7 @@ console mode: `stop` drains in-flight requests before the SCM reports it `Stoppe
 
 ## Architecture
 
-- Gateway (Windows-only) built on [`opc-da-client`](https://github.com/wends155/opc-cli) for the COM/OPC DA layer — no dependency on proprietary SDKs (OPC Labs QuickOPC, Graybox, Matrikon, etc.).
+- Gateway (Windows-only) built on the ByteHound-maintained [`bytehound-opc-da-client`](https://github.com/bytehound-labs/opc-cli/tree/main/opc-da-client) package for the COM/OPC DA layer — no dependency on proprietary SDKs (OPC Labs QuickOPC, Graybox, Matrikon, etc.).
 - Client (cross-platform) is a plain network client with no COM/Windows dependency.
 - Scope is intentionally OPC DA only for now — see [`AGENTS.md`](AGENTS.md) for the reasoning.
 
