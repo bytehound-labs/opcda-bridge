@@ -145,8 +145,9 @@ config file — see [Configuration](#configuration) below.
     --server Kepware.KepServerEX.V5
   ```
   Operators can use `index-pause`, `index-resume`, and `index-cancel` for an active build.
-  Responses distinguish `not-indexed`, `partial`, `ready`, `stale`, `refreshing`, and `failed`
-  states. A no-match response is authoritative only for a complete index.
+  Refreshes run asynchronously, and responses distinguish `not-indexed`, `partial`, `ready`,
+  `stale`, `refreshing`, and `failed` states. A no-match response is authoritative only for a
+  complete index.
 - Release a browse session before its gateway-side expiry:
 
   ```sh

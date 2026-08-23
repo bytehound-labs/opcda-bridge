@@ -31,11 +31,20 @@ const DEFAULT_SEARCH_RESULTS: u32 = 200;
 const MAX_SEARCH_RESULTS: u32 = 1_000;
 const MAX_SEARCH_VISITED: u32 = 50_000;
 
-#[derive(Clone)]
 pub struct BridgeService<C: OpcClient> {
     client: Arc<C>,
     browse: Arc<BrowseManager<C>>,
     index: Arc<IndexManager<C>>,
+}
+
+impl<C: OpcClient> Clone for BridgeService<C> {
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            browse: Arc::clone(&self.browse),
+            index: Arc::clone(&self.index),
+        }
+    }
 }
 
 impl<C: OpcClient> BridgeService<C> {
@@ -1541,12 +1550,16 @@ mod tests {
             }))
             .await
             .unwrap();
-        for _ in 0..100 {
-            if service.index.status("S").await.unwrap().state == IndexState::Ready {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if service.index.status("S").await.unwrap().state == IndexState::Ready {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .unwrap();
         assert_eq!(
             service.index.status("S").await.unwrap().state,
             IndexState::Ready
