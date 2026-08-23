@@ -9,6 +9,7 @@ use chrono::{DateTime, Local, Timelike};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,6 +76,112 @@ struct RuntimeState {
     build: Option<RuntimeBuild>,
     retry_after: Option<SystemTime>,
     last_error: Option<String>,
+}
+
+struct BackgroundTasks {
+    state: Mutex<BackgroundTaskState>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    idle: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct BackgroundTaskState {
+    active: usize,
+    shutting_down: bool,
+}
+
+struct BackgroundTaskGuard {
+    tasks: Arc<BackgroundTasks>,
+}
+
+impl BackgroundTasks {
+    fn new() -> Self {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        Self {
+            state: Mutex::new(BackgroundTaskState::default()),
+            shutdown,
+            idle: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.shutting_down)
+            .unwrap_or(true)
+    }
+
+    fn request_shutdown(&self) {
+        let should_notify = self
+            .state
+            .lock()
+            .map(|mut state| {
+                if state.shutting_down {
+                    false
+                } else {
+                    state.shutting_down = true;
+                    true
+                }
+            })
+            .unwrap_or(true);
+        if should_notify {
+            let _ = self.shutdown.send(true);
+        }
+    }
+
+    fn spawn<F>(self: &Arc<Self>, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        if state.shutting_down {
+            return false;
+        }
+        state.active = state.active.saturating_add(1);
+        drop(state);
+
+        let tasks = Arc::clone(self);
+        tokio::spawn(async move {
+            let _guard = BackgroundTaskGuard { tasks };
+            future.await;
+        });
+        true
+    }
+
+    async fn wait_for_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            let active = self.state.lock().map(|state| state.active).unwrap_or(0);
+            if active == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for BackgroundTaskGuard {
+    fn drop(&mut self) {
+        let became_idle = self
+            .tasks
+            .state
+            .lock()
+            .map(|mut state| {
+                state.active = state.active.saturating_sub(1);
+                state.active == 0
+            })
+            .unwrap_or(true);
+        if became_idle {
+            self.tasks.idle.notify_one();
+        }
+    }
 }
 
 struct QueryCache {
@@ -230,6 +337,7 @@ impl QueryCache {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     server: String,
+    generation: u64,
     query: String,
     mode: i32,
     limit: u32,
@@ -626,7 +734,6 @@ impl IndexDb {
         limit: u32,
     ) -> anyhow::Result<Vec<IndexedMatch>> {
         let normalized_query = normalize_query(query);
-        let terms = normalized_query.split_whitespace().collect::<Vec<_>>();
         let mut sql = format!(
             "SELECT e.item_id, e.display_name, e.kind, e.breadcrumbs FROM entries e
              WHERE e.server = ? AND e.generation = {}",
@@ -634,20 +741,9 @@ impl IndexDb {
         );
         let mut values = vec![server.to_string()];
         match mode {
-            1 if terms.len() == 1 => {
+            1 => {
                 sql.push_str(" AND (e.display_name_norm = ? OR e.item_id_norm = ?)");
                 values.extend([normalized_query.clone(), normalized_query.clone()]);
-            }
-            1 | 2 if terms.len() > 1 => {
-                for term in terms {
-                    let pattern = format!("%{}%", escape_like(term));
-                    sql.push_str(
-                        " AND (e.display_name_norm LIKE ? ESCAPE '\\'
-                            OR e.item_id_norm LIKE ? ESCAPE '\\'
-                            OR e.breadcrumbs LIKE ? ESCAPE '\\')",
-                    );
-                    values.extend([pattern.clone(), pattern.clone(), pattern]);
-                }
             }
             2 => {
                 let pattern = format!("{}%", escape_like(&normalized_query));
@@ -658,21 +754,30 @@ impl IndexDb {
                 values.extend([pattern.clone(), pattern]);
             }
             _ => {
-                let fts_query = normalized_query
+                let fts_compatible = normalized_query
                     .split_whitespace()
-                    .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-                    .collect::<Vec<_>>()
-                    .join(" AND ");
-                sql.push_str(
-                    " AND EXISTS (
-                         SELECT 1 FROM entries_fts f
-                         WHERE f.server = e.server
-                           AND f.generation = e.generation
-                           AND f.item_id = e.item_id
-                           AND entries_fts MATCH ?
-                     )",
-                );
-                values.push(fts_query);
+                    .all(|term| term.chars().count() >= 3);
+                if normalized_query.chars().count() >= 3 && fts_compatible {
+                    let fts_query = format!("\"{}\"", normalized_query.replace('"', "\"\""));
+                    sql.push_str(
+                        " AND EXISTS (
+                             SELECT 1 FROM entries_fts f
+                             WHERE f.server = e.server
+                               AND f.generation = e.generation
+                               AND f.item_id = e.item_id
+                               AND entries_fts MATCH ?
+                         )",
+                    );
+                    values.push(fts_query);
+                } else {
+                    let pattern = format!("%{}%", escape_like(&normalized_query));
+                    sql.push_str(
+                        " AND (e.display_name_norm LIKE ? ESCAPE '\\'
+                            OR e.item_id_norm LIKE ? ESCAPE '\\'
+                            OR e.breadcrumbs LIKE ? ESCAPE '\\')",
+                    );
+                    values.extend([pattern.clone(), pattern.clone(), pattern]);
+                }
             }
         }
         sql.push_str(
@@ -746,6 +851,7 @@ pub struct IndexManager<C: OpcClient> {
     active_builds: Arc<Mutex<HashSet<String>>>,
     foreground_users: Arc<Mutex<HashMap<String, usize>>>,
     cache: Arc<Mutex<QueryCache>>,
+    background_tasks: Arc<BackgroundTasks>,
     background_started: AtomicBool,
 }
 
@@ -764,6 +870,7 @@ impl<C: OpcClient> IndexManager<C> {
                 order: VecDeque::new(),
                 capacity: cache_capacity,
             })),
+            background_tasks: Arc::new(BackgroundTasks::new()),
             background_started: AtomicBool::new(false),
         }
     }
@@ -781,14 +888,42 @@ impl<C: OpcClient> IndexManager<C> {
         }
         for server in self.settings.servers.clone() {
             let manager = Arc::clone(self);
-            tokio::spawn(async move {
+            let mut shutdown = self.background_tasks.subscribe();
+            self.background_tasks.spawn(async move {
                 manager.refresh_if_due(&server).await;
                 loop {
-                    tokio::time::sleep(manager.background_refresh_delay(&server).await).await;
-                    manager.refresh_if_due(&server).await;
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    let delay = manager.background_refresh_delay(&server).await;
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = shutdown.changed() => {}
+                        _ = tokio::time::sleep(delay) => {
+                            manager.refresh_if_due(&server).await;
+                        }
+                    }
                 }
             });
         }
+    }
+
+    pub async fn shutdown_background_indexing(&self) {
+        self.background_tasks.request_shutdown();
+        if let Ok(runtime) = self.runtime.lock() {
+            for state in runtime.values() {
+                if let Some(control) = state
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.control.as_ref())
+                {
+                    control.cancel();
+                }
+            }
+        }
+        self.background_tasks.wait_for_idle().await;
     }
 
     async fn background_refresh_delay(&self, server: &str) -> Duration {
@@ -1078,7 +1213,10 @@ impl<C: OpcClient> IndexManager<C> {
         force: bool,
     ) -> anyhow::Result<IndexStatus> {
         self.require_configured(server)?;
-        let blocked = {
+        if self.background_tasks.is_shutting_down() {
+            return self.status(server).await;
+        }
+        let should_start = {
             let mut runtime = self
                 .runtime
                 .lock()
@@ -1093,11 +1231,10 @@ impl<C: OpcClient> IndexManager<C> {
                 && state
                     .retry_after
                     .is_some_and(|retry| SystemTime::now() < retry);
-            if state.build.is_some()
-                || backing_off
-                || active_builds >= self.settings.concurrency.max(1) as usize
-            {
-                true
+            if state.build.is_some() || backing_off {
+                false
+            } else if active_builds >= self.settings.concurrency.max(1) as usize {
+                anyhow::bail!("namespace index build concurrency limit reached");
             } else {
                 let foreground_users = self
                     .foreground_users
@@ -1119,10 +1256,10 @@ impl<C: OpcClient> IndexManager<C> {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("index active-build lock poisoned"))?
                     .insert(server.to_string());
-                false
+                true
             }
         };
-        if blocked {
+        if !should_start {
             return self.status(server).await;
         }
 
@@ -1137,6 +1274,11 @@ impl<C: OpcClient> IndexManager<C> {
                 return Err(error);
             }
         };
+        if self.background_tasks.is_shutting_down() {
+            handle.control.cancel();
+            self.finish_build(server, None);
+            return self.status(server).await;
+        }
         let (organization, source) = match self.client.get_capabilities(server).await {
             Ok(capabilities) => (capabilities.organization, capabilities.source),
             Err(error) => {
@@ -1177,11 +1319,22 @@ impl<C: OpcClient> IndexManager<C> {
             self.finish_build(server, Some(error.to_string()));
             return Err(error);
         }
+        if self.background_tasks.is_shutting_down() {
+            handle.control.cancel();
+            let _ = self.with_database(|db| db.discard_generation(server, generation));
+            self.finish_build(server, None);
+            return self.status(server).await;
+        }
         let manager = Arc::clone(self);
         let server_name = server.to_string();
-        tokio::spawn(async move {
+        let control = Arc::clone(&handle.control);
+        if !self.background_tasks.spawn(async move {
             manager.run_build(server_name, generation, handle).await;
-        });
+        }) {
+            control.cancel();
+            let _ = self.with_database(|db| db.discard_generation(server, generation));
+            self.finish_build(server, None);
+        }
         self.status(server).await
     }
 
@@ -1240,47 +1393,52 @@ impl<C: OpcClient> IndexManager<C> {
             });
         }
         let limit = limit.max(1).min(self.settings.max_results);
-        let key = CacheKey {
-            server: server.to_string(),
-            query: normalize_query(query),
-            mode,
-            limit,
-        };
         let status = self.status(server).await?;
-        let cached = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
-            .get(&key);
-        if status.active_generation > 0
-            && let Some(mut value) = cached
-        {
-            value.status = status;
-            return Ok(value);
-        }
-        let generation = self.with_database(|db| db.search_generation(server))?;
-        let Some(generation) = generation else {
+        let normalized_query = normalize_query(query);
+        let result = self.with_database(|db| {
+            let Some(generation) = db.search_generation(server)? else {
+                return Ok(None);
+            };
+            let key = CacheKey {
+                server: server.to_string(),
+                generation,
+                query: normalized_query.clone(),
+                mode,
+                limit,
+            };
+            if status.active_generation == generation
+                && let Some(mut value) = self
+                    .cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
+                    .get(&key)
+            {
+                value.status = status.clone();
+                return Ok(Some(value));
+            }
+            let mut matches = db.search(server, generation, query, mode, limit)?;
+            let has_more = matches.len() > limit as usize;
+            matches.truncate(limit as usize);
+            let value = IndexedSearch {
+                matches,
+                has_more,
+                status: status.clone(),
+            };
+            if status.active_generation == generation {
+                self.cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
+                    .insert(key, value.clone());
+            }
+            Ok(Some(value))
+        })?;
+        let Some(value) = result else {
             return Ok(IndexedSearch {
                 matches: Vec::new(),
                 has_more: false,
                 status,
             });
         };
-        let mut matches =
-            self.with_database(|db| db.search(server, generation, query, mode, limit))?;
-        let has_more = matches.len() > limit as usize;
-        matches.truncate(limit as usize);
-        let value = IndexedSearch {
-            matches,
-            has_more,
-            status,
-        };
-        if value.status.active_generation > 0 {
-            self.cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
-                .insert(key, value.clone());
-        }
         Ok(value)
     }
 
@@ -1316,7 +1474,7 @@ impl<C: OpcClient> IndexManager<C> {
         let mut cancelled = false;
         let mut failed = None;
         let mut terminal = false;
-        let mut batch_started = Instant::now();
+        let mut accounted_active_time_ms = 0_u64;
         let mut rate_limiter =
             ItemRateLimiter::new(self.settings.item_rate_limit, self.settings.burst_size);
         let mut next_health_probe = Instant::now();
@@ -1359,12 +1517,13 @@ impl<C: OpcClient> IndexManager<C> {
                             break;
                         }
                         pending.clear();
-                        self.enforce_duty_cycle(&handle.control, &server, batch_started.elapsed())
-                            .await;
-                        batch_started = Instant::now();
                     }
                 }
                 Ok(InventoryEvent::Progress(progress)) => {
+                    let active_time_delta_ms = progress
+                        .active_time_ms
+                        .saturating_sub(accounted_active_time_ms);
+                    accounted_active_time_ms = progress.active_time_ms;
                     last_progress = progress.clone();
                     if let Err(error) =
                         self.with_database(|db| db.update_progress(&server, generation, &progress))
@@ -1373,6 +1532,18 @@ impl<C: OpcClient> IndexManager<C> {
                         break;
                     }
                     self.update_runtime_progress(&server, progress);
+                    if active_time_delta_ms > 0
+                        && !self
+                            .enforce_duty_cycle(
+                                &handle.control,
+                                &server,
+                                Duration::from_millis(active_time_delta_ms),
+                            )
+                            .await
+                    {
+                        cancelled = true;
+                        break;
+                    }
                 }
                 Ok(InventoryEvent::Completed(result)) => {
                     terminal = true;
@@ -1396,21 +1567,18 @@ impl<C: OpcClient> IndexManager<C> {
         if !terminal && failed.is_none() {
             failed = Some("inventory stream ended before completion".to_string());
         }
-        if !pending.is_empty() && failed.is_none() {
-            if let Err(error) =
+        if !pending.is_empty()
+            && failed.is_none()
+            && let Err(error) =
                 self.with_database(|db| db.insert_entries(&server, generation, &pending))
-            {
-                failed = Some(error.to_string());
-            } else {
-                self.enforce_duty_cycle(&handle.control, &server, batch_started.elapsed())
-                    .await;
-            }
+        {
+            failed = Some(error.to_string());
         }
 
         if let Some(error) = failed {
             let _ = self.with_database(|db| db.fail_generation(&server, generation, &error));
             self.finish_build(&server, Some(error));
-        } else if completed && !cancelled {
+        } else if completed && !cancelled && !handle.control.is_cancelled() {
             let result = self.with_database(|db| {
                 db.promote(&server, generation, &timestamp_now(), &last_progress)
             });
@@ -1439,10 +1607,10 @@ impl<C: OpcClient> IndexManager<C> {
         control: &Arc<dyn InventoryControl>,
         server: &str,
         work_duration: Duration,
-    ) {
+    ) -> bool {
         let duty = u32::from(self.settings.duty_cycle_percent.clamp(1, 100));
         if duty >= 100 {
-            return;
+            return !control.is_cancelled();
         }
         let pause_duration = work_duration.mul_f64(f64::from(100 - duty) / f64::from(duty));
         let can_pause = self.runtime.lock().ok().is_some_and(|runtime| {
@@ -1466,6 +1634,7 @@ impl<C: OpcClient> IndexManager<C> {
         {
             control.resume();
         }
+        still_running
     }
 
     async fn wait_for_maintenance(
@@ -1932,12 +2101,14 @@ mod tests {
         };
         let first = CacheKey {
             server: "first".into(),
+            generation: 1,
             query: "query".into(),
             mode: 3,
             limit: 10,
         };
         let second = CacheKey {
             server: "second".into(),
+            generation: 1,
             query: "query".into(),
             mode: 3,
             limit: 10,
@@ -2662,6 +2833,12 @@ mod tests {
                     kind: InventoryNodeKind::BranchAndItem,
                     breadcrumbs: vec!["FCS0201".into()],
                 },
+                InventoryEntry {
+                    display_name: "Tag".into(),
+                    item_id: "Unique.Tag".into(),
+                    kind: InventoryNodeKind::Item,
+                    breadcrumbs: vec!["Area".into()],
+                },
             ],
         )
         .unwrap();
@@ -2682,23 +2859,26 @@ mod tests {
         .unwrap();
         assert_eq!(db.search("S", generation, "PV", 1, 10).unwrap().len(), 1);
         assert_eq!(
-            db.search("S", generation, "FCS0201 204FI", 1, 10)
+            db.search("S", generation, "FCS0201!204FI00510.PV", 1, 10)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            db.search("S", generation, "FCS0201 204FI", 2, 10)
+            db.search("S", generation, "FCS0201!204FI", 2, 10)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            db.search("S", generation, "fcs0201 204fi", 3, 10)
+            db.search("S", generation, "fcs0201!204fi", 3, 10)
                 .unwrap()
                 .len(),
             1
         );
+        assert_eq!(db.search("S", generation, "pv", 3, 10).unwrap().len(), 2);
+        assert_eq!(db.search("S", generation, "area", 3, 10).unwrap().len(), 1);
+        assert_eq!(db.search("S", generation, "ar", 3, 10).unwrap().len(), 1);
         assert_eq!(db.search("S", generation, "temp", 2, 10).unwrap().len(), 1);
         let second_generation = db
             .start_generation(
@@ -3294,8 +3474,8 @@ mod tests {
             IndexState::Partial
         );
         assert_eq!(
-            manager.refresh("T", true).await.unwrap().state,
-            IndexState::NotIndexed
+            manager.refresh("T", true).await.unwrap_err().to_string(),
+            "namespace index build concurrency limit reached"
         );
         assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), starts);
 
@@ -3352,6 +3532,69 @@ mod tests {
         assert!(control.cancelled.load(Ordering::Acquire));
         stream_release.notify_one();
         wait_for_state(&manager, "S", IndexState::NotIndexed).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_background_scheduler_and_build_tasks() {
+        let directory = tempdir().unwrap();
+        let stream_started = Arc::new(Notify::new());
+        let stream_release = Arc::new(Notify::new());
+        let manager = manager_with_blocking_event(
+            directory.path().join("index.sqlite3"),
+            Ok(InventoryEvent::Entry(inventory_entry("Tag", "S.Tag"))),
+            Arc::clone(&stream_started),
+            Arc::clone(&stream_release),
+        );
+
+        manager.start_background_indexing();
+        stream_started.notified().await;
+        assert!(manager.background_tasks.state.lock().unwrap().active >= 2);
+
+        let shutdown_manager = Arc::clone(&manager);
+        let shutdown = tokio::spawn(async move {
+            shutdown_manager.shutdown_background_indexing().await;
+        });
+        for _ in 0..100 {
+            if manager.background_tasks.is_shutting_down() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(manager.background_tasks.is_shutting_down());
+
+        stream_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("background indexing did not drain")
+            .unwrap();
+        assert_eq!(manager.background_tasks.state.lock().unwrap().active, 0);
+        assert_eq!(manager.status("S").await.unwrap().state, IndexState::Failed);
+    }
+
+    #[tokio::test]
+    async fn background_task_registry_is_idempotent_and_rejects_new_work_after_shutdown() {
+        let tasks = Arc::new(BackgroundTasks::new());
+        assert!(tasks.spawn(async {}));
+        tasks.wait_for_idle().await;
+        assert!(!tasks.is_shutting_down());
+
+        tasks.request_shutdown();
+        tasks.request_shutdown();
+        assert!(tasks.is_shutting_down());
+        assert!(!tasks.spawn(async {}));
+
+        let directory = tempdir().unwrap();
+        let client = Arc::new(MockOpcClient::default());
+        let manager = Arc::new(IndexManager::new(
+            Arc::clone(&client),
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        manager.shutdown_background_indexing().await;
+        assert_eq!(
+            manager.refresh("S", true).await.unwrap().state,
+            IndexState::NotIndexed
+        );
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

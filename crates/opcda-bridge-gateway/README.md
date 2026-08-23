@@ -21,6 +21,7 @@ The gateway also exposes persistent indexed-search status, refresh, pause, resum
 query operations for explicitly configured OPC servers. Capability responses advertise indexed
 search support, its protocol version, the configured result limit, and the server's index state.
 Indexed results contain exact ItemIDs and breadcrumb labels, never browse-session node keys.
+Refreshes run asynchronously, and gateway shutdown cancels active indexing before the process exits.
 
 Configure the index in the gateway TOML file under `[index]`. Automatic indexing is restricted to
 the explicit `servers` allow-list and uses a service-writable SQLite database, conservative

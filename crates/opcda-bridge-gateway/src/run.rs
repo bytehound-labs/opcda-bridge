@@ -78,7 +78,8 @@ pub async fn shutdown_signal() {
 /// (`service::run_as_service`), so the two differ only in where their
 /// `shutdown` future comes from and how the process's overall lifecycle
 /// (plain `main` return vs. SCM status reporting) is handled around this
-/// call — not in how the gateway itself starts up.
+/// call — not in how the gateway itself starts up. `ready` runs after the
+/// listener and gRPC server are ready to accept connections.
 ///
 /// Windows-only, like the rest of the gateway's runtime setup: the real
 /// `OpcDaAdapter`-backed `BridgeService::default()` only exists on Windows.
@@ -86,6 +87,7 @@ pub async fn shutdown_signal() {
 pub async fn run_gateway(
     cli: crate::config::Cli,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce() + Send + 'static,
 ) -> anyhow::Result<()> {
     use std::net::SocketAddr;
 
@@ -118,13 +120,16 @@ pub async fn run_gateway(
     let background_indexing = bridge.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let serve_task = tokio::spawn(serve_with_ready(listener, bridge, shutdown, move || {
+        ready();
         let _ = ready_tx.send(());
     }));
     ready_rx
         .await
         .map_err(|_| anyhow::anyhow!("gateway server failed before becoming ready"))?;
     background_indexing.start_background_indexing();
-    serve_task.await??;
+    let serve_result = serve_task.await;
+    background_indexing.shutdown_background_indexing().await;
+    serve_result??;
     tracing::info!("opcda-bridge gateway shut down");
     Ok(())
 }

@@ -94,8 +94,8 @@ pub fn build_service_definition(executable_path: PathBuf, cli: &Cli) -> ServiceD
 /// real SCM API one-to-one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceLifecycle {
-    /// Reported immediately after registering the control handler, while
-    /// config/logging are still being resolved.
+    /// Reported after registering the control handler, while
+    /// config/logging/listener startup is still in progress.
     StartPending,
     /// Reported once the listener is ready to serve requests.
     Running,
@@ -344,8 +344,6 @@ mod windows_impl {
         // secondary `_arguments` parameter above.
         let cli = Cli::parse();
 
-        report_status(&status_handle, ServiceLifecycle::Running)?;
-
         // Report `StopPending` the instant the stop signal arrives, before
         // `run::run_gateway`'s shutdown future actually resolves and the
         // in-flight-request drain begins — this is exactly the moment the
@@ -359,7 +357,10 @@ mod windows_impl {
         };
 
         let rt = tokio::runtime::Runtime::new()?;
-        let result = rt.block_on(run::run_gateway(cli, shutdown));
+        let ready_status_handle = status_handle.clone();
+        let result = rt.block_on(run::run_gateway(cli, shutdown, move || {
+            let _ = report_status(&ready_status_handle, ServiceLifecycle::Running);
+        }));
 
         report_status(&status_handle, ServiceLifecycle::Stopped)?;
         result

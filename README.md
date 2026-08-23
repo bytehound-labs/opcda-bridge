@@ -364,7 +364,8 @@ machine, remember to open the listen port in the Windows Firewall, same as conso
 Once running as a service there is no console, so [logging](#logging) always goes to the file
 sink — the same location and settings as console mode (next to the executable by default, or
 wherever `--log-dir`/`log.dir` points). The service also shuts down the same way `Ctrl+C` does in
-console mode: `stop` drains in-flight requests before the SCM reports it `Stopped`.
+console mode: the SCM reports `Running` only after the listener is ready, and `stop` drains
+in-flight requests before it reports `Stopped`.
 
 ## Architecture
 

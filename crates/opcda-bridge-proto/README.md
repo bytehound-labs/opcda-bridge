@@ -6,7 +6,7 @@ applications should use the higher-level `opcda-bridge` client library instead.
 
 ```toml
 [dependencies]
-opcda-bridge-proto = "0.3"
+opcda-bridge-proto = "0.4"
 ```
 
 The protocol is generated from the crate's bundled `bridge.proto` definition. Browse is a unary,

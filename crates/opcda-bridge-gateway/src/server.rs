@@ -67,6 +67,10 @@ impl<C: OpcClient> BridgeService<C> {
     pub fn start_background_indexing(&self) {
         self.index.start_background_indexing();
     }
+
+    pub async fn shutdown_background_indexing(&self) {
+        self.index.shutdown_background_indexing().await;
+    }
 }
 
 #[cfg(target_os = "windows")]

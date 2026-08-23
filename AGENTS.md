@@ -147,7 +147,8 @@ the real Windows type in a thin shim" pattern as `logging.rs`. The top of the fi
 platform-neutral and covered by Linux tests: `ServiceDefinition`/`build_service_definition` (what
 to register), `service_launch_arguments` (which CLI flags become the service's permanent launch
 arguments), `ServiceLifecycle` (a plain mirror of `windows_service::service::ServiceState` that
-pins down the intended `StartPending → Running → StopPending → Stopped` reporting order), and
+pins down the intended `StartPending → Running → StopPending → Stopped` reporting order, with
+`Running` emitted only after listener readiness), and
 `is_scm_launch_error_code` (the raw `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` check, kept as a
 plain `Option<i32>` comparison rather than matching on the Windows-only `windows_service::Error`
 directly). Only the `#[cfg(target_os = "windows")] mod windows_impl` submodule — the actual
