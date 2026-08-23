@@ -357,7 +357,7 @@ mod windows_impl {
         };
 
         let rt = tokio::runtime::Runtime::new()?;
-        let ready_status_handle = status_handle.clone();
+        let ready_status_handle = status_handle;
         let result = rt.block_on(run::run_gateway(cli, shutdown, move || {
             let _ = report_status(&ready_status_handle, ServiceLifecycle::Running);
         }));
