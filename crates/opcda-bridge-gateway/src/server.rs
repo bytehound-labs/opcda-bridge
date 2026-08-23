@@ -1,16 +1,23 @@
 use crate::browse::{BrowseManager, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+use crate::config::{GatewayConfig, resolve_index_config};
+use crate::index::{
+    IndexControlAction, IndexManager, IndexState, IndexStatus, SearchMode, normalize_query,
+};
 use crate::opc::{
-    BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource,
+    BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource, InventoryProgress,
     NamespaceOrganization, OpcClient, OpcValue, TagValue, WriteResult,
 };
 use opcda_bridge_proto::bridge::{
     BrowseBreadcrumb, BrowseNode as ProtoBrowseNode, BrowsePage as ProtoBrowsePage,
-    BrowseSource as ProtoBrowseSource, CloseBrowseSessionRequest, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, ListServersRequest, ListServersResponse,
+    BrowseSource as ProtoBrowseSource, CloseBrowseSessionRequest, ControlSearchIndexRequest,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSearchIndexStatusRequest,
+    IndexedSearchMatch, IndexedSearchProgress, ListServersRequest, ListServersResponse,
     NamespaceOrganization as ProtoNamespaceOrganization, ReadRequest, ReadResponse,
-    SearchCompleted, SearchEvent, SearchMatch, SearchMatchMode, SearchProgress, SearchRequest,
-    TagValue as ProtoTagValue, WriteRequest, WriteResponse, bridge_server::Bridge,
-    search_event::Event, write_request::TypedValue as ProtoTypedValue,
+    RefreshSearchIndexRequest, SearchCompleted, SearchEvent, SearchIndexControlAction,
+    SearchIndexRequest, SearchIndexResponse, SearchIndexState, SearchIndexStatus, SearchMatch,
+    SearchMatchMode, SearchProgress, SearchRequest, TagValue as ProtoTagValue, WriteRequest,
+    WriteResponse, bridge_server::Bridge, search_event::Event,
+    write_request::TypedValue as ProtoTypedValue,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -19,22 +26,37 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 const PROTOCOL_VERSION: &str = "2";
+const INDEXED_SEARCH_PROTOCOL_VERSION: &str = "1";
 const DEFAULT_SEARCH_RESULTS: u32 = 200;
 const MAX_SEARCH_RESULTS: u32 = 1_000;
 const MAX_SEARCH_VISITED: u32 = 50_000;
 
+#[derive(Clone)]
 pub struct BridgeService<C: OpcClient> {
     client: Arc<C>,
     browse: Arc<BrowseManager<C>>,
+    index: Arc<IndexManager<C>>,
 }
 
 impl<C: OpcClient> BridgeService<C> {
     pub fn new(client: C) -> Self {
+        Self::with_index_config(client, &GatewayConfig::default())
+    }
+
+    pub fn with_index_config(client: C, config: &GatewayConfig) -> Self {
         let client = Arc::new(client);
         Self {
             browse: Arc::new(BrowseManager::new(Arc::clone(&client))),
+            index: Arc::new(IndexManager::new(
+                Arc::clone(&client),
+                resolve_index_config(&config.index),
+            )),
             client,
         }
+    }
+
+    pub fn start_background_indexing(&self) {
+        self.index.start_background_indexing();
     }
 }
 
@@ -51,6 +73,15 @@ fn internal(error: impl std::fmt::Display) -> Status {
     Status::internal(message)
 }
 
+fn index_error(error: impl std::fmt::Display) -> Status {
+    let message = error.to_string();
+    if message.contains("not configured") {
+        Status::failed_precondition(message)
+    } else {
+        internal(message)
+    }
+}
+
 fn resolve_host(host: &str) -> &str {
     if host.is_empty() { "localhost" } else { host }
 }
@@ -65,6 +96,7 @@ fn map_namespace_organization(value: NamespaceOrganization) -> ProtoNamespaceOrg
 
 fn map_browse_source(value: BrowseSource) -> ProtoBrowseSource {
     match value {
+        BrowseSource::Unspecified => ProtoBrowseSource::Unspecified,
         BrowseSource::Da3 => ProtoBrowseSource::Da3,
         BrowseSource::Da2 => ProtoBrowseSource::Da2,
         BrowseSource::Flat => ProtoBrowseSource::Flat,
@@ -99,7 +131,11 @@ fn map_browse_page(session_id: String, page: BrowsePage) -> ProtoBrowsePage {
     }
 }
 
-fn map_capabilities(capabilities: BrowseCapabilities) -> GetCapabilitiesResponse {
+fn map_capabilities(
+    capabilities: BrowseCapabilities,
+    index_status: &IndexStatus,
+    max_indexed_search_results: u32,
+) -> GetCapabilitiesResponse {
     GetCapabilitiesResponse {
         application_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: PROTOCOL_VERSION.to_string(),
@@ -108,6 +144,65 @@ fn map_capabilities(capabilities: BrowseCapabilities) -> GetCapabilitiesResponse
         supports_search: capabilities.supports_search,
         organization: map_namespace_organization(capabilities.organization) as i32,
         source: map_browse_source(capabilities.source) as i32,
+        supports_indexed_search: true,
+        indexed_search_protocol_version: INDEXED_SEARCH_PROTOCOL_VERSION.to_string(),
+        max_indexed_search_results,
+        search_index_state: map_index_state(index_status.state) as i32,
+    }
+}
+
+fn map_index_state(state: IndexState) -> SearchIndexState {
+    match state {
+        IndexState::NotIndexed => SearchIndexState::NotIndexed,
+        IndexState::Partial => SearchIndexState::Partial,
+        IndexState::Ready => SearchIndexState::Ready,
+        IndexState::Stale => SearchIndexState::Stale,
+        IndexState::Refreshing => SearchIndexState::Refreshing,
+        IndexState::Failed => SearchIndexState::Failed,
+    }
+}
+
+fn map_inventory_progress(progress: InventoryProgress) -> IndexedSearchProgress {
+    IndexedSearchProgress {
+        branches_visited: progress.branches_visited,
+        entries_seen: progress.entries_seen,
+        unique_items: progress.unique_items,
+        active_time_ms: progress.active_time_ms,
+        paused_time_ms: progress.paused_time_ms,
+        items_per_second: progress.items_per_second,
+        estimated_remaining_ms: progress.estimated_remaining_ms,
+    }
+}
+
+fn map_index_status(status: IndexStatus) -> SearchIndexStatus {
+    SearchIndexStatus {
+        server: status.server,
+        state: map_index_state(status.state) as i32,
+        configured: status.configured,
+        active_generation: status.active_generation,
+        entry_count: status.entry_count,
+        unique_item_count: status.unique_item_count,
+        started_at: status.started_at,
+        completed_at: status.completed_at,
+        last_error: status.last_error,
+        database_bytes: status.database_bytes,
+        organization: map_namespace_organization(status.organization) as i32,
+        source: map_browse_source(status.source) as i32,
+        progress: status.progress.map(map_inventory_progress),
+    }
+}
+
+fn map_index_match(value: crate::index::IndexedMatch) -> IndexedSearchMatch {
+    IndexedSearchMatch {
+        item_id: value.item_id,
+        display_name: value.display_name,
+        kind: match value.kind {
+            crate::opc::InventoryNodeKind::Item => opcda_bridge_proto::bridge::BrowseNodeKind::Item,
+            crate::opc::InventoryNodeKind::BranchAndItem => {
+                opcda_bridge_proto::bridge::BrowseNodeKind::BranchAndItem
+            }
+        } as i32,
+        breadcrumbs: value.breadcrumbs,
     }
 }
 
@@ -153,7 +248,8 @@ fn search_mode(mode: i32) -> Result<SearchMatchMode, Status> {
 }
 
 fn validate_search(request: &SearchRequest) -> Result<(SearchMatchMode, u32), Status> {
-    if request.query.trim().is_empty() {
+    let normalized_query = normalize_query(&request.query);
+    if normalized_query.is_empty() {
         return Err(Status::invalid_argument("search query must not be empty"));
     }
     let mode = search_mode(request.match_mode)?;
@@ -195,6 +291,7 @@ fn search_event(event: Event) -> SearchEvent {
 #[allow(clippy::too_many_arguments)]
 async fn run_search<C: OpcClient>(
     manager: Arc<BrowseManager<C>>,
+    _foreground: crate::index::ForegroundGuard<C>,
     server: String,
     session_id: String,
     request: SearchRequest,
@@ -379,12 +476,18 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         let req = request.into_inner();
+        let _foreground = self.index.foreground_guard(&req.server);
         let capabilities = self
             .client
             .get_capabilities(&req.server)
             .await
             .map_err(internal)?;
-        Ok(Response::new(map_capabilities(capabilities)))
+        let index_status = self.index.status(&req.server).await.map_err(internal)?;
+        Ok(Response::new(map_capabilities(
+            capabilities,
+            &index_status,
+            self.index.max_results(),
+        )))
     }
 
     #[tracing::instrument(skip(self, request))]
@@ -393,6 +496,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         request: Request<opcda_bridge_proto::bridge::BrowseRequest>,
     ) -> Result<Response<ProtoBrowsePage>, Status> {
         let req = request.into_inner();
+        let _foreground = self.index.foreground_guard(&req.server);
         let (session_id, page) = self
             .browse
             .browse(
@@ -425,6 +529,102 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(skip(self, request))]
+    async fn get_search_index_status(
+        &self,
+        request: Request<GetSearchIndexStatusRequest>,
+    ) -> Result<Response<SearchIndexStatus>, Status> {
+        let status = self
+            .index
+            .status(&request.into_inner().server)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(map_index_status(status)))
+    }
+
+    #[tracing::instrument(skip(self, request))]
+    async fn refresh_search_index(
+        &self,
+        request: Request<RefreshSearchIndexRequest>,
+    ) -> Result<Response<SearchIndexStatus>, Status> {
+        let request = request.into_inner();
+        let status = self
+            .index
+            .refresh(&request.server, request.force)
+            .await
+            .map_err(index_error)?;
+        Ok(Response::new(map_index_status(status)))
+    }
+
+    #[tracing::instrument(skip(self, request))]
+    async fn control_search_index(
+        &self,
+        request: Request<ControlSearchIndexRequest>,
+    ) -> Result<Response<SearchIndexStatus>, Status> {
+        let request = request.into_inner();
+        let action = SearchIndexControlAction::try_from(request.action)
+            .map_err(|_| Status::invalid_argument("unknown index control action"))?;
+        let action = match action {
+            SearchIndexControlAction::Pause => IndexControlAction::Pause,
+            SearchIndexControlAction::Resume => IndexControlAction::Resume,
+            SearchIndexControlAction::Cancel => IndexControlAction::Cancel,
+            SearchIndexControlAction::Unspecified => {
+                return Err(Status::invalid_argument("index control action is required"));
+            }
+        };
+        self.index
+            .control(&request.server, action)
+            .await
+            .map_err(index_error)?;
+        let status = self.index.status(&request.server).await.map_err(internal)?;
+        Ok(Response::new(map_index_status(status)))
+    }
+
+    #[tracing::instrument(skip(self, request))]
+    async fn search_index(
+        &self,
+        request: Request<SearchIndexRequest>,
+    ) -> Result<Response<SearchIndexResponse>, Status> {
+        let request = request.into_inner();
+        let mode = SearchMode::try_from(request.match_mode)
+            .map_err(|_| Status::invalid_argument("unknown search match mode"))?;
+        let mode = match mode {
+            SearchMode::Exact => SearchMode::Exact,
+            SearchMode::Prefix => SearchMode::Prefix,
+            SearchMode::Contains | SearchMode::Unspecified => SearchMode::Contains,
+        };
+        let normalized_query = normalize_query(&request.query);
+        if normalized_query.is_empty() {
+            return Err(Status::invalid_argument("search query must not be empty"));
+        }
+        let minimum = match mode {
+            SearchMode::Exact | SearchMode::Prefix => 2,
+            SearchMode::Contains | SearchMode::Unspecified => 3,
+        };
+        if normalized_query.chars().count() < minimum {
+            return Err(Status::invalid_argument(format!(
+                "indexed {mode:?} searches require at least {minimum} characters"
+            )));
+        }
+        let result = self
+            .index
+            .search(
+                &request.server,
+                &request.query,
+                mode as i32,
+                request.max_results,
+            )
+            .await
+            .map_err(index_error)?;
+        let status = result.status;
+        let matches = result.matches;
+        Ok(Response::new(SearchIndexResponse {
+            matches: matches.into_iter().map(map_index_match).collect(),
+            has_more: result.has_more,
+            status: Some(map_index_status(status)),
+        }))
+    }
+
     type SearchStream = ReceiverStream<Result<SearchEvent, Status>>;
 
     #[tracing::instrument(skip(self, request))]
@@ -433,6 +633,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SearchStream>, Status> {
         let request = request.into_inner();
+        let foreground = self.index.foreground_guard(&request.server);
         let (mode, max_results) = validate_search(&request)?;
         let temporary_session = request.session_id.is_none();
         let session_id = match request.session_id.as_deref() {
@@ -443,6 +644,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         let manager = Arc::clone(&self.browse);
         tokio::spawn(run_search(
             manager,
+            foreground,
             request.server.clone(),
             session_id,
             request,
@@ -468,6 +670,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
     #[tracing::instrument(skip(self, request))]
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = request.into_inner();
+        let _foreground = self.index.foreground_guard(&req.server);
         let values = self
             .client
             .read_tag_values(&req.server, req.tag_ids)
@@ -484,6 +687,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
         let req = request.into_inner();
+        let _foreground = self.index.foreground_guard(&req.server);
         let value = typed_value_to_opc_value(req.typed_value)?;
         let result = self
             .client
@@ -497,6 +701,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IndexConfig;
     use crate::opc::BrowseCapabilities;
     use crate::test_support::MockOpcClient;
     use opcda_bridge_proto::bridge::{
@@ -505,6 +710,7 @@ mod tests {
         SearchMatchMode, SearchRequest, WriteRequest, bridge_server::Bridge,
         write_request::TypedValue as ProtoTypedValue,
     };
+    use tempfile::tempdir;
 
     fn service() -> BridgeService<MockOpcClient> {
         BridgeService::new(MockOpcClient::default())
@@ -536,9 +742,101 @@ mod tests {
             map_browse_source(BrowseSource::Derived),
             ProtoBrowseSource::Derived
         );
+        assert_eq!(
+            map_browse_source(BrowseSource::Unspecified),
+            ProtoBrowseSource::Unspecified
+        );
         assert!(is_expandable(BrowseNodeKind::Branch));
         assert!(is_expandable(BrowseNodeKind::BranchAndItem));
         assert!(!is_expandable(BrowseNodeKind::Item));
+    }
+
+    #[test]
+    fn maps_index_status_progress_matches_and_errors() {
+        for (state, expected) in [
+            (IndexState::NotIndexed, SearchIndexState::NotIndexed),
+            (IndexState::Partial, SearchIndexState::Partial),
+            (IndexState::Ready, SearchIndexState::Ready),
+            (IndexState::Stale, SearchIndexState::Stale),
+            (IndexState::Refreshing, SearchIndexState::Refreshing),
+            (IndexState::Failed, SearchIndexState::Failed),
+        ] {
+            assert_eq!(map_index_state(state), expected);
+        }
+
+        let mapped = map_index_status(IndexStatus {
+            server: "S".into(),
+            state: IndexState::Refreshing,
+            configured: true,
+            active_generation: 3,
+            entry_count: 5,
+            unique_item_count: 4,
+            started_at: Some("start".into()),
+            completed_at: Some("complete".into()),
+            last_error: Some("warning".into()),
+            database_bytes: 1024,
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+            progress: Some(InventoryProgress {
+                branches_visited: 1,
+                entries_seen: 2,
+                unique_items: 2,
+                active_time_ms: 3,
+                paused_time_ms: 4,
+                items_per_second: 5.5,
+                estimated_remaining_ms: Some(6),
+            }),
+        });
+        assert_eq!(mapped.server, "S");
+        assert_eq!(mapped.state, SearchIndexState::Refreshing as i32);
+        assert_eq!(mapped.active_generation, 3);
+        assert_eq!(mapped.entry_count, 5);
+        assert_eq!(mapped.unique_item_count, 4);
+        assert_eq!(mapped.started_at.as_deref(), Some("start"));
+        assert_eq!(mapped.completed_at.as_deref(), Some("complete"));
+        assert_eq!(mapped.last_error.as_deref(), Some("warning"));
+        assert_eq!(mapped.database_bytes, 1024);
+        assert_eq!(
+            mapped.organization,
+            ProtoNamespaceOrganization::Hierarchical as i32
+        );
+        assert_eq!(mapped.source, ProtoBrowseSource::Da2 as i32);
+        let progress = mapped.progress.unwrap();
+        assert_eq!(progress.branches_visited, 1);
+        assert_eq!(progress.entries_seen, 2);
+        assert_eq!(progress.unique_items, 2);
+        assert_eq!(progress.active_time_ms, 3);
+        assert_eq!(progress.paused_time_ms, 4);
+        assert_eq!(progress.items_per_second, 5.5);
+        assert_eq!(progress.estimated_remaining_ms, Some(6));
+
+        for (kind, expected) in [
+            (
+                crate::opc::InventoryNodeKind::Item,
+                opcda_bridge_proto::bridge::BrowseNodeKind::Item,
+            ),
+            (
+                crate::opc::InventoryNodeKind::BranchAndItem,
+                opcda_bridge_proto::bridge::BrowseNodeKind::BranchAndItem,
+            ),
+        ] {
+            let mapped = map_index_match(crate::index::IndexedMatch {
+                item_id: "S.Tag".into(),
+                display_name: "Tag".into(),
+                kind,
+                breadcrumbs: vec!["S".into()],
+            });
+            assert_eq!(mapped.item_id, "S.Tag");
+            assert_eq!(mapped.display_name, "Tag");
+            assert_eq!(mapped.kind, expected as i32);
+            assert_eq!(mapped.breadcrumbs, vec!["S"]);
+        }
+
+        assert_eq!(
+            index_error("server is not configured").code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(index_error("database failed").code(), tonic::Code::Internal);
     }
 
     #[test]
@@ -1160,6 +1458,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indexed_search_handlers_validate_map_and_execute_requests() {
+        let directory = tempdir().unwrap();
+        let config = GatewayConfig {
+            index: IndexConfig {
+                database_path: Some(
+                    directory
+                        .path()
+                        .join("index.sqlite3")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                servers: vec!["S".into()],
+                enabled: Some(false),
+                ..IndexConfig::default()
+            },
+            ..GatewayConfig::default()
+        };
+        let service = BridgeService::with_index_config(MockOpcClient::default(), &config);
+        service.start_background_indexing();
+
+        let status = service
+            .get_search_index_status(Request::new(GetSearchIndexStatusRequest {
+                server: "S".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.state, SearchIndexState::NotIndexed as i32);
+
+        assert_eq!(
+            service
+                .control_search_index(Request::new(ControlSearchIndexRequest {
+                    server: "S".into(),
+                    action: i32::MAX,
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            service
+                .control_search_index(Request::new(ControlSearchIndexRequest {
+                    server: "S".into(),
+                    action: SearchIndexControlAction::Unspecified as i32,
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            service
+                .search_index(Request::new(SearchIndexRequest {
+                    server: "S".into(),
+                    query: "mock".into(),
+                    match_mode: i32::MAX,
+                    max_results: 10,
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            service
+                .refresh_search_index(Request::new(RefreshSearchIndexRequest {
+                    server: "Other".into(),
+                    force: true,
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        service
+            .refresh_search_index(Request::new(RefreshSearchIndexRequest {
+                server: "S".into(),
+                force: true,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if service.index.status("S").await.unwrap().state == IndexState::Ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            service.index.status("S").await.unwrap().state,
+            IndexState::Ready
+        );
+
+        let result = service
+            .search_index(Request::new(SearchIndexRequest {
+                server: "S".into(),
+                query: "mock".into(),
+                match_mode: SearchMatchMode::Contains as i32,
+                max_results: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].item_id, "Mock.Tag");
+        assert_eq!(result.status.unwrap().state, SearchIndexState::Ready as i32);
+
+        let controlled = service
+            .control_search_index(Request::new(ControlSearchIndexRequest {
+                server: "S".into(),
+                action: SearchIndexControlAction::Resume as i32,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(controlled.state, SearchIndexState::Ready as i32);
+    }
+
+    #[tokio::test]
     async fn close_session_and_read_write_paths_work() {
         let service = service();
         let page = service
@@ -1352,13 +1770,32 @@ mod tests {
 
     #[test]
     fn map_capabilities_clamps_page_size() {
-        let response = map_capabilities(BrowseCapabilities {
-            organization: NamespaceOrganization::Hierarchical,
-            source: BrowseSource::Da2,
-            supports_browse_sessions: true,
-            supports_search: false,
-            max_page_size: u32::MAX,
-        });
+        let status = IndexStatus {
+            server: "S".into(),
+            state: IndexState::NotIndexed,
+            configured: false,
+            active_generation: 0,
+            entry_count: 0,
+            unique_item_count: 0,
+            started_at: None,
+            completed_at: None,
+            last_error: None,
+            database_bytes: 0,
+            organization: NamespaceOrganization::Unspecified,
+            source: BrowseSource::Unspecified,
+            progress: None,
+        };
+        let response = map_capabilities(
+            BrowseCapabilities {
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da2,
+                supports_browse_sessions: true,
+                supports_search: false,
+                max_page_size: u32::MAX,
+            },
+            &status,
+            50,
+        );
         assert_eq!(response.max_page_size, MAX_PAGE_SIZE);
     }
 

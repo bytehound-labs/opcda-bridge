@@ -35,6 +35,15 @@ fn test_browse_and_search_help_expose_scalable_options() {
     assert!(search_help.contains("--match-mode"));
     assert!(search_help.contains("--max-results"));
     assert!(search_help.contains("--include-branches"));
+
+    let index_search = Command::new(client_bin)
+        .args(["index-search", "--help"])
+        .output()
+        .unwrap();
+    assert!(index_search.status.success());
+    let index_search_help = String::from_utf8_lossy(&index_search.stdout);
+    assert!(index_search_help.contains("--match-mode"));
+    assert!(index_search_help.contains("--max-results"));
 }
 
 #[test]

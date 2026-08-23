@@ -241,7 +241,7 @@ page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.sea
 - **Error contract**: `Error::Connect(tonic::transport::Error)` and `Error::Rpc(tonic::Status)`
   use transparent error rendering so the CLI's existing error output remains unchanged.
 - **Published distribution**: `opcda-bridge` is consumed from crates.io with a normal SemVer
-  dependency (`opcda-bridge = "0.3"`). Git dependencies are not part of the supported consumer
+  dependency (`opcda-bridge = "0.4"`). Git dependencies are not part of the supported consumer
   path.
 - **Release automation**: release-plz runs separate release-PR and publish jobs and publishes only
   after a merged release PR. The `release_commits` allowlist excludes both scoped and unscoped

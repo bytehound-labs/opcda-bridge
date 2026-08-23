@@ -10,6 +10,8 @@ pub const DEFAULT_PAGE_SIZE: u32 = opcda_bridge::DEFAULT_PAGE_SIZE;
 pub const DEFAULT_BROWSE_ALL_LIMIT: u32 = 10_000;
 /// Default maximum number of matches requested by `search`.
 pub const DEFAULT_SEARCH_MAX_RESULTS: u32 = opcda_bridge::DEFAULT_SEARCH_MAX_RESULTS;
+/// Default maximum number of matches requested by `index-search`.
+pub const DEFAULT_INDEX_SEARCH_MAX_RESULTS: u32 = opcda_bridge::DEFAULT_INDEX_SEARCH_MAX_RESULTS;
 
 /// Client configuration loaded from an optional TOML file. Every field is
 /// optional; a value missing from the file (or the file itself missing)
@@ -21,6 +23,7 @@ pub struct ClientConfig {
     pub page_size: Option<u32>,
     pub browse_all_limit: Option<u32>,
     pub search_max_results: Option<u32>,
+    pub index_search_max_results: Option<u32>,
     pub output: Option<OutputFormat>,
 }
 
@@ -136,6 +139,13 @@ pub fn resolve_search_max_results(cli_limit: Option<u32>, config: &ClientConfig)
         .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
 }
 
+/// Resolve the persistent-index search result cap.
+pub fn resolve_index_search_max_results(cli_limit: Option<u32>, config: &ClientConfig) -> u32 {
+    cli_limit
+        .or(config.index_search_max_results)
+        .unwrap_or(DEFAULT_INDEX_SEARCH_MAX_RESULTS)
+}
+
 /// Resolve the output format with `CLI flag/env > config file > default`
 /// precedence. `cli_output` is already the CLI-only resolution (`--json`
 /// wins over `--output`, which itself already folds in `OPC_BRIDGE_OUTPUT`
@@ -200,7 +210,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "host = \"example:1234\"\nserver = \"S1\"\npage_size = 50\nbrowse_all_limit = 500\nsearch_max_results = 75"
+            "host = \"example:1234\"\nserver = \"S1\"\npage_size = 50\nbrowse_all_limit = 500\nsearch_max_results = 75\nindex_search_max_results = 25"
         )
         .unwrap();
         let config = load_config_file(file.path(), true).unwrap();
@@ -209,6 +219,7 @@ mod tests {
         assert_eq!(config.page_size, Some(50));
         assert_eq!(config.browse_all_limit, Some(500));
         assert_eq!(config.search_max_results, Some(75));
+        assert_eq!(config.index_search_max_results, Some(25));
     }
 
     #[test]
@@ -411,6 +422,20 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_index_search_max_results_precedence() {
+        let config = ClientConfig {
+            index_search_max_results: Some(40),
+            ..Default::default()
+        };
+        assert_eq!(resolve_index_search_max_results(Some(45), &config), 45);
+        assert_eq!(resolve_index_search_max_results(None, &config), 40);
+        assert_eq!(
+            resolve_index_search_max_results(None, &ClientConfig::default()),
+            DEFAULT_INDEX_SEARCH_MAX_RESULTS
+        );
+    }
+
+    #[test]
     fn test_resolve_output_cli_wins() {
         let config = ClientConfig {
             output: Some(OutputFormat::Json),
@@ -457,6 +482,7 @@ mod tests {
         assert_eq!(config.page_size, Some(250));
         assert_eq!(config.browse_all_limit, Some(2_000));
         assert_eq!(config.search_max_results, Some(100));
+        assert_eq!(config.index_search_max_results, None);
         assert_eq!(resolve_output(None, &config), OutputFormat::Table);
     }
 
@@ -468,6 +494,7 @@ mod tests {
             page_size in proptest::option::of(any::<u32>()),
             browse_all_limit in proptest::option::of(any::<u32>()),
             search_max_results in proptest::option::of(any::<u32>()),
+            index_search_max_results in proptest::option::of(any::<u32>()),
             output in proptest::option::of(proptest::prop_oneof![
                 Just(OutputFormat::Table),
                 Just(OutputFormat::Json),
@@ -479,6 +506,7 @@ mod tests {
                 page_size,
                 browse_all_limit,
                 search_max_results,
+                index_search_max_results,
                 output,
             };
             let encoded = toml::to_string(&original).unwrap();

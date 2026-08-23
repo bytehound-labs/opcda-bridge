@@ -17,8 +17,9 @@ definitions, cross-platform CLI, and Windows gateway as separate crates. Release
 release pull request and publishes only after its generated metadata passes the required release
 integrity check.
 
-The 0.3 API line introduces a breaking gRPC browse contract. Upgrade the gateway and client
-together; 0.2 clients and gateways are not wire-compatible with 0.3.
+The 0.4 API line introduces indexed namespace search and extends the gRPC capabilities contract.
+The additive wire protocol remains compatible with older gateways and clients, but indexed-search
+features require matching 0.4 clients and gateways.
 
 ## Why
 
@@ -80,7 +81,7 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   ```
   This places `opcda-bridge-client` on `PATH` at `~/.cargo/bin/opcda-bridge-client`; re-run the same
   command (add `--force` to overwrite an existing install) to upgrade. Use
-  `cargo install opcda-bridge-client --version 0.2.0` to pin a specific published version.
+  `cargo install opcda-bridge-client --version 0.4.0` to pin a specific published version.
 
 ## Usage
 
@@ -124,13 +125,28 @@ config file — see [Configuration](#configuration) below.
   ```
   `--all` follows continuation tokens explicitly and stops at the `--max-results` safety cap
   (10,000 by default). It can be expensive and is not used for normal tree navigation.
-- Search independently of tree browsing. Results arrive progressively; progress is written to
-  stderr, and Ctrl+C drops the active stream. Exact ItemIDs in results remain the identities used
-  for read/write:
+- Search the live namespace independently of tree browsing. This compatibility/diagnostic path
+  traverses the OPC server; results arrive progressively, progress is written to stderr, and
+  Ctrl+C drops the active stream. Exact ItemIDs in results remain the identities used for
+  read/write:
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 search Device1 \
     --server Kepware.KepServerEX.V5 --match-mode contains
   ```
+- Use the persistent gateway-owned index for fast interactive discovery. Only servers explicitly
+  allowed by the gateway configuration can be indexed, and indexed search never falls back to
+  live traversal:
+  ```sh
+  opcda-bridge-client --host 192.168.1.50:7600 index-status \
+    --server Kepware.KepServerEX.V5
+  opcda-bridge-client --host 192.168.1.50:7600 index-search Device1 \
+    --server Kepware.KepServerEX.V5 --match-mode contains
+  opcda-bridge-client --host 192.168.1.50:7600 index-refresh \
+    --server Kepware.KepServerEX.V5
+  ```
+  Operators can use `index-pause`, `index-resume`, and `index-cancel` for an active build.
+  Responses distinguish `not-indexed`, `partial`, `ready`, `stale`, `refreshing`, and `failed`
+  states. A no-match response is authoritative only for a complete index.
 - Release a browse session before its gateway-side expiry:
 
   ```sh
@@ -179,6 +195,8 @@ opcda-bridge-client --host 192.168.1.50:7600 --json read --server Kepware.KepSer
 `organization`, `source`, `warning`, and `pages`. Each node keeps its opaque `node_key`, local
 `display_name`, typed `kind`, and optional exact `item_id` separate. `search` emits newline-delimited
 JSON events so matches and progress remain streaming rather than waiting for the full search.
+`index-search` emits one object containing ranked `matches`, `has_more`, and full index `status`;
+its matches contain exact ItemIDs and breadcrumb labels but no session-bound node keys.
 Commands that fail print a structured `{"error": "..."}` object to stderr instead of the usual
 `Error: ...` text, and the process still exits non-zero.
 
@@ -201,10 +219,10 @@ connecting.
 
 For a Rust program, skip both of the above and depend on
 [`opcda-bridge`](https://crates.io/crates/opcda-bridge) directly instead. It exposes typed
-capabilities, one-page browse requests/responses, explicit session close, cancellable search
-streams, and read/write operations without `clap`, `tabled`, `serde_json`, or `toml` pulled in
-transitively — just `opcda-bridge-proto`, `tonic`, `tonic-prost`, `uuid`, and `thiserror`. Add it
-to a project with:
+capabilities, one-page browse requests/responses, explicit session close, cancellable live-search
+streams, persistent indexed-search status/refresh/control/query methods, and read/write operations
+without `clap`, `tabled`, `serde_json`, or `toml` pulled in transitively — just
+`opcda-bridge-proto`, `tonic`, `tonic-prost`, `uuid`, and `thiserror`. Add it to a project with:
 
 ```sh
 cargo add opcda-bridge
@@ -238,6 +256,35 @@ for every available key.
 
 Logging settings (`log.*`) are also read from this file — see [Logging](#logging) below.
 
+The persistent namespace index is opt-in by server: index operations are accepted only for ProgIDs
+in `index.servers`, and automatic indexing never scans any other server. A valid complete
+generation remains available while a refresh runs, and failed or cancelled refreshes never replace
+it.
+
+| Index setting             | Config key                            | Default                 |
+| ------------------------- | ------------------------------------- | ----------------------- |
+| Database path             | `index.database_path`                 | Platform data directory |
+| Automatic indexing        | `index.enabled`                       | `true`                  |
+| Indexed server allow-list | `index.servers`                       | Empty                   |
+| Refresh interval          | `index.refresh_interval_seconds`      | `86400`                 |
+| Native batch size         | `index.batch_size`                    | `100`                   |
+| Average item rate         | `index.item_rate_limit`               | `250` items/second      |
+| Burst allowance           | `index.burst_size`                    | `100` items             |
+| Active duty cycle         | `index.duty_cycle_percent`            | `20`%                   |
+| Foreground quiet period   | `index.quiet_period_seconds`          | `2` seconds             |
+| Health probe interval     | `index.health_probe_interval_seconds` | `30` seconds            |
+| Health latency threshold  | `index.health_latency_threshold_ms`   | `500` ms                |
+| Maintenance windows       | `index.maintenance_windows`           | Empty                   |
+| Concurrent builds         | `index.concurrency`                   | `1`                     |
+| Query-cache capacity      | `index.query_cache_capacity`          | `256` entries           |
+| Start paused              | `index.paused`                        | `false`                 |
+| Maximum indexed results   | `index.max_results`                   | `50`                    |
+
+The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (falling back to
+`$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS and
+`%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows. Maintenance-window entries are local
+24-hour ranges such as `22:00-06:00`; when configured, indexing is deferred outside those ranges.
+
 ### Client
 
 Looks for a config file in a platform-specific location unless `--config` gives another path:
@@ -250,14 +297,15 @@ See
 [`crates/opcda-bridge-client/client.example.toml`](crates/opcda-bridge-client/client.example.toml)
 for every available key.
 
-| Setting               | CLI flag                     | Env var             | Config key           | Default                               |
-| --------------------- | ---------------------------- | ------------------- | -------------------- | ------------------------------------- |
-| Gateway address       | `--host`                     | `OPC_BRIDGE_HOST`   | `host`               | `localhost:7600`                      |
-| Default OPC DA server | `--server`                   | —                   | `server`             | none — must be set one way or another |
-| Browse page size      | `browse --page-size`         | —                   | `page_size`          | `200`                                 |
-| Browse `--all` cap    | `browse --all --max-results` | —                   | `browse_all_limit`   | `10000`                               |
-| Search result cap     | `search --max-results`       | —                   | `search_max_results` | `200`                                 |
-| Output format         | `--output` / `--json`        | `OPC_BRIDGE_OUTPUT` | `output`             | `table`                               |
+| Setting               | CLI flag                     | Env var             | Config key                 | Default                               |
+| --------------------- | ---------------------------- | ------------------- | -------------------------- | ------------------------------------- |
+| Gateway address       | `--host`                     | `OPC_BRIDGE_HOST`   | `host`                     | `localhost:7600`                      |
+| Default OPC DA server | `--server`                   | —                   | `server`                   | none — must be set one way or another |
+| Browse page size      | `browse --page-size`         | —                   | `page_size`                | `200`                                 |
+| Browse `--all` cap    | `browse --all --max-results` | —                   | `browse_all_limit`         | `10000`                               |
+| Search result cap     | `search --max-results`       | —                   | `search_max_results`       | `200`                                 |
+| Index search cap      | `index-search --max-results` | —                   | `index_search_max_results` | `50`                                  |
+| Output format         | `--output` / `--json`        | `OPC_BRIDGE_OUTPUT` | `output`                   | `table`                               |
 
 `server` has no built-in default: if it is left unset by every source,
 `capabilities`/`browse`/`search`/`read`/`write` fail rather than guessing a server.

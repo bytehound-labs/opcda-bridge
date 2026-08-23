@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-v0.3.2...opcda-bridge-v0.4.0) - 2026-08-23
+
+### Added
+
+- add persistent indexed namespace search and typed index controls
+- expose indexed-search status, progress, exact ItemIDs, and breadcrumbs
+
 ## [0.3.2](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-v0.2.2...opcda-bridge-v0.3.2) - 2026-08-23
 
 ### Added
@@ -15,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(ci)* stop release automation loops ([#49](https://github.com/bytehound-labs/opcda-bridge/pull/49))
+- _(ci)_ stop release automation loops ([#49](https://github.com/bytehound-labs/opcda-bridge/pull/49))
 
 ### Other
 
@@ -25,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(ci)* stop release automation loops ([#49](https://github.com/bytehound-labs/opcda-bridge/pull/49))
+- _(ci)_ stop release automation loops ([#49](https://github.com/bytehound-labs/opcda-bridge/pull/49))
 
 ## [0.2.0](https://github.com/bytehound-labs/opcda-bridge/releases/tag/opcda-bridge-v0.2.0) - 2026-08-12
 

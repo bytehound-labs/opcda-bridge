@@ -89,7 +89,7 @@ pub enum Commands {
         /// Opaque session ID returned by browse
         session_id: String,
     },
-    /// Search the namespace with progressive results and progress events
+    /// Search the live namespace with progressive results and progress events
     Search {
         /// Literal query to match
         query: String,
@@ -113,6 +113,47 @@ pub enum Commands {
         /// Bypass cached namespace metadata
         #[arg(long)]
         refresh: bool,
+    },
+    /// Show persistent namespace-index status and build progress
+    IndexStatus {
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Search the persistent namespace index without live traversal
+    IndexSearch {
+        /// Literal query to match
+        query: String,
+        #[arg(long)]
+        server: Option<String>,
+        /// Match mode: exact, prefix, or contains
+        #[arg(long, value_enum, default_value_t = SearchMode::Contains)]
+        match_mode: SearchMode,
+        /// Maximum number of ranked matches
+        #[arg(long)]
+        max_results: Option<u32>,
+    },
+    /// Start or coalesce a persistent namespace-index refresh
+    IndexRefresh {
+        #[arg(long)]
+        server: Option<String>,
+        /// Ignore refresh age and retry backoff
+        #[arg(long)]
+        force: bool,
+    },
+    /// Pause an active persistent namespace-index build
+    IndexPause {
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Resume a paused persistent namespace-index build
+    IndexResume {
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Cancel an active persistent namespace-index build
+    IndexCancel {
+        #[arg(long)]
+        server: Option<String>,
     },
     /// Read tag values
     Read {
@@ -201,6 +242,62 @@ pub async fn run_command(
             )
             .await?
         }
+        Commands::IndexStatus { server } => {
+            let server = crate::config::resolve_server(server, config)?;
+            crate::commands::cmd_index_status(host, server, format).await?
+        }
+        Commands::IndexSearch {
+            query,
+            server,
+            match_mode,
+            max_results,
+        } => {
+            let server = crate::config::resolve_server(server, config)?;
+            let max_results = crate::config::resolve_index_search_max_results(max_results, config);
+            crate::commands::cmd_index_search(
+                host,
+                server,
+                query,
+                match_mode.into(),
+                max_results,
+                format,
+            )
+            .await?
+        }
+        Commands::IndexRefresh { server, force } => {
+            let server = crate::config::resolve_server(server, config)?;
+            crate::commands::cmd_index_refresh(host, server, force, format).await?
+        }
+        Commands::IndexPause { server } => {
+            let server = crate::config::resolve_server(server, config)?;
+            crate::commands::cmd_index_control(
+                host,
+                server,
+                opcda_bridge::SearchIndexControlAction::Pause,
+                format,
+            )
+            .await?
+        }
+        Commands::IndexResume { server } => {
+            let server = crate::config::resolve_server(server, config)?;
+            crate::commands::cmd_index_control(
+                host,
+                server,
+                opcda_bridge::SearchIndexControlAction::Resume,
+                format,
+            )
+            .await?
+        }
+        Commands::IndexCancel { server } => {
+            let server = crate::config::resolve_server(server, config)?;
+            crate::commands::cmd_index_control(
+                host,
+                server,
+                opcda_bridge::SearchIndexControlAction::Cancel,
+                format,
+            )
+            .await?
+        }
         Commands::Read { server, tags } => {
             let server = crate::config::resolve_server(server, config)?;
             crate::commands::cmd_read(host, server, tags, format).await?
@@ -263,6 +360,28 @@ mod tests {
                 max_results: Some(5),
                 include_branches: false,
                 refresh: false,
+            },
+            Commands::IndexStatus {
+                server: Some("S".into()),
+            },
+            Commands::IndexSearch {
+                query: "PV1".into(),
+                server: Some("S".into()),
+                match_mode: SearchMode::Contains,
+                max_results: Some(5),
+            },
+            Commands::IndexRefresh {
+                server: Some("S".into()),
+                force: true,
+            },
+            Commands::IndexPause {
+                server: Some("S".into()),
+            },
+            Commands::IndexResume {
+                server: Some("S".into()),
+            },
+            Commands::IndexCancel {
+                server: Some("S".into()),
             },
             Commands::Read {
                 server: Some("S".into()),
@@ -383,6 +502,37 @@ mod tests {
                 ..
             }
         ));
+
+        let args = Cli::try_parse_from([
+            "opcda-bridge",
+            "index-search",
+            "PV1",
+            "--server",
+            "S",
+            "--match-mode",
+            "exact",
+            "--max-results",
+            "50",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Commands::IndexSearch {
+                match_mode: SearchMode::Exact,
+                max_results: Some(50),
+                ..
+            }
+        ));
+
+        for command in [
+            "index-status",
+            "index-refresh",
+            "index-pause",
+            "index-resume",
+            "index-cancel",
+        ] {
+            Cli::try_parse_from(["opcda-bridge", command, "--server", "S"]).unwrap();
+        }
     }
 
     #[test]

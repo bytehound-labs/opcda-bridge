@@ -19,7 +19,7 @@
 # Default: localhost:7600
 host = "localhost:7600"
 
-# Default OPC DA server ProgID for capabilities/browse/search/read/write, used when --server
+# Default OPC DA server ProgID for capabilities/browse/search/index/read/write, used when --server
 # is omitted. Unlike the other keys, there is no built-in default — if
 # this is unset and --server is omitted, the command errors.
 # CLI flag: --server
@@ -39,6 +39,11 @@ browse_all_limit = 10000
 # CLI flag: search --max-results
 # Default: 200
 search_max_results = 200
+
+# Maximum matches returned by `index-search`.
+# CLI flag: index-search --max-results
+# Default: 50
+index_search_max_results = 50
 
 # Output format: "table" (human-readable, default) or "json" (pretty-printed,
 # for scripting/piping into jq). --json is shorthand for --output json.

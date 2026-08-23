@@ -475,8 +475,8 @@ fn operation_error(error: anyhow::Error) -> Status {
 mod tests {
     use super::*;
     use crate::opc::{
-        BrowseCapabilities, BrowseNodeKind, BrowsePage, BrowseSource, NamespaceOrganization,
-        OpcValue,
+        BrowseCapabilities, BrowseNodeKind, BrowsePage, BrowseSource, InventoryHandle,
+        NamespaceOrganization, OpcValue,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -560,6 +560,14 @@ mod tests {
                 return Err(anyhow::anyhow!("close failed"));
             }
             Ok(())
+        }
+
+        async fn start_inventory(
+            &self,
+            _server: &str,
+            _batch_size: u32,
+        ) -> anyhow::Result<InventoryHandle> {
+            Err(anyhow::anyhow!("inventory unused in browse tests"))
         }
 
         async fn read_tag_values(
