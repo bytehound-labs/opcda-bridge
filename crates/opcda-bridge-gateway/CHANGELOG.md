@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.2.2...opcda-bridge-gateway-v0.3.1) - 2026-08-23
+
+### Fixed
+
+- *(ci)* stop release automation loops ([#49](https://github.com/bytehound-labs/opcda-bridge/pull/49))
+
+### Other
+
+- *(opcda-bridge-gateway)* release v0.2.13 ([#47](https://github.com/bytehound-labs/opcda-bridge/pull/47))
+- *(opcda-bridge-gateway)* release v0.2.12 ([#46](https://github.com/bytehound-labs/opcda-bridge/pull/46))
+- *(opcda-bridge-gateway)* release v0.2.11 ([#45](https://github.com/bytehound-labs/opcda-bridge/pull/45))
+- *(opcda-bridge-gateway)* release v0.2.10 ([#44](https://github.com/bytehound-labs/opcda-bridge/pull/44))
+- *(opcda-bridge-gateway)* release v0.2.9 ([#43](https://github.com/bytehound-labs/opcda-bridge/pull/43))
+- *(opcda-bridge-gateway)* release v0.2.8 ([#42](https://github.com/bytehound-labs/opcda-bridge/pull/42))
+- *(opcda-bridge-gateway)* release v0.2.7 ([#41](https://github.com/bytehound-labs/opcda-bridge/pull/41))
+- *(opcda-bridge-gateway)* release v0.2.6 ([#40](https://github.com/bytehound-labs/opcda-bridge/pull/40))
+- *(opcda-bridge-gateway)* release v0.2.5 ([#39](https://github.com/bytehound-labs/opcda-bridge/pull/39))
+- *(opcda-bridge-gateway)* release v0.2.4 ([#38](https://github.com/bytehound-labs/opcda-bridge/pull/38))
+- *(opcda-bridge-gateway)* release v0.2.3 ([#37](https://github.com/bytehound-labs/opcda-bridge/pull/37))
+
 ### Fixed
 
 - Prevented release-plz from reprocessing its own release commits.
