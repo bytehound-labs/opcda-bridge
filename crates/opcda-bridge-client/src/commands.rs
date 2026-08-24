@@ -1363,6 +1363,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn indexed_search_status_renders_nonfailed_diagnostics_as_warnings() {
+        let status = IndexStatusOutput {
+            server: "S".into(),
+            state: "ready".into(),
+            configured: true,
+            active_generation: 1,
+            entry_count: 1,
+            unique_item_count: 1,
+            started_at: None,
+            completed_at: None,
+            last_error: Some("partial inventory".into()),
+            database_bytes: 1,
+            organization: "hierarchical".into(),
+            source: "da2".into(),
+            progress: None,
+        };
+
+        let table = output::render(index_status_rows(&status), OutputFormat::Table).unwrap();
+        assert!(table.contains("Last warning"));
+        assert!(table.contains("partial inventory"));
+    }
+
     fn typed_page() -> BrowsePage {
         BrowsePage {
             session_id: "session".into(),
