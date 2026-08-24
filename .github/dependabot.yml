@@ -6,6 +6,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Suppress routine version-update PRs; security updates remain enabled.
+    open-pull-requests-limit: 0
     groups:
       cargo-dependencies:
         patterns:
@@ -18,6 +20,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Suppress routine version-update PRs; security updates remain enabled.
+    open-pull-requests-limit: 0
     groups:
       github-actions:
         patterns:
