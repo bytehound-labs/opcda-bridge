@@ -192,6 +192,10 @@ opcda-bridge-client --host 192.168.1.50:7600 --json read --server Kepware.KepSer
 ]
 ```
 
+Read values are semantic strings. For an OPC DA `VT_BSTR`, the `value` field contains the exact
+BSTR contents: `AUT` is returned as `AUT`, an empty BSTR is empty, and quote characters are
+preserved only when they are part of the BSTR itself.
+
 `browse` emits a metadata object containing `session_id`, `nodes`, `next_page_token`, `complete`,
 `organization`, `source`, `warning`, and `pages`. Each node keeps its opaque `node_key`, local
 `display_name`, typed `kind`, and optional exact `item_id` separate. `search` emits newline-delimited

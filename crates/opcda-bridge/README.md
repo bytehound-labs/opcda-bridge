@@ -14,6 +14,9 @@ The library exposes typed capabilities, one-page browse sessions, explicit conti
 session close operations, progressive search events, and read/write methods. Browse pages are not
 automatically drained; callers that need bulk results must collect pages explicitly.
 
+`Client::read` returns semantic values. For an OPC DA `VT_BSTR`, `TagValue::value` contains the
+exact BSTR contents without added or removed quote characters.
+
 ```rust,no_run
 use opcda_bridge::{
     BrowsePageRequest, Client, SearchIndexRequest, SearchMatchMode, SearchRequest,

@@ -885,14 +885,36 @@ mod tests {
         assert_eq!(page.source, ProtoBrowseSource::Derived as i32);
         assert_eq!(page.warning.as_deref(), Some("partial"));
 
-        let values = map_to_proto_tag_values(vec![TagValue {
-            tag_id: "tag".into(),
-            value: "42".into(),
-            quality: "good".into(),
-            timestamp: "now".into(),
-        }]);
-        assert_eq!(values[0].tag_id, "tag");
-        assert_eq!(values[0].value, "42");
+        let values = map_to_proto_tag_values(
+            [
+                ("aut", "AUT"),
+                ("empty", ""),
+                ("embedded", "A\"B"),
+                ("literal-quotes", "\"AUT\""),
+            ]
+            .into_iter()
+            .map(|(tag_id, value)| TagValue {
+                tag_id: tag_id.into(),
+                value: value.into(),
+                quality: "good".into(),
+                timestamp: "now".into(),
+            })
+            .collect(),
+        );
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.tag_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aut", "empty", "embedded", "literal-quotes"]
+        );
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AUT", "", "A\"B", "\"AUT\""]
+        );
         assert_eq!(values[0].quality, "good");
         assert_eq!(values[0].timestamp, "now");
 
@@ -1687,6 +1709,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(read.values[0].tag_id, "tag");
+        assert_eq!(read.values[0].value, "value");
 
         for typed_value in [
             ProtoTypedValue::StringValue("text".into()),

@@ -232,6 +232,8 @@ message ReadResponse {
 
 message TagValue {
   string tag_id = 1;
+  // Semantic textual value. For an OPC DA VT_BSTR, this is the exact BSTR
+  // content; quote characters are data only when they are present in the BSTR.
   string value = 2;
   string quality = 3;
   string timestamp = 4;

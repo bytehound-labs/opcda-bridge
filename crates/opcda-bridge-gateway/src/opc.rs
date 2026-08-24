@@ -114,6 +114,10 @@ pub struct InventoryHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagValue {
     pub tag_id: String,
+    /// The exact semantic value returned by OPC DA.
+    ///
+    /// For a `VT_BSTR`, quote characters are preserved exactly as returned by
+    /// the server; the gateway does not add display framing.
     pub value: String,
     pub quality: String,
     pub timestamp: String,

@@ -9,6 +9,9 @@ Install it with Cargo:
 cargo install opcda-bridge-client
 ```
 
+Read output contains semantic values. An OPC DA `VT_BSTR` is returned exactly as supplied by the
+server, so a BSTR containing `AUT` produces `"value": "AUT"` rather than a display-quoted value.
+
 Browse one bounded page of immediate children:
 
 ```sh
