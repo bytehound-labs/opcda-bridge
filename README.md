@@ -292,6 +292,15 @@ The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (
 `%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows. Maintenance-window entries are local
 24-hour ranges such as `22:00-06:00`; when configured, indexing is deferred outside those ranges.
 
+Run only one gateway process with a given index database path. A gateway automatically loads
+`opcda-bridge-gateway.toml` next to its executable, so launching a second copy from the same
+directory can otherwise start a second inventory against the same SQLite file. When multiple
+gateway instances are intentional, give each instance an explicit, different
+`index.database_path` and configure indexing on only the instance that should build that
+server's index. An active build also creates a sibling `.build.lock` file; it is removed when
+the build exits cleanly. If a process was terminated forcibly, inspect the lock contents and
+remove the stale lock only after confirming that no gateway is still using that database.
+
 ### Client
 
 Looks for a config file in a platform-specific location unless `--config` gives another path:

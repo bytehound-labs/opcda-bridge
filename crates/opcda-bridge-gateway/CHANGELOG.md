@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- preserve active index status while an obsolete runtime error is still present
+- report exact index database operations and build lifecycle context in gateway logs
+- avoid quarantining the index database for ordinary operational errors such as lock contention
+- prevent multiple gateway processes from building the same index database concurrently
+
 ## [0.4.0](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.3.2...opcda-bridge-gateway-v0.4.0) - 2026-08-23
 
 ### Added

@@ -44,7 +44,9 @@ rotation = "daily"
 #   Linux/macOS: $XDG_DATA_HOME/opcda-bridge/index.sqlite3
 #                (falls back to $HOME/.local/share/opcda-bridge/index.sqlite3)
 #   Windows:     %PROGRAMDATA%\opcda-bridge\index.sqlite3
-# database_path = "opcda-bridge-index.sqlite3"
+# Use a different path for every gateway process that may run on this host.
+# Each active build also creates a sibling ".build.lock" file.
+# database_path = "C:\\ProgramData\\opcda-bridge\\index.sqlite3"
 
 # Only these OPC DA server ProgIDs are eligible for automatic indexing.
 # A server must be listed here for status, manual operations, or automatic
