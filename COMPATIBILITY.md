@@ -39,6 +39,7 @@ reported as `unverified`, not rejected. Optional features may be
 | paged | - | indexed | - | contract-boundary-tested | A 0.3.2 client reads, writes, and browses through the current gateway. |
 | indexed | 0.4.0 | indexed | 0.4.3 | exact-pair-tested | The 0.4.0 indexed client reaches the current indexed gateway contract. |
 | indexed | 0.4.3 | indexed | 0.4.3 | exact-pair-tested | The current client and gateway are exercised together. |
+| indexed | - | indexed | - | contract-boundary-tested | The current indexed client and gateway are exercised together on every compatibility workflow run. |
 
 An intentional wire-contract break creates a new protocol boundary.
 The affected protocol crate, reusable library, client, and gateway

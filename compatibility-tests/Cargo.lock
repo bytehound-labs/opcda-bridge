@@ -162,9 +162,9 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bytehound-opc-da-client"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4436c429d6d4a8a55587042d3c63b9befbae2c70884653cd5e33aa6935791f72"
+checksum = "3fad9f885b7b06aa5faa73f128b58445b6e6c68f6d3f380310c0ecebbc78543c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -747,7 +747,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e084c362f4cb9c6e93cf0e7f950c601e1fc4098d2eee75b676d42f03307d3173"
 dependencies = [
- "opcda-bridge-proto 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "opcda-bridge-proto 0.4.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
  "tonic",
  "tonic-prost",
@@ -755,9 +755,9 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
- "opcda-bridge-proto 0.4.3",
+ "opcda-bridge-proto 0.4.4",
  "serde",
  "thiserror",
  "tonic",
@@ -772,11 +772,11 @@ dependencies = [
  "async-trait",
  "opcda-bridge 0.3.2",
  "opcda-bridge 0.4.0",
- "opcda-bridge 0.4.3",
+ "opcda-bridge 0.4.4",
  "opcda-bridge-gateway 0.3.2",
- "opcda-bridge-gateway 0.4.3",
+ "opcda-bridge-gateway 0.4.4",
  "opcda-bridge-proto 0.3.2",
- "opcda-bridge-proto 0.4.3",
+ "opcda-bridge-proto 0.4.4",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -809,14 +809,14 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytehound-opc-da-client",
  "chrono",
  "clap",
- "opcda-bridge-proto 0.4.3",
+ "opcda-bridge-proto 0.4.4",
  "rusqlite",
  "serde",
  "serde_json",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "prost",
  "toml",
@@ -857,11 +857,12 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcab52b65265518a33aaa4fdbef4048c0f891b1fd9a08462372cb34ef497117f"
+checksum = "ca809d8bd46ee8e6c0b11dbd3de11c3e02a5aeec4a08d2e4ce0f905d27215ede"
 dependencies = [
  "prost",
+ "toml",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

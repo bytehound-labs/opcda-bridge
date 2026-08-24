@@ -63,3 +63,9 @@ client_version = "0.4.3"
 gateway_version = "0.4.3"
 status = "exact-pair-tested"
 notes = "The current client and gateway are exercised together."
+
+[[evidence]]
+client_line = "indexed"
+gateway_line = "indexed"
+status = "contract-boundary-tested"
+notes = "The current indexed client and gateway are exercised together on every compatibility workflow run."

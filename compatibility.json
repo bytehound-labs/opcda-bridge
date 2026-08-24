@@ -28,6 +28,12 @@
       "gateway_version": "0.4.3",
       "notes": "The current client and gateway are exercised together.",
       "status": "exact-pair-tested"
+    },
+    {
+      "client_line": "indexed",
+      "gateway_line": "indexed",
+      "notes": "The current indexed client and gateway are exercised together on every compatibility workflow run.",
+      "status": "contract-boundary-tested"
     }
   ],
   "protocol": {

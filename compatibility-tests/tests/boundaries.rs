@@ -344,18 +344,15 @@ async fn indexed_client_reaches_current_index_contract() {
 }
 
 #[tokio::test]
-async fn current_client_and_gateway_are_exact_pair_tested() {
+async fn current_client_and_gateway_are_contract_boundary_tested() {
     let (host, shutdown, _tempdir) = start_current_gateway().await;
     let mut client = current_client::Client::connect(&host).await.unwrap();
 
-    let report = client
-        .compatibility_with_client_version(None, "0.4.3")
-        .await
-        .unwrap();
+    let report = client.compatibility(None).await.unwrap();
     assert_eq!(report.status, current_client::CompatibilityStatus::Full);
     assert_eq!(
         report.evidence,
-        current_client::CompatibilityEvidence::ExactPairTested
+        current_client::CompatibilityEvidence::ContractBoundaryTested
     );
 
     shutdown.send(()).unwrap();
