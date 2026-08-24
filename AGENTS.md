@@ -101,7 +101,9 @@ the `OpcClient` trait use a mock implementation so they run on all platforms.
 The cross-version workflow exercises published 0.3.2 and 0.4.0 boundary clients against current
 and historical gateway services backed by mock `OpcClient` implementations. An exact package pair
 does not need prior CI evidence when its negotiated protocol ranges overlap, but the CLI reports
-such pairings as `unverified`.
+such pairings as `unverified`. Release-plz pull requests regenerate the isolated test workspace's
+lockfile before running the same locked test command because path package versions change in the
+release branch.
 
 An intentional Protobuf break requires the `breaking-protobuf` label, a new or changed catalog
 boundary, updated evidence, and regenerated compatibility reports. Release-integrity validation

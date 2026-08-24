@@ -44,6 +44,8 @@ Example: `feat(gateway): add tag subscription support`.
   note manual verification steps in the PR description when a change needs them.
 - Cross-version protocol checks run from the isolated `compatibility-tests/` workspace:
   `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`.
+  Release-plz pull requests regenerate that workspace's lockfile first because their path
+  dependencies carry the release PR's bumped package versions.
 
 ## CI
 

@@ -72,6 +72,10 @@ jobs:
       - name: Check generated compatibility reports
         run: python3 scripts/generate-compatibility-report.py --check
 
+      - name: Refresh lockfile for release PR
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')
+        run: cargo generate-lockfile --manifest-path compatibility-tests/Cargo.toml
+
       - name: Run cross-version boundary tests
         run: cargo test --manifest-path compatibility-tests/Cargo.toml --locked
 
