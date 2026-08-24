@@ -332,9 +332,11 @@ for every available key.
 ## Logging
 
 The gateway writes structured logs to a rolling file next to its executable — by default
-`logs/opcda-bridge-gateway.log.<date>` — through a non-blocking writer, so logging never adds
-latency to request handling. When a console is attached (running interactively, as opposed to
-under a background/service process), the same log lines are also printed to stdout.
+`logs/opcda-bridge-gateway.<date>.log` — through a non-blocking writer, so logging never adds
+latency to request handling. Daily rotation uses `YYYY-MM-DD`, hourly rotation uses
+`YYYY-MM-DD-HH`, and `never` uses `logs/opcda-bridge-gateway.log`. When a console is attached
+(running interactively, as opposed to under a background/service process), the same log lines
+are also printed to stdout.
 
 | Setting      | CLI flag         | Env var    | Config key     | Default                       |
 | ------------ | ---------------- | ---------- | -------------- | ----------------------------- |

@@ -98,6 +98,14 @@ pub fn init_tracing(settings: &LogSettings) -> anyhow::Result<WorkerGuard> {
     init_tracing_with_stdout(settings, std::io::stdout().is_terminal())
 }
 
+fn build_file_appender(settings: &LogSettings) -> anyhow::Result<RollingFileAppender> {
+    Ok(RollingFileAppender::builder()
+        .rotation(settings.rotation.clone())
+        .filename_prefix("opcda-bridge-gateway")
+        .filename_suffix("log")
+        .build(&settings.dir)?)
+}
+
 /// Same as [`init_tracing`], but with "is a console attached" passed in
 /// explicitly rather than detected, so tests can exercise both the
 /// stdout-attached and stdout-detached layer wiring deterministically.
@@ -110,11 +118,7 @@ fn init_tracing_with_stdout(
     use tracing_subscriber::util::SubscriberInitExt;
 
     std::fs::create_dir_all(&settings.dir)?;
-    let file_appender = RollingFileAppender::new(
-        settings.rotation.clone(),
-        &settings.dir,
-        "opcda-bridge-gateway.log",
-    );
+    let file_appender = build_file_appender(settings)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     let filter = build_env_filter(settings.level.as_deref());
 
@@ -277,6 +281,59 @@ mod tests {
         assert_eq!(settings.dir, PathBuf::from("/default/dir"));
         assert_eq!(settings.format, LogFormat::Pretty);
         assert_eq!(settings.rotation, Rotation::DAILY);
+    }
+
+    fn created_log_filename(rotation: Rotation) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = LogSettings {
+            level: None,
+            dir: dir.path().to_path_buf(),
+            format: LogFormat::Pretty,
+            rotation,
+        };
+        let _appender = build_file_appender(&settings).unwrap();
+        let filenames = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(filenames.len(), 1);
+        filenames.into_iter().next().unwrap()
+    }
+
+    fn assert_dated_log_filename(filename: &str, date_length: usize, separators: &[usize]) {
+        let date = filename
+            .strip_prefix("opcda-bridge-gateway.")
+            .unwrap()
+            .strip_suffix(".log")
+            .unwrap();
+        assert_eq!(date.len(), date_length);
+        assert!(date.bytes().enumerate().all(|(index, byte)| {
+            if separators.contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit()
+            }
+        }));
+    }
+
+    #[test]
+    fn test_file_appender_daily_filename() {
+        let filename = created_log_filename(Rotation::DAILY);
+        assert_dated_log_filename(&filename, 10, &[4, 7]);
+    }
+
+    #[test]
+    fn test_file_appender_hourly_filename() {
+        let filename = created_log_filename(Rotation::HOURLY);
+        assert_dated_log_filename(&filename, 13, &[4, 7, 10]);
+    }
+
+    #[test]
+    fn test_file_appender_never_filename() {
+        assert_eq!(
+            created_log_filename(Rotation::NEVER),
+            "opcda-bridge-gateway.log"
+        );
     }
 
     // `tracing_subscriber`'s global subscriber can only be installed once
