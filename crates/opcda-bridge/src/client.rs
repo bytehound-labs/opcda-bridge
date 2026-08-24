@@ -706,20 +706,28 @@ mod tests {
     async fn read_maps_data_and_errors() {
         let host = start_mock_server(MockBridgeService {
             read_response: ReadResponse {
-                values: vec![ProtoTagValue {
-                    tag_id: "t1".into(),
-                    value: "42".into(),
-                    quality: "Good".into(),
-                    timestamp: "now".into(),
-                }],
+                values: ["AUT", "", "A\"B", "\"AUT\""]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| ProtoTagValue {
+                        tag_id: format!("t{index}"),
+                        value: value.into(),
+                        quality: "Good".into(),
+                        timestamp: "now".into(),
+                    })
+                    .collect(),
             },
             ..Default::default()
         })
         .await;
         let mut client = Client::connect(&host).await.unwrap();
+        let values = client.read("S".into(), vec![]).await.unwrap();
         assert_eq!(
-            client.read("S".into(), vec![]).await.unwrap()[0].value,
-            "42"
+            values
+                .iter()
+                .map(|value| value.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AUT", "", "A\"B", "\"AUT\""]
         );
 
         let host = start_mock_server(MockBridgeService {

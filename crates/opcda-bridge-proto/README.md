@@ -15,3 +15,6 @@ separate progressive streaming operation. Persistent indexed discovery uses unar
 `GetSearchIndexStatus`, `RefreshSearchIndex`, `ControlSearchIndex`, and `SearchIndex` operations.
 Indexed matches contain exact ItemIDs and breadcrumb labels but never session-bound browse node
 keys.
+
+The `TagValue.value` field is semantic text. For OPC DA `VT_BSTR` values, it contains the exact
+BSTR contents; quote characters are data only when present in the BSTR itself.

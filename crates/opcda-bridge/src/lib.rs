@@ -11,6 +11,9 @@
 //! reads/writes/browses without shelling out to the CLI binary and parsing
 //! its output can depend on this crate directly instead.
 //!
+//! Read results contain semantic values: an OPC DA `VT_BSTR` is returned with
+//! its exact contents, without display quote framing.
+//!
 //! ```no_run
 //! use opcda_bridge::{
 //!     BrowsePageRequest, SearchIndexRequest, SearchMatchMode, SearchRequest,

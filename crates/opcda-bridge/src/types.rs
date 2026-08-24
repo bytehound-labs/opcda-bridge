@@ -383,7 +383,10 @@ pub enum SearchEvent {
     Completed(SearchCompleted),
 }
 
-/// A single tag's value returned by [`crate::Client::read`].
+/// A single tag's semantic value returned by [`crate::Client::read`].
+///
+/// For an OPC DA `VT_BSTR`, `value` contains the exact BSTR contents. The
+/// bridge does not add or remove quote characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagValue {
     pub tag_id: String,
