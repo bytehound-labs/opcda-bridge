@@ -258,6 +258,12 @@ page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.sea
 - **Published distribution**: `opcda-bridge` is consumed from crates.io with a normal SemVer
   dependency (`opcda-bridge = "0.4"`). Git dependencies are not part of the supported consumer
   path.
+- **OPC DA client publication**: Publish `bytehound-opc-da-client` through
+  `.github/workflows/publish-opcda-client.yml` from an authenticated GitHub CLI session rather
+  than requiring local Cargo registry credentials. Pass the exact upstream `opc-cli` ref and run
+  the workflow with `dry_run=true` first; after it succeeds, rerun with `dry_run=false`. The
+  Windows workflow supplies the repository's `CARGO_REGISTRY_TOKEN` secret only to the publishing
+  step. Never paste or print that token.
 - **Release automation**: release-plz runs separate release-PR and publish jobs and publishes only
   after a merged release PR. The `release_commits` allowlist excludes both scoped and unscoped
   release-plz commit forms; the required `release-integrity` check rejects release PRs containing
