@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.1...opcda-bridge-gateway-v0.4.2) - 2026-08-24
+
+### Fixed
+
+- validate DA2 branches before indexing ([#67](https://github.com/bytehound-labs/opcda-bridge/pull/67))
+
+### Other
+
+- publish OPC DA client dependency ([#65](https://github.com/bytehound-labs/opcda-bridge/pull/65))
+
 ### Fixed
 
 - preserve active index status while an obsolete runtime error is still present
