@@ -590,7 +590,18 @@ impl IndexDb {
         server: &str,
         generation: u64,
         completed_at: &str,
+        progress: &InventoryProgress,
+    ) -> anyhow::Result<()> {
+        self.promote_with_warning(server, generation, completed_at, progress, None)
+    }
+
+    fn promote_with_warning(
+        &mut self,
+        server: &str,
+        generation: u64,
+        completed_at: &str,
         _progress: &InventoryProgress,
+        warning: Option<&str>,
     ) -> anyhow::Result<()> {
         let (entry_count, unique_item_count) = self.connection.query_row(
             "SELECT COUNT(*), COUNT(DISTINCT item_id)
@@ -610,12 +621,13 @@ impl IndexDb {
         let promoted = transaction.execute(
             "UPDATE generations
              SET state = 'active', completed_at = ?1,
-                 entry_count = ?2, unique_item_count = ?3, last_error = NULL
-             WHERE server = ?4 AND generation = ?5 AND state = 'staging'",
+                 entry_count = ?2, unique_item_count = ?3, last_error = ?4
+             WHERE server = ?5 AND generation = ?6 AND state = 'staging'",
             params![
                 completed_at,
                 entry_count,
                 unique_item_count,
+                warning,
                 server,
                 generation as i64
             ],
@@ -1473,6 +1485,7 @@ impl<C: OpcClient> IndexManager<C> {
         let mut completed = false;
         let mut cancelled = false;
         let mut failed = None;
+        let mut completion_warning = None;
         let mut terminal = false;
         let mut accounted_active_time_ms = 0_u64;
         let mut rate_limiter =
@@ -1555,6 +1568,8 @@ impl<C: OpcClient> IndexManager<C> {
                                 .warning
                                 .unwrap_or_else(|| "inventory was truncated".to_string()),
                         );
+                    } else {
+                        completion_warning = result.warning;
                     }
                     break;
                 }
@@ -1580,12 +1595,30 @@ impl<C: OpcClient> IndexManager<C> {
             self.finish_build(&server, Some(error));
         } else if completed && !cancelled && !handle.control.is_cancelled() {
             let result = self.with_database(|db| {
-                db.promote(&server, generation, &timestamp_now(), &last_progress)
+                let completed_at = timestamp_now();
+                match completion_warning.as_deref() {
+                    Some(warning) => db.promote_with_warning(
+                        &server,
+                        generation,
+                        &completed_at,
+                        &last_progress,
+                        Some(warning),
+                    ),
+                    None => db.promote(&server, generation, &completed_at, &last_progress),
+                }
             });
             match result {
                 Ok(()) => {
                     if let Ok(mut cache) = self.cache.lock() {
                         cache.clear_server(&server);
+                    }
+                    if let Some(warning) = completion_warning {
+                        tracing::warn!(
+                            server = %server,
+                            generation,
+                            warning = %warning,
+                            "namespace index completed with warning"
+                        );
                     }
                     self.finish_build(&server, None);
                 }
@@ -3159,6 +3192,53 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn completed_inventory_warning_keeps_generation_active_and_searchable() {
+        let directory = tempdir().unwrap();
+        let warning = "skipped 1 DA2 branch name(s) rejected by the server";
+        let client = Arc::new(LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::from([
+                    Ok(InventoryEvent::Entry(inventory_entry("Tag", "S.Tag"))),
+                    Ok(InventoryEvent::Completed(InventoryCompleted {
+                        complete: true,
+                        cancelled: false,
+                        truncated: false,
+                        warning: Some(warning.into()),
+                        organization: NamespaceOrganization::Hierarchical,
+                        source: BrowseSource::Da2,
+                    })),
+                ]),
+                Arc::new(RecordingInventoryControl::default()),
+            ))],
+            vec![],
+        ));
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("index.sqlite3")),
+        ));
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Ready).await;
+
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::Ready);
+        assert_eq!(status.active_generation, 1);
+        assert_eq!(status.last_error.as_deref(), Some(warning));
+        assert_eq!(
+            manager
+                .search("S", "tag", 3, 10)
+                .await
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+        let rows = manager.with_database(|db| db.status_rows("S")).unwrap();
+        assert_eq!(rows[0].state, "active");
+        assert_eq!(rows[0].last_error.as_deref(), Some(warning));
     }
 
     #[tokio::test]

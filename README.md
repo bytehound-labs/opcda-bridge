@@ -146,7 +146,9 @@ config file — see [Configuration](#configuration) below.
   ```
   Operators can use `index-pause`, `index-resume`, and `index-cancel` for an active build.
   Refreshes run asynchronously, and responses distinguish `not-indexed`, `partial`, `ready`,
-  `stale`, `refreshing`, and `failed` states. A no-match response is authoritative only for a
+  `stale`, `refreshing`, and `failed` states. A completed inventory may also carry a non-fatal
+  warning while remaining `ready`; clients display that diagnostic as a warning rather than
+  treating the active generation as failed. A no-match response is authoritative only for a
   complete index.
 - Release a browse session before its gateway-side expiry:
 
