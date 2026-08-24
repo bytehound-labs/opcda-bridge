@@ -150,6 +150,9 @@ config file — see [Configuration](#configuration) below.
   warning while remaining `ready`; clients display that diagnostic as a warning rather than
   treating the active generation as failed. A no-match response is authoritative only for a
   complete index.
+  DA2 hierarchical inventory validates every server-reported branch before queueing it.
+  Branch-only names rejected by native navigation with `E_INVALIDARG` are skipped and included in
+  the completion warning, while names that resolve to exact items remain selectable.
 - Release a browse session before its gateway-side expiry:
 
   ```sh
