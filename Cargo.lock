@@ -777,7 +777,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opcda-bridge"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "opcda-bridge-proto",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-client"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "prost",
  "toml",
