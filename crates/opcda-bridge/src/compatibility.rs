@@ -772,7 +772,7 @@ mod tests {
             CompatibilityEvidence::ContractBoundaryTested
         );
         assert_eq!(
-            catalog_evidence(Some("0.4.3"), Some("0.4.2")),
+            catalog_evidence(Some("0.3.1"), Some("0.3.1")),
             CompatibilityEvidence::Unverified
         );
         assert_eq!(
