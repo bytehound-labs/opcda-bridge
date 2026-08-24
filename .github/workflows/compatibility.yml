@@ -72,9 +72,19 @@ jobs:
       - name: Check generated compatibility reports
         run: python3 scripts/generate-compatibility-report.py --check
 
-      - name: Refresh lockfile for release PR
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')
-        run: cargo generate-lockfile --manifest-path compatibility-tests/Cargo.toml
+      - name: Refresh lockfile when package manifests changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] \
+            || [[ ! -f compatibility-tests/Cargo.lock ]] \
+            || { [[ -n "$BASE_SHA" ]] \
+              && ! git diff --quiet "$BASE_SHA" HEAD -- 'Cargo.toml' '*/Cargo.toml'; }; then
+            cargo generate-lockfile --manifest-path compatibility-tests/Cargo.toml
+          else
+            echo "Compatibility test package manifests are unchanged; keeping the locked fixture."
+          fi
 
       - name: Run cross-version boundary tests
         run: cargo test --manifest-path compatibility-tests/Cargo.toml --locked
