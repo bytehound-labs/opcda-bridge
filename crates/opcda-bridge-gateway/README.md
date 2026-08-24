@@ -30,6 +30,10 @@ Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway for
 BSTR contents without adding display quote characters; quotes remain only when present in the
 server value.
 
+Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
+BSTR contents without adding display quote characters; quotes remain only when present in the
+server value.
+
 Configure the index in the gateway TOML file under `[index]`. Automatic indexing is restricted to
 the explicit `servers` allow-list and uses a service-writable SQLite database, conservative
 batch/rate/duty-cycle defaults, a two-second foreground quiet period, and one build at a time.

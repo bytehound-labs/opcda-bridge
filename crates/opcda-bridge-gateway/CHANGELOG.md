@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid quarantining the index database for ordinary operational errors such as lock contention
 - prevent multiple gateway processes from building the same index database concurrently
 
+## [0.4.1](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.0...opcda-bridge-gateway-v0.4.1) - 2026-08-24
+
+### Fixed
+
+- preserve raw OPC DA BSTR values
+
 ## [0.4.0](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.3.2...opcda-bridge-gateway-v0.4.0) - 2026-08-23
 
 ### Added
