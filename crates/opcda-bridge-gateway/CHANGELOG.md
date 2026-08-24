@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - keep namespace index activation responsive by promoting generation metadata atomically and
   reclaiming obsolete generations in bounded background cleanup batches
-- preserve searchable active generations after restart while interrupted staging generations are
-  retained as failed metadata for background cleanup
+- preserve searchable active generations after restart while interrupted refresh data is
+  superseded for background cleanup without reporting the durable snapshot as failed
 - marshal required DA3 root and filter strings correctly, with a narrowly scoped DA2 fallback for
   compatible servers that reject the first DA3 root browse
 - persist activated counts from committed index rows instead of relying on the final progress event

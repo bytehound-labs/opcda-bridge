@@ -202,10 +202,12 @@ config file — see [Configuration](#configuration) below.
   Active generations remain durable across restarts. Activation is an atomic metadata transition,
   while superseded and abandoned data is reclaimed in bounded background batches, so indexing
   maintenance does not interrupt indexed search or status requests. Transient cleanup failures
-  are retried with bounded backoff, and older failed generations do not make a newer active
-  generation appear failed. If relational index rows and the full-text index disagree after an
-  interrupted legacy startup repair, the rebuildable cache is quarantined rather than serving
-  silently incomplete substring results.
+  are retried with bounded backoff. A refresh interrupted by restart is superseded when a complete
+  active generation remains available, so the durable snapshot stays ready while cleanup runs;
+  interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
+  generations do not make a newer active generation appear failed. If relational index rows and
+  the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache
+  is quarantined rather than serving silently incomplete substring results.
   DA3 root ItemIDs and unused filters are marshalled as required non-null empty strings. If the
   first DA3 root browse still returns `RPC_X_NULL_REF_POINTER` or `E_NOTIMPL`, a server that also
   supports DA2 continues through DA2 with an explicit compatibility warning. The persisted

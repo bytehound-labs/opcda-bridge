@@ -575,13 +575,21 @@ impl IndexDb {
             anyhow::bail!("namespace index relational and full-text data are inconsistent");
         }
         connection.execute(
-            "UPDATE generations
-             SET state = 'failed',
+            "UPDATE generations AS interrupted
+             SET state = CASE
+                     WHEN EXISTS (
+                         SELECT 1 FROM generations AS active
+                         WHERE active.server = interrupted.server
+                           AND active.state = 'active'
+                     )
+                     THEN 'superseded'
+                     ELSE 'failed'
+                 END,
                  last_error = COALESCE(
                      last_error,
                      'namespace index build interrupted by gateway restart'
                  )
-             WHERE state = 'staging'",
+             WHERE interrupted.state = 'staging'",
             [],
         )?;
         Ok(Self {
@@ -2979,7 +2987,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_open_quarantines_invalid_schema_and_marks_interrupted_builds_failed() {
+    fn sqlite_open_quarantines_invalid_schema_and_recovers_interrupted_builds() {
         let directory = tempdir().unwrap();
         let memory = IndexDb::open(Path::new(":memory:")).unwrap();
         assert_eq!(memory.database_bytes(), 0);
@@ -3092,12 +3100,32 @@ mod tests {
 
         let reopened = IndexDb::open(&interrupted_path).unwrap();
         let rows = reopened.status_rows("S").unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, "active");
         assert_eq!(rows[0].generation, active);
-        assert_eq!(rows[1].state, "failed");
         assert_eq!(
-            rows[1].last_error.as_deref(),
+            reopened
+                .connection
+                .query_row(
+                    "SELECT state FROM generations
+                     WHERE server = 'S' AND generation = ?1",
+                    [generation as i64],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT last_error FROM generations
+                     WHERE server = 'S' AND generation = ?1",
+                    [generation as i64],
+                    |row| row.get::<_, Option<String>>(0)
+                )
+                .unwrap()
+                .as_deref(),
             Some("namespace index build interrupted by gateway restart")
         );
         assert_eq!(reopened.search_generation("S").unwrap(), Some(active));
@@ -3127,6 +3155,74 @@ mod tests {
                 .unwrap(),
             1
         );
+
+        let initial_path = directory.path().join("interrupted-initial.sqlite3");
+        let mut initial = IndexDb::open(&initial_path).unwrap();
+        let initial_generation = initial
+            .start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                "1",
+            )
+            .unwrap();
+        initial
+            .insert_entries(
+                "S",
+                initial_generation,
+                &[inventory_entry("Interrupted", "S.Tag")],
+            )
+            .unwrap();
+        drop(initial);
+
+        let reopened_initial = IndexDb::open(&initial_path).unwrap();
+        let initial_rows = reopened_initial.status_rows("S").unwrap();
+        assert_eq!(initial_rows.len(), 1);
+        assert_eq!(initial_rows[0].state, "failed");
+        assert_eq!(
+            initial_rows[0].last_error.as_deref(),
+            Some("namespace index build interrupted by gateway restart")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_during_refresh_keeps_active_status_ready() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("restart-status.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let active = db
+            .start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                &timestamp_now(),
+            )
+            .unwrap();
+        db.insert_entries("S", active, &[inventory_entry("Active", "S.Active")])
+            .unwrap();
+        db.promote("S", active, &timestamp_now(), &completed_progress(1))
+            .unwrap();
+        let interrupted = db
+            .start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                &timestamp_now(),
+            )
+            .unwrap();
+        db.insert_entries(
+            "S",
+            interrupted,
+            &[inventory_entry("Interrupted", "S.Interrupted")],
+        )
+        .unwrap();
+        drop(db);
+
+        let manager = IndexManager::new(Arc::new(MockOpcClient::default()), settings(path));
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::Ready);
+        assert_eq!(status.active_generation, active);
+        assert!(status.last_error.is_none());
     }
 
     #[test]

@@ -40,8 +40,9 @@ is reported as a warning unless the index state is `failed`.
 Completed active generations are durable across gateway restarts. Activation is a short atomic
 metadata transition, so search and status remain responsive while a refresh becomes active.
 Superseded and abandoned data is reclaimed in bounded background batches through a separate
-SQLite WAL connection; an interrupted staging generation is retained as failed metadata until
-that cleanup can run, without rebuilding the active full-text index at startup.
+SQLite WAL connection. An interrupted refresh is superseded when a complete active generation
+remains available, so status and search continue to use that snapshot while cleanup runs.
+An interrupted initial build remains failed and visible because no complete snapshot can replace it.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the
