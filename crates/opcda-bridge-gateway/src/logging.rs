@@ -3,7 +3,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
 
-/// Log output format.
+/// Log output format used by the gateway's file and console layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
     /// Human-readable, ANSI-free (log files aren't a terminal).
