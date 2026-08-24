@@ -1,6 +1,6 @@
 [package]
 name = "opcda-bridge"
-version = "0.4.3"
+version = "0.4.4"
 edition.workspace = true
 rust-version.workspace = true
 description = "Reusable async Rust client library for the opcda-bridge gateway's gRPC API"

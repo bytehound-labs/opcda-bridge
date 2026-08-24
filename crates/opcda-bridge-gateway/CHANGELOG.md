@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.3...opcda-bridge-gateway-v0.4.4) - 2026-08-24
+
+### Added
+
+- add client gateway compatibility discovery
+
+### Other
+
+- enable independent crate versions
+
 ## [0.4.3](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.2...opcda-bridge-gateway-v0.4.3) - 2026-08-24
 
 ### Fixed
