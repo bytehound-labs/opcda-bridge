@@ -1,10 +1,12 @@
 use crate::output::{self, OutputFormat};
 use opcda_bridge::{
-    BrowseNode, BrowsePage, BrowsePageRequest, Capabilities, Client, IndexedSearchProgress,
-    SearchEvent, SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse,
-    SearchIndexStatus, SearchMatchMode, SearchRequest, parse_value,
+    BrowseNode, BrowsePage, BrowsePageRequest, Capabilities, Client, CompatibilityFeature,
+    CompatibilityReport, FeatureCompatibilityStatus, IndexedSearchProgress, SearchEvent,
+    SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse, SearchIndexStatus,
+    SearchMatchMode, SearchRequest, parse_value,
 };
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::io::Write;
 use tabled::Tabled;
 use tabled::derive::display;
@@ -13,6 +15,133 @@ use tabled::derive::display;
 struct ServerRow {
     #[tabled(rename = "Servers")]
     name: String,
+}
+
+#[derive(Tabled, Serialize)]
+struct CompatibilityRow {
+    #[tabled(rename = "Client")]
+    client_version: String,
+    #[tabled(rename = "Library")]
+    library_version: String,
+    #[tabled(rename = "Gateway")]
+    gateway_version: String,
+    #[tabled(rename = "Source")]
+    source: String,
+    #[tabled(rename = "Overall")]
+    status: String,
+    #[tabled(rename = "Evidence")]
+    evidence: String,
+    #[tabled(rename = "Feature")]
+    feature: String,
+    #[tabled(rename = "Feature Status")]
+    feature_status: String,
+    #[tabled(rename = "Client Versions")]
+    client_versions: String,
+    #[tabled(rename = "Gateway Versions")]
+    gateway_versions: String,
+    #[tabled(rename = "Negotiated")]
+    negotiated_version: String,
+    #[tabled(rename = "Reason")]
+    reason: String,
+}
+
+fn version_range(range: Option<opcda_bridge::ProtocolVersionRange>) -> String {
+    match range {
+        Some(range) if range.min == range.max => range.min.to_string(),
+        Some(range) => format!("{}-{}", range.min, range.max),
+        None => "unknown".into(),
+    }
+}
+
+fn render_compatibility(
+    report: &CompatibilityReport,
+    format: OutputFormat,
+) -> anyhow::Result<String> {
+    if format == OutputFormat::Json {
+        return Ok(serde_json::to_string_pretty(report)?);
+    }
+
+    let rows = if report.features.is_empty() {
+        vec![CompatibilityRow {
+            client_version: report.client_version.clone(),
+            library_version: report.library_version.clone(),
+            gateway_version: report
+                .gateway_version
+                .as_deref()
+                .unwrap_or("unknown")
+                .into(),
+            source: report.source.to_string(),
+            status: report.status.to_string(),
+            evidence: report.evidence.to_string(),
+            feature: "none".into(),
+            feature_status: "unknown".into(),
+            client_versions: "unknown".into(),
+            gateway_versions: "unknown".into(),
+            negotiated_version: "none".into(),
+            reason: "gateway did not provide a compatibility profile".into(),
+        }]
+    } else {
+        report
+            .features
+            .iter()
+            .map(|feature| CompatibilityRow {
+                client_version: report.client_version.clone(),
+                library_version: report.library_version.clone(),
+                gateway_version: report
+                    .gateway_version
+                    .as_deref()
+                    .unwrap_or("unknown")
+                    .into(),
+                source: report.source.to_string(),
+                status: report.status.to_string(),
+                evidence: report.evidence.to_string(),
+                feature: feature.feature.to_string(),
+                feature_status: feature.status.to_string(),
+                client_versions: version_range(Some(feature.client_versions)),
+                gateway_versions: version_range(feature.gateway_versions),
+                negotiated_version: feature
+                    .negotiated_version
+                    .map_or_else(|| "none".into(), |version| version.to_string()),
+                reason: feature.reason.clone(),
+            })
+            .collect()
+    };
+    output::render(rows, format)
+}
+
+/// Print the negotiated compatibility profile and enforce requested features.
+pub async fn cmd_compatibility(
+    host: String,
+    server: Option<String>,
+    required: Vec<CompatibilityFeature>,
+    format: OutputFormat,
+) -> anyhow::Result<()> {
+    let mut client = Client::connect(&host).await?;
+    let report = client
+        .compatibility_with_client_version(server.as_deref(), env!("CARGO_PKG_VERSION"))
+        .await?;
+    println!("{}", render_compatibility(&report, format)?);
+
+    let required = if required.is_empty() {
+        vec![CompatibilityFeature::Core]
+    } else {
+        required
+    };
+    let failures = required
+        .iter()
+        .filter(|feature| {
+            report
+                .feature(**feature)
+                .is_none_or(|result| result.status != FeatureCompatibilityStatus::Compatible)
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let mut message = String::from("gateway compatibility check failed for ");
+    let _ = write!(message, "{}", failures.join(", "));
+    Err(anyhow::anyhow!(message))
 }
 
 pub async fn cmd_servers(host: String, format: OutputFormat) -> anyhow::Result<()> {
@@ -763,9 +892,9 @@ mod tests {
     use opcda_bridge_proto::bridge::{
         BrowseBreadcrumb, BrowseNode as ProtoBrowseNode, BrowseNodeKind as ProtoBrowseNodeKind,
         BrowsePage as ProtoBrowsePage, BrowseSource as ProtoBrowseSource, GetCapabilitiesResponse,
-        IndexedSearchMatch, IndexedSearchProgress, ListServersResponse,
-        NamespaceOrganization as ProtoOrganization, ReadResponse, SearchCompleted,
-        SearchEvent as ProtoSearchEvent, SearchIndexResponse,
+        GetGatewayInfoResponse, IndexedSearchMatch, IndexedSearchProgress, ListServersResponse,
+        NamespaceOrganization as ProtoOrganization, ProtocolFeature, ProtocolFeatureKind,
+        ReadResponse, SearchCompleted, SearchEvent as ProtoSearchEvent, SearchIndexResponse,
         SearchIndexState as ProtoSearchIndexState, SearchIndexStatus, SearchMatch, SearchProgress,
         TagValue as ProtoTagValue, WriteResponse,
     };
@@ -871,6 +1000,76 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn compatibility_command_reports_full_and_rejects_missing_requirements() {
+        let host = start_mock_server(MockBridgeService {
+            gateway_info_response: GetGatewayInfoResponse {
+                application_version: "0.4.3".into(),
+                compatibility_schema_version: 1,
+                features: vec![
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Core as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Namespace as i32,
+                        min_version: 2,
+                        max_version: 2,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::IndexedSearch as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                ],
+            },
+            ..Default::default()
+        })
+        .await;
+        cmd_compatibility(
+            host,
+            None,
+            vec![
+                CompatibilityFeature::Core,
+                CompatibilityFeature::IndexedSearch,
+            ],
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+
+        let host = start_mock_server(MockBridgeService {
+            gateway_info_response: GetGatewayInfoResponse {
+                application_version: "0.3.2".into(),
+                compatibility_schema_version: 1,
+                features: vec![
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Core as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Namespace as i32,
+                        min_version: 2,
+                        max_version: 2,
+                    },
+                ],
+            },
+            ..Default::default()
+        })
+        .await;
+        let error = cmd_compatibility(
+            host,
+            None,
+            vec![CompatibilityFeature::IndexedSearch],
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("indexed-search"));
     }
 
     #[tokio::test]

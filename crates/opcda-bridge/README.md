@@ -13,6 +13,13 @@ opcda-bridge = "0.4"
 This crate has its own independent release version. It does not need to match the client or
 gateway version; applications should select a compatible protocol and capability contract.
 
+Use `Client::gateway_info()` to retrieve the gateway-wide protocol profile without an OPC DA
+server, or `Client::compatibility()` to evaluate the reusable library's profile. For older
+gateways, pass a server ProgID to `Client::compatibility(Some("..."))` so the library can infer the
+legacy capabilities contract. The result reports per-feature compatibility and whether the exact
+package pair is covered by boundary evidence; protocol overlap, not package-version equality,
+governs normal operation.
+
 The library exposes typed capabilities, one-page browse sessions, explicit continuation and
 session close operations, progressive search events, and read/write methods. Browse pages are not
 automatically drained; callers that need bulk results must collect pages explicitly.

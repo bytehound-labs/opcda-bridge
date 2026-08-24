@@ -1,0 +1,71 @@
+{
+  "catalog_version": "1",
+  "evidence": [
+    {
+      "client_line": "indexed",
+      "gateway_line": "paged",
+      "notes": "The current client negotiates the paged namespace contract with a 0.3.2 gateway.",
+      "status": "contract-boundary-tested"
+    },
+    {
+      "client_line": "paged",
+      "gateway_line": "indexed",
+      "notes": "A 0.3.2 client reads, writes, and browses through the current gateway.",
+      "status": "contract-boundary-tested"
+    },
+    {
+      "client_line": "indexed",
+      "client_version": "0.4.0",
+      "gateway_line": "indexed",
+      "gateway_version": "0.4.3",
+      "notes": "The 0.4.0 indexed client reaches the current indexed gateway contract.",
+      "status": "exact-pair-tested"
+    },
+    {
+      "client_line": "indexed",
+      "client_version": "0.4.3",
+      "gateway_line": "indexed",
+      "gateway_version": "0.4.3",
+      "notes": "The current client and gateway are exercised together.",
+      "status": "exact-pair-tested"
+    }
+  ],
+  "protocol": {
+    "core": 1,
+    "indexed_search": 1,
+    "namespace": 2
+  },
+  "release_lines": [
+    {
+      "core_protocol": 1,
+      "indexed_search_protocol": 0,
+      "max_version": "0.3.1",
+      "min_version": "0.1.0",
+      "name": "legacy",
+      "namespace_protocol": 1,
+      "notes": "Original streaming browse contract.",
+      "status": "legacy"
+    },
+    {
+      "core_protocol": 1,
+      "indexed_search_protocol": 0,
+      "max_version": "0.3.999",
+      "min_version": "0.3.2",
+      "name": "paged",
+      "namespace_protocol": 2,
+      "notes": "Capabilities, paged browse, browse sessions, and live search.",
+      "status": "supported"
+    },
+    {
+      "core_protocol": 1,
+      "indexed_search_protocol": 1,
+      "max_version": "0.999.999",
+      "min_version": "0.4.0",
+      "name": "indexed",
+      "namespace_protocol": 2,
+      "notes": "Adds persistent namespace indexing.",
+      "status": "supported"
+    }
+  ],
+  "schema_version": 1
+}

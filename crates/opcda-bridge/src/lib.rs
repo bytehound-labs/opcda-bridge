@@ -58,6 +58,7 @@
 //! ```
 
 mod client;
+mod compatibility;
 mod error;
 mod types;
 
@@ -66,6 +67,12 @@ mod test_support;
 
 pub use client::Client;
 pub use client::SearchStream;
+pub use compatibility::{
+    CompatibilityEvidence, CompatibilityFeature, CompatibilityReport, CompatibilitySource,
+    CompatibilityStatus, FeatureCompatibility, FeatureCompatibilityStatus, GatewayInfo,
+    ProtocolFeatureSupport, ProtocolProfile, ProtocolVersionRange, current_client_profile,
+    evaluate_compatibility, legacy_gateway_profile, unknown_compatibility_report,
+};
 pub use error::{Error, Result};
 pub use opcda_bridge_proto::DEFAULT_BRIDGE_PORT;
 pub use types::{

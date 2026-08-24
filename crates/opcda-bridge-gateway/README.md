@@ -13,6 +13,11 @@ The gateway is versioned independently from the client and protocol crates. Preb
 `opcda-bridge-gateway-vX.Y.Z` tags; client/gateway interoperability is determined by the wire
 protocol and advertised capabilities rather than matching package versions.
 
+The gateway-wide `GetGatewayInfo` RPC advertises the protocol-feature ranges supported by the
+running binary without opening an OPC DA server. The client compatibility command uses this
+handshake for deployment checks; `GetCapabilities` remains the per-server operational capability
+endpoint and supports older clients.
+
 The gateway must run on the Windows machine hosting the OPC DA server. See the repository README
 for service installation, configuration, and firewall setup.
 

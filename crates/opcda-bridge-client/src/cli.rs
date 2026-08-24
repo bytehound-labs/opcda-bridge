@@ -1,6 +1,6 @@
 use crate::output::OutputFormat;
 use clap::{Parser, Subcommand, ValueEnum};
-use opcda_bridge::SearchMatchMode;
+use opcda_bridge::{CompatibilityFeature, SearchMatchMode};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -38,6 +38,23 @@ pub enum SearchMode {
     Contains,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RequiredFeature {
+    Core,
+    Namespace,
+    IndexedSearch,
+}
+
+impl From<RequiredFeature> for CompatibilityFeature {
+    fn from(value: RequiredFeature) -> Self {
+        match value {
+            RequiredFeature::Core => Self::Core,
+            RequiredFeature::Namespace => Self::Namespace,
+            RequiredFeature::IndexedSearch => Self::IndexedSearch,
+        }
+    }
+}
+
 impl From<SearchMode> for SearchMatchMode {
     fn from(value: SearchMode) -> Self {
         match value {
@@ -52,6 +69,15 @@ impl From<SearchMode> for SearchMatchMode {
 pub enum Commands {
     /// List available OPC DA servers
     Servers,
+    /// Check client/gateway protocol compatibility
+    Compatibility {
+        /// OPC DA server ProgID for legacy gateway fallback
+        #[arg(long)]
+        server: Option<String>,
+        /// Require a specific protocol feature to be compatible
+        #[arg(long, value_enum)]
+        require: Vec<RequiredFeature>,
+    },
     /// Show gateway and namespace capabilities for an OPC DA server
     Capabilities {
         #[arg(long)]
@@ -182,6 +208,11 @@ pub async fn run_command(
 
     match cli.command {
         Commands::Servers => crate::commands::cmd_servers(host, format).await?,
+        Commands::Compatibility { server, require } => {
+            let server = server.or_else(|| config.server.clone());
+            let require = require.into_iter().map(Into::into).collect();
+            crate::commands::cmd_compatibility(host, server, require, format).await?
+        }
         Commands::Capabilities { server } => {
             let server = crate::config::resolve_server(server, config)?;
             crate::commands::cmd_capabilities(host, server, format).await?
@@ -315,7 +346,9 @@ mod tests {
     use super::*;
     use crate::test_support::{MockBridgeService, start_mock_server};
     use clap::Parser;
-    use opcda_bridge_proto::bridge::WriteResponse;
+    use opcda_bridge_proto::bridge::{
+        GetGatewayInfoResponse, ProtocolFeature, ProtocolFeatureKind, WriteResponse,
+    };
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -411,6 +444,73 @@ mod tests {
             )
             .await
             .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_dispatches_compatibility() {
+        let host = start_mock_server(MockBridgeService {
+            gateway_info_response: GetGatewayInfoResponse {
+                application_version: "0.4.3".into(),
+                compatibility_schema_version: 1,
+                features: vec![
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Core as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Namespace as i32,
+                        min_version: 2,
+                        max_version: 2,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::IndexedSearch as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                ],
+            },
+            ..Default::default()
+        })
+        .await;
+        run_command(
+            cli(
+                Commands::Compatibility {
+                    server: None,
+                    require: Vec::new(),
+                },
+                host,
+            ),
+            &crate::config::ClientConfig::default(),
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn parses_compatibility_command_and_required_features() {
+        let cli = Cli::try_parse_from([
+            "opcda-bridge",
+            "compatibility",
+            "--server",
+            "S",
+            "--require",
+            "core",
+            "--require",
+            "indexed-search",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Compatibility { server, require } => {
+                assert_eq!(server.as_deref(), Some("S"));
+                assert_eq!(
+                    require,
+                    vec![RequiredFeature::Core, RequiredFeature::IndexedSearch]
+                );
+            }
+            _ => panic!("expected compatibility command"),
         }
     }
 

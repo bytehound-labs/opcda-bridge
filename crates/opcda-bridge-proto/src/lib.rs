@@ -1,6 +1,52 @@
 /// Default TCP port used by the gateway and clients.
 pub const DEFAULT_BRIDGE_PORT: u16 = 7600;
 
+/// Generated compatibility contract metadata shared by the gateway and clients.
+pub mod compatibility {
+    /// A package release line and the protocol contracts it implements.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ReleaseLine {
+        pub name: &'static str,
+        pub min_version: &'static str,
+        pub max_version: &'static str,
+        pub status: &'static str,
+        pub core_protocol: u32,
+        pub namespace_protocol: u32,
+        pub indexed_search_protocol: u32,
+    }
+
+    include!(concat!(env!("OUT_DIR"), "/compatibility_generated.rs"));
+
+    /// The canonical compatibility catalog bundled with this crate.
+    pub const CATALOG_TOML: &str = include_str!("../compatibility.toml");
+
+    fn version_tuple(value: &str) -> Option<(u64, u64, u64)> {
+        let parts = value.split('.').collect::<Vec<_>>();
+        if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+            return None;
+        }
+        Some((
+            parts[0].parse().ok()?,
+            parts[1].parse().ok()?,
+            parts[2].parse().ok()?,
+        ))
+    }
+
+    /// Find the catalog release line containing an exact `X.Y.Z` version.
+    pub fn release_line_for(version: &str) -> Option<&'static ReleaseLine> {
+        let version = version_tuple(version)?;
+        RELEASE_LINES.iter().find(|line| {
+            let Some(minimum) = version_tuple(line.min_version) else {
+                return false;
+            };
+            let Some(maximum) = version_tuple(line.max_version) else {
+                return false;
+            };
+            minimum <= version && version <= maximum
+        })
+    }
+}
+
 pub mod bridge {
     tonic::include_proto!("bridge");
 }
@@ -23,6 +69,24 @@ mod tests {
     #[test]
     fn test_default_bridge_port() {
         assert_eq!(DEFAULT_BRIDGE_PORT, 7600);
+    }
+
+    #[test]
+    fn test_compatibility_catalog_release_lines() {
+        let legacy = crate::compatibility::release_line_for("0.3.1").unwrap();
+        assert_eq!(legacy.name, "legacy");
+        assert_eq!(legacy.namespace_protocol, 1);
+        assert_eq!(legacy.status, "legacy");
+
+        let paged = crate::compatibility::release_line_for("0.3.2").unwrap();
+        assert_eq!(paged.name, "paged");
+        assert_eq!(paged.namespace_protocol, 2);
+
+        let indexed = crate::compatibility::release_line_for("0.4.3").unwrap();
+        assert_eq!(indexed.name, "indexed");
+        assert_eq!(indexed.indexed_search_protocol, 1);
+        assert!(crate::compatibility::release_line_for("1.0").is_none());
+        assert!(crate::compatibility::release_line_for("0.x.3").is_none());
     }
 
     #[test]

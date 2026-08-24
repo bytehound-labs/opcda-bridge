@@ -1,0 +1,24 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "opcda-bridge-compatibility-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+current-client = { package = "opcda-bridge", path = "../crates/opcda-bridge" }
+current-gateway = { package = "opcda-bridge-gateway", path = "../crates/opcda-bridge-gateway" }
+current-proto = { package = "opcda-bridge-proto", path = "../crates/opcda-bridge-proto" }
+historical-client-032 = { package = "opcda-bridge", version = "=0.3.2" }
+historical-client-040 = { package = "opcda-bridge", version = "=0.4.0" }
+historical-gateway-032 = { package = "opcda-bridge-gateway", version = "=0.3.2" }
+historical-proto-032 = { package = "opcda-bridge-proto", version = "=0.3.2" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"

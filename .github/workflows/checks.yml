@@ -148,8 +148,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
-      - name: Verify publishable packages
-        run: cargo package --workspace --locked
+      - name: Create publishable package archives
+        # Workspace packages may depend on same-version internal crates that
+        # are not published until the release PR merges. The Linux and
+        # Windows jobs compile the current workspace sources; this job checks
+        # that Cargo can assemble every publishable archive.
+        run: cargo package --workspace --locked --no-verify
 
   msrv:
     name: MSRV

@@ -10,14 +10,14 @@ use crate::opc::{
 use opcda_bridge_proto::bridge::{
     BrowseBreadcrumb, BrowseNode as ProtoBrowseNode, BrowsePage as ProtoBrowsePage,
     BrowseSource as ProtoBrowseSource, CloseBrowseSessionRequest, ControlSearchIndexRequest,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSearchIndexStatusRequest,
-    IndexedSearchMatch, IndexedSearchProgress, ListServersRequest, ListServersResponse,
-    NamespaceOrganization as ProtoNamespaceOrganization, ReadRequest, ReadResponse,
-    RefreshSearchIndexRequest, SearchCompleted, SearchEvent, SearchIndexControlAction,
-    SearchIndexRequest, SearchIndexResponse, SearchIndexState, SearchIndexStatus, SearchMatch,
-    SearchMatchMode, SearchProgress, SearchRequest, TagValue as ProtoTagValue, WriteRequest,
-    WriteResponse, bridge_server::Bridge, search_event::Event,
-    write_request::TypedValue as ProtoTypedValue,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetSearchIndexStatusRequest, IndexedSearchMatch, IndexedSearchProgress, ListServersRequest,
+    ListServersResponse, NamespaceOrganization as ProtoNamespaceOrganization, ProtocolFeature,
+    ProtocolFeatureKind, ReadRequest, ReadResponse, RefreshSearchIndexRequest, SearchCompleted,
+    SearchEvent, SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse,
+    SearchIndexState, SearchIndexStatus, SearchMatch, SearchMatchMode, SearchProgress,
+    SearchRequest, TagValue as ProtoTagValue, WriteRequest, WriteResponse, bridge_server::Bridge,
+    search_event::Event, write_request::TypedValue as ProtoTypedValue,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -25,8 +25,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-const PROTOCOL_VERSION: &str = "2";
-const INDEXED_SEARCH_PROTOCOL_VERSION: &str = "1";
 const DEFAULT_SEARCH_RESULTS: u32 = 200;
 const MAX_SEARCH_RESULTS: u32 = 1_000;
 const MAX_SEARCH_VISITED: u32 = 50_000;
@@ -144,23 +142,58 @@ fn map_browse_page(session_id: String, page: BrowsePage) -> ProtoBrowsePage {
     }
 }
 
+fn gateway_release_line() -> &'static opcda_bridge_proto::compatibility::ReleaseLine {
+    opcda_bridge_proto::compatibility::release_line_for(env!("CARGO_PKG_VERSION"))
+        .expect("gateway package version must be in the compatibility catalog")
+}
+
 fn map_capabilities(
     capabilities: BrowseCapabilities,
     index_status: &IndexStatus,
     max_indexed_search_results: u32,
 ) -> GetCapabilitiesResponse {
+    let release_line = gateway_release_line();
     GetCapabilitiesResponse {
         application_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_version: PROTOCOL_VERSION.to_string(),
+        protocol_version: release_line.namespace_protocol.to_string(),
         max_page_size: capabilities.max_page_size.min(MAX_PAGE_SIZE),
         supports_browse_sessions: capabilities.supports_browse_sessions,
         supports_search: capabilities.supports_search,
         organization: map_namespace_organization(capabilities.organization) as i32,
         source: map_browse_source(capabilities.source) as i32,
-        supports_indexed_search: true,
-        indexed_search_protocol_version: INDEXED_SEARCH_PROTOCOL_VERSION.to_string(),
+        supports_indexed_search: release_line.indexed_search_protocol > 0,
+        indexed_search_protocol_version: if release_line.indexed_search_protocol == 0 {
+            String::new()
+        } else {
+            release_line.indexed_search_protocol.to_string()
+        },
         max_indexed_search_results,
         search_index_state: map_index_state(index_status.state) as i32,
+    }
+}
+
+fn gateway_info() -> GetGatewayInfoResponse {
+    let release_line = gateway_release_line();
+    GetGatewayInfoResponse {
+        application_version: env!("CARGO_PKG_VERSION").to_string(),
+        compatibility_schema_version: opcda_bridge_proto::compatibility::SCHEMA_VERSION,
+        features: vec![
+            ProtocolFeature {
+                kind: ProtocolFeatureKind::Core as i32,
+                min_version: release_line.core_protocol,
+                max_version: release_line.core_protocol,
+            },
+            ProtocolFeature {
+                kind: ProtocolFeatureKind::Namespace as i32,
+                min_version: release_line.namespace_protocol,
+                max_version: release_line.namespace_protocol,
+            },
+            ProtocolFeature {
+                kind: ProtocolFeatureKind::IndexedSearch as i32,
+                min_version: release_line.indexed_search_protocol,
+                max_version: release_line.indexed_search_protocol,
+            },
+        ],
     }
 }
 
@@ -483,6 +516,14 @@ async fn run_search_inner<C: OpcClient>(
 
 #[tonic::async_trait]
 impl<C: OpcClient> Bridge for BridgeService<C> {
+    #[tracing::instrument(skip(self, _request))]
+    async fn get_gateway_info(
+        &self,
+        _request: Request<GetGatewayInfoRequest>,
+    ) -> Result<Response<GetGatewayInfoResponse>, Status> {
+        Ok(Response::new(gateway_info()))
+    }
+
     #[tracing::instrument(skip(self, request))]
     async fn get_capabilities(
         &self,
@@ -719,7 +760,8 @@ mod tests {
     use crate::test_support::MockOpcClient;
     use opcda_bridge_proto::bridge::{
         BrowseRequest, BrowseSource as ProtoBrowseSource, GetCapabilitiesRequest,
-        ListServersRequest, NamespaceOrganization as ProtoNamespaceOrganization, ReadRequest,
+        GetGatewayInfoRequest, ListServersRequest,
+        NamespaceOrganization as ProtoNamespaceOrganization, ProtocolFeatureKind, ReadRequest,
         SearchMatchMode, SearchRequest, WriteRequest, bridge_server::Bridge,
         write_request::TypedValue as ProtoTypedValue,
     };
@@ -1011,9 +1053,35 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(response.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(
+            response.protocol_version,
+            gateway_release_line().namespace_protocol.to_string()
+        );
         assert!(response.supports_browse_sessions);
         assert_eq!(response.max_page_size, MAX_PAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn gateway_info_reports_generated_protocol_contract() {
+        let response = service()
+            .get_gateway_info(Request::new(GetGatewayInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response.compatibility_schema_version,
+            opcda_bridge_proto::compatibility::SCHEMA_VERSION
+        );
+        assert_eq!(response.features.len(), 3);
+        assert_eq!(response.features[0].kind, ProtocolFeatureKind::Core as i32);
+        assert_eq!(
+            response.features[1].min_version,
+            opcda_bridge_proto::compatibility::NAMESPACE_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            response.features[2].kind,
+            ProtocolFeatureKind::IndexedSearch as i32
+        );
     }
 
     #[tokio::test]

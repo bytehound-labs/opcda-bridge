@@ -42,6 +42,8 @@ Example: `feat(gateway): add tag subscription support`.
   on any OS: tests exercise a hand-written `MockOpcClient` instead of a live COM connection.
 - Hardware-in-the-loop tests (against a real Windows host + OPC DA server) aren't part of CI;
   note manual verification steps in the PR description when a change needs them.
+- Cross-version protocol checks run from the isolated `compatibility-tests/` workspace:
+  `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`.
 
 ## CI
 
@@ -50,9 +52,11 @@ PRs must pass `cargo fmt --check --all`, `cargo clippy --workspace --all-targets
 (COM); the client crate should build and test on Linux, macOS, and Windows.
 
 The workflows are change-aware: compiled validation runs for Rust, workspace, dependency, script,
-or workflow changes; package verification also runs when crate metadata or packaged documentation
-changes. Documentation-only changes keep the required `check` and `coverage` statuses green
-without rebuilding the workspace.
+or workflow changes; package archive validation also runs when crate metadata or packaged
+documentation changes. The archive job uses `cargo package --workspace --locked --no-verify`
+because same-version internal dependencies may not be published until the release PR merges; the
+Linux and Windows jobs compile the current workspace sources. Documentation-only changes keep the
+required `check` and `coverage` statuses green without rebuilding the workspace.
 
 Security workflows use immutable action pins and bounded aggregate statuses. They run CodeQL,
 Semgrep, full-history Gitleaks, actionlint, zizmor, Protobuf breaking-change checks, and bounded
@@ -61,6 +65,18 @@ keyless signatures, and provenance; use the release workflow's manual dispatch f
 validation without publishing. Intentional Protobuf wire-contract breaks must carry the
 `breaking-protobuf` label; without that explicit approval, the Buf compatibility check blocks the
 pull request.
+
+The generated compatibility files must remain synchronized with
+`crates/opcda-bridge-proto/compatibility.toml`:
+
+```sh
+python3 scripts/generate-compatibility-report.py --check
+```
+
+The catalog describes protocol release lines rather than equal package versions. An intentional
+breaking Protobuf change requires the `breaking-protobuf` label, a new or changed compatibility
+boundary, updated boundary evidence, and regenerated reports. The Buf compatibility workflow
+enforces those requirements.
 
 ## Pull requests
 
@@ -84,6 +100,10 @@ dependency order. `changelog_include` entries cascade a reusable library or prot
 the dependent packages that must be rebuilt, without restoring workspace-wide lockstep versions.
 The generated release metadata must pass the package-aware `release-integrity` check, while the
 release commit filter and crates.io rate limit provide additional safeguards.
+
+Every publishable package version must fall within exactly one catalog release line. Client and
+gateway binary Releases include `COMPATIBILITY.md` and `compatibility.json` so operators can inspect
+the same protocol evidence offline.
 
 All four crates publish to crates.io. GitHub Releases and prebuilt platform archives are reserved
 for the client and gateway tags; the protocol crate and reusable library do not produce binary

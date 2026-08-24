@@ -12,6 +12,10 @@ opcda-bridge-proto = "0.4"
 The protocol crate has its own independent release version. Client and gateway package versions
 may differ; interoperability is determined by the generated wire contract and capability versions.
 
+`GetGatewayInfo` returns the gateway package version and protocol-feature ranges without contacting
+an OPC DA server. Clients use those ranges for compatibility negotiation; `GetCapabilities`
+continues to provide per-server operational details and remains available for legacy fallback.
+
 The protocol is generated from the crate's bundled `bridge.proto` definition. Browse is a unary,
 one-level page operation with opaque session and continuation tokens; live namespace search is a
 separate progressive streaming operation. Persistent indexed discovery uses unary

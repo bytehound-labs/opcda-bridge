@@ -36,6 +36,7 @@ jobs:
             proto:
               - 'buf.yaml'
               - 'crates/opcda-bridge-proto/proto/**'
+              - 'crates/opcda-bridge-proto/compatibility.toml'
               - 'crates/opcda-bridge-proto/build.rs'
               - 'crates/opcda-bridge-proto/Cargo.toml'
               - 'Cargo.lock'
@@ -66,10 +67,31 @@ jobs:
       - name: Reject breaking Protobuf changes
         run: buf breaking --against '.git#ref=refs/remotes/origin/main' --against-config buf.yaml
 
+  breaking-boundary:
+    name: Validate approved compatibility boundary
+    needs: changes
+    if: needs.changes.outputs.run == 'true' && github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'breaking-protobuf')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate compatibility boundary and evidence
+        run: |
+          python3 scripts/check-compatibility-catalog.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --breaking-protobuf
+
   security:
     name: Required Protobuf compatibility status
     if: always()
-    needs: [changes, compatibility]
+    needs: [changes, compatibility, breaking-boundary]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -93,4 +115,10 @@ jobs:
         if: needs.changes.outputs.run == 'true' && !contains(github.event.pull_request.labels.*.name, 'breaking-protobuf') && needs.compatibility.result != 'success'
         run: |
           echo "Protobuf compatibility ended with: ${{ needs.compatibility.result }}"
+          exit 1
+
+      - name: Verify approved boundary result
+        if: needs.changes.outputs.run == 'true' && contains(github.event.pull_request.labels.*.name, 'breaking-protobuf') && needs.breaking-boundary.result != 'success'
+        run: |
+          echo "Approved Protobuf changes require a validated compatibility boundary: ${{ needs.breaking-boundary.result }}"
           exit 1

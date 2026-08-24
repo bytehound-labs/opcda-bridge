@@ -47,6 +47,29 @@ OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based 
 - **Gateway** — runs on the Windows host alongside the OPC DA server, speaks native COM.
 - **Client** — runs anywhere (Linux, macOS, Windows), talks to the gateway over the network.
 
+## Client/gateway compatibility
+
+Check a deployed pair before using optional protocol features:
+
+```sh
+opcda-bridge-client --host 192.168.1.50:7600 compatibility
+opcda-bridge-client --host 192.168.1.50:7600 compatibility \
+  --require namespace --require indexed-search
+```
+
+The check uses the gateway-wide protocol handshake and does not contact an OPC DA server. For an
+older gateway that predates that handshake, provide `--server` (or configure a default server) to
+infer compatibility from its legacy capabilities response. A `full` result means all advertised
+features overlap; `partial` means core read/write operations overlap while an optional feature does
+not; `incompatible` means core or a required feature cannot be negotiated; and `unknown` means the
+gateway cannot describe itself. Overlapping but untested package pairs are reported as
+`unverified` and remain usable. The report includes both the client binary version and the reusable
+library version implementing its protocol contract.
+
+The [compatibility catalog](COMPATIBILITY.md) documents protocol release lines and boundary-test
+evidence. The machine-readable [`compatibility.json`](compatibility.json) file is suitable for
+deployment tooling. Client and gateway package versions are independent and do not need to match.
+
 ## Installation
 
 Prebuilt client and gateway binaries are attached to their package-specific tags on the
@@ -133,6 +156,13 @@ config file — see [Configuration](#configuration) below.
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 capabilities --server Kepware.KepServerEX.V5
   ```
+- Check client/gateway protocol compatibility without opening an OPC DA server:
+  ```sh
+  opcda-bridge-client --host 192.168.1.50:7600 compatibility
+  ```
+  Add `--require namespace` or `--require indexed-search` when deployment requires those optional
+  features. Older gateways can be checked with `--server Kepware.KepServerEX.V5`, which enables
+  legacy capability inference.
 - Browse one bounded page of immediate children. The root request opens a session; use the returned
   opaque session, node, and continuation values unchanged to expand a branch or load another page:
   ```sh

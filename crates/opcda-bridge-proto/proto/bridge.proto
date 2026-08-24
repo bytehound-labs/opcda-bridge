@@ -5,6 +5,7 @@ package bridge;
 import "google/protobuf/empty.proto";
 
 service Bridge {
+  rpc GetGatewayInfo(GetGatewayInfoRequest) returns (GetGatewayInfoResponse);
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
   rpc Browse(BrowseRequest) returns (BrowsePage);
   rpc CloseBrowseSession(CloseBrowseSessionRequest) returns (google.protobuf.Empty);
@@ -16,6 +17,27 @@ service Bridge {
   rpc RefreshSearchIndex(RefreshSearchIndexRequest) returns (SearchIndexStatus);
   rpc ControlSearchIndex(ControlSearchIndexRequest) returns (SearchIndexStatus);
   rpc SearchIndex(SearchIndexRequest) returns (SearchIndexResponse);
+}
+
+message GetGatewayInfoRequest {}
+
+message GetGatewayInfoResponse {
+  string application_version = 1;
+  uint32 compatibility_schema_version = 2;
+  repeated ProtocolFeature features = 3;
+}
+
+message ProtocolFeature {
+  ProtocolFeatureKind kind = 1;
+  uint32 min_version = 2;
+  uint32 max_version = 3;
+}
+
+enum ProtocolFeatureKind {
+  PROTOCOL_FEATURE_KIND_UNSPECIFIED = 0;
+  PROTOCOL_FEATURE_KIND_CORE = 1;
+  PROTOCOL_FEATURE_KIND_NAMESPACE = 2;
+  PROTOCOL_FEATURE_KIND_INDEXED_SEARCH = 3;
 }
 
 message GetCapabilitiesRequest {

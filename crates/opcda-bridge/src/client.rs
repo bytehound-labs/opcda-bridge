@@ -6,12 +6,16 @@ use crate::types::{
     SearchIndexRequest, SearchIndexResponse, SearchIndexStatus, SearchRequest, TagValue, Value,
     WriteResult,
 };
+use crate::{
+    CompatibilityReport, GatewayInfo, current_client_profile, evaluate_compatibility,
+    legacy_gateway_profile, unknown_compatibility_report,
+};
 use opcda_bridge_proto::bridge::bridge_client::BridgeClient;
 use opcda_bridge_proto::bridge::write_request::TypedValue;
 use opcda_bridge_proto::bridge::{
     CloseBrowseSessionRequest, ControlSearchIndexRequest, GetCapabilitiesRequest,
-    GetSearchIndexStatusRequest, ListServersRequest, ReadRequest, RefreshSearchIndexRequest,
-    WriteRequest,
+    GetGatewayInfoRequest, GetSearchIndexStatusRequest, ListServersRequest, ReadRequest,
+    RefreshSearchIndexRequest, WriteRequest,
 };
 use tonic::Code;
 use tonic::codec::Streaming;
@@ -60,6 +64,53 @@ impl Client {
             .map_err(|status| feature_error("capability discovery", status))?
             .into_inner()
             .try_into()
+    }
+
+    /// Report gateway-wide protocol ranges without contacting an OPC server.
+    pub async fn gateway_info(&mut self) -> Result<GatewayInfo> {
+        self.inner
+            .get_gateway_info(GetGatewayInfoRequest {})
+            .await
+            .map_err(Error::Rpc)?
+            .into_inner()
+            .try_into()
+    }
+
+    /// Compare this reusable client with a gateway, using the library version
+    /// as the local application version.
+    pub async fn compatibility(&mut self, server: Option<&str>) -> Result<CompatibilityReport> {
+        self.compatibility_with_client_version(server, env!("CARGO_PKG_VERSION"))
+            .await
+    }
+
+    /// Compare this client application version with a gateway.
+    ///
+    /// New gateways answer without an OPC server. Older gateways can be
+    /// inspected with `server` through their legacy per-server capabilities
+    /// response; without it, the result is honestly reported as unknown.
+    pub async fn compatibility_with_client_version(
+        &mut self,
+        server: Option<&str>,
+        client_version: impl Into<String>,
+    ) -> Result<CompatibilityReport> {
+        let client_profile = current_client_profile(client_version);
+        match self.gateway_info().await {
+            Ok(info) => {
+                let gateway_profile = crate::ProtocolProfile::from_gateway_info(&info);
+                Ok(evaluate_compatibility(&client_profile, &gateway_profile))
+            }
+            Err(Error::Rpc(status)) if status.code() == Code::Unimplemented => match server {
+                Some(server) => {
+                    let capabilities = self.capabilities(server).await?;
+                    let gateway_profile = legacy_gateway_profile(&capabilities);
+                    Ok(evaluate_compatibility(&client_profile, &gateway_profile))
+                }
+                None => Ok(unknown_compatibility_report(
+                    client_profile.application_version.unwrap_or_default(),
+                )),
+            },
+            Err(error) => Err(error),
+        }
     }
 
     /// List the OPC DA servers registered on the gateway's host.
@@ -274,8 +325,9 @@ mod tests {
     use opcda_bridge_proto::bridge::search_event;
     use opcda_bridge_proto::bridge::{
         BrowseNode as ProtoBrowseNode, BrowsePage as ProtoBrowsePage,
-        BrowseSource as ProtoBrowseSource, GetCapabilitiesResponse, IndexedSearchMatch,
-        IndexedSearchProgress, ListServersResponse, NamespaceOrganization as ProtoOrganization,
+        BrowseSource as ProtoBrowseSource, GetCapabilitiesResponse, GetGatewayInfoResponse,
+        IndexedSearchMatch, IndexedSearchProgress, ListServersResponse,
+        NamespaceOrganization as ProtoOrganization, ProtocolFeature, ProtocolFeatureKind,
         ReadResponse, SearchCompleted, SearchEvent as ProtoSearchEvent, SearchIndexResponse,
         SearchIndexState as ProtoSearchIndexState, SearchIndexStatus, SearchProgress,
         TagValue as ProtoTagValue, WriteResponse,
@@ -347,6 +399,128 @@ mod tests {
         assert_eq!(capabilities.max_indexed_search_results, 50);
         assert_eq!(capabilities.search_index_state, SearchIndexState::Ready);
         assert_eq!(requests.lock().unwrap()[0].server, "S");
+    }
+
+    #[tokio::test]
+    async fn gateway_info_and_compatibility_report_are_typed() {
+        let service = MockBridgeService {
+            gateway_info_response: GetGatewayInfoResponse {
+                application_version: "0.4.3".into(),
+                compatibility_schema_version: 1,
+                features: vec![
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Core as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Namespace as i32,
+                        min_version: 2,
+                        max_version: 2,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::IndexedSearch as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+        let requests = Arc::clone(&service.gateway_info_requests);
+        let host = start_mock_server(service).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        let info = client.gateway_info().await.unwrap();
+        assert_eq!(info.application_version, "0.4.3");
+        let report = client
+            .compatibility_with_client_version(None, "0.4.3")
+            .await
+            .unwrap();
+        assert_eq!(report.status, crate::CompatibilityStatus::Full);
+        assert_eq!(report.library_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn compatibility_wrapper_and_gateway_info_errors_are_typed() {
+        let host = start_mock_server(MockBridgeService {
+            gateway_info_response: GetGatewayInfoResponse {
+                application_version: "0.4.3".into(),
+                compatibility_schema_version: 1,
+                features: vec![
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Core as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::Namespace as i32,
+                        min_version: 2,
+                        max_version: 2,
+                    },
+                    ProtocolFeature {
+                        kind: ProtocolFeatureKind::IndexedSearch as i32,
+                        min_version: 1,
+                        max_version: 1,
+                    },
+                ],
+            },
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert_eq!(
+            client.compatibility(None).await.unwrap().status,
+            crate::CompatibilityStatus::Full
+        );
+
+        let host = start_mock_server(MockBridgeService {
+            gateway_info_error: Some(Status::internal("gateway unavailable")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client.compatibility(None).await.unwrap_err(),
+            Error::Rpc(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn compatibility_falls_back_to_legacy_or_reports_unknown() {
+        let service = MockBridgeService {
+            gateway_info_error: Some(Status::unimplemented("old gateway")),
+            capabilities_response: GetCapabilitiesResponse {
+                application_version: "0.3.2".into(),
+                protocol_version: "2".into(),
+                supports_indexed_search: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let host = start_mock_server(service).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        let report = client
+            .compatibility_with_client_version(Some("S"), "0.4.3")
+            .await
+            .unwrap();
+        assert_eq!(
+            report.source,
+            crate::CompatibilitySource::LegacyCapabilities
+        );
+        assert_eq!(report.status, crate::CompatibilityStatus::Partial);
+
+        let host = start_mock_server(MockBridgeService {
+            gateway_info_error: Some(Status::unimplemented("old gateway")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        let report = client
+            .compatibility_with_client_version(None, "0.4.3")
+            .await
+            .unwrap();
+        assert_eq!(report.status, crate::CompatibilityStatus::Unknown);
     }
 
     #[tokio::test]

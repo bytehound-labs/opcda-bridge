@@ -1,0 +1,65 @@
+schema_version = 1
+catalog_version = "1"
+
+[protocol]
+core = 1
+namespace = 2
+indexed_search = 1
+
+[[release_lines]]
+name = "legacy"
+min_version = "0.1.0"
+max_version = "0.3.1"
+status = "legacy"
+core_protocol = 1
+namespace_protocol = 1
+indexed_search_protocol = 0
+notes = "Original streaming browse contract."
+
+[[release_lines]]
+name = "paged"
+min_version = "0.3.2"
+max_version = "0.3.999"
+status = "supported"
+core_protocol = 1
+namespace_protocol = 2
+indexed_search_protocol = 0
+notes = "Capabilities, paged browse, browse sessions, and live search."
+
+[[release_lines]]
+name = "indexed"
+min_version = "0.4.0"
+max_version = "0.999.999"
+status = "supported"
+core_protocol = 1
+namespace_protocol = 2
+indexed_search_protocol = 1
+notes = "Adds persistent namespace indexing."
+
+[[evidence]]
+client_line = "indexed"
+gateway_line = "paged"
+status = "contract-boundary-tested"
+notes = "The current client negotiates the paged namespace contract with a 0.3.2 gateway."
+
+[[evidence]]
+client_line = "paged"
+gateway_line = "indexed"
+status = "contract-boundary-tested"
+notes = "A 0.3.2 client reads, writes, and browses through the current gateway."
+
+[[evidence]]
+client_line = "indexed"
+gateway_line = "indexed"
+client_version = "0.4.0"
+gateway_version = "0.4.3"
+status = "exact-pair-tested"
+notes = "The 0.4.0 indexed client reaches the current indexed gateway contract."
+
+[[evidence]]
+client_line = "indexed"
+gateway_line = "indexed"
+client_version = "0.4.3"
+gateway_version = "0.4.3"
+status = "exact-pair-tested"
+notes = "The current client and gateway are exercised together."

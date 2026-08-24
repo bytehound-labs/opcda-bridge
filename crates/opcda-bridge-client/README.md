@@ -13,6 +13,21 @@ The CLI is versioned independently from the gateway and reusable client library.
 use `opcda-bridge-client-vX.Y.Z` tags; a matching gateway version is not required when the wire
 protocol and advertised capabilities support the requested operations.
 
+Check compatibility before enabling optional operations:
+
+```sh
+opcda-bridge-client compatibility
+opcda-bridge-client compatibility --require namespace --require indexed-search
+```
+
+The command negotiates protocol features without contacting an OPC DA server when the gateway
+supports `GetGatewayInfo`. Use `--server PROGID` for legacy gateways that only expose per-server
+capabilities. `full`, `partial`, `incompatible`, and `unknown` describe negotiated behavior;
+`unverified` evidence means the protocol ranges overlap but that exact package pair has not been
+exercised in CI. The report distinguishes the client binary version from the reusable-library
+version implementing its protocol contract. See the repository's
+[compatibility catalog](../../COMPATIBILITY.md) for release lines and boundary evidence.
+
 Read output contains semantic values. An OPC DA `VT_BSTR` is returned exactly as supplied by the
 server, so a BSTR containing `AUT` produces `"value": "AUT"` rather than a display-quoted value.
 

@@ -3,10 +3,10 @@
 use opcda_bridge_proto::bridge::bridge_server::{Bridge, BridgeServer};
 use opcda_bridge_proto::bridge::{
     BrowsePage, BrowseRequest, CloseBrowseSessionRequest, ControlSearchIndexRequest,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSearchIndexStatusRequest,
-    ListServersRequest, ListServersResponse, ReadRequest, ReadResponse, RefreshSearchIndexRequest,
-    SearchEvent, SearchIndexRequest, SearchIndexResponse, SearchIndexStatus, SearchRequest,
-    WriteRequest, WriteResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetSearchIndexStatusRequest, ListServersRequest, ListServersResponse, ReadRequest,
+    ReadResponse, RefreshSearchIndexRequest, SearchEvent, SearchIndexRequest, SearchIndexResponse,
+    SearchIndexStatus, SearchRequest, WriteRequest, WriteResponse,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,6 +17,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 pub(crate) struct MockBridgeService {
+    pub(crate) gateway_info_response: GetGatewayInfoResponse,
     pub(crate) capabilities_response: GetCapabilitiesResponse,
     pub(crate) list_servers_response: ListServersResponse,
     pub(crate) browse_responses: Vec<BrowsePage>,
@@ -42,6 +43,7 @@ pub(crate) struct MockBridgeService {
 impl Default for MockBridgeService {
     fn default() -> Self {
         Self {
+            gateway_info_response: GetGatewayInfoResponse::default(),
             capabilities_response: GetCapabilitiesResponse::default(),
             list_servers_response: ListServersResponse::default(),
             browse_responses: vec![BrowsePage {
@@ -74,6 +76,13 @@ impl Default for MockBridgeService {
 
 #[tonic::async_trait]
 impl Bridge for MockBridgeService {
+    async fn get_gateway_info(
+        &self,
+        _request: Request<GetGatewayInfoRequest>,
+    ) -> Result<Response<GetGatewayInfoResponse>, Status> {
+        Ok(Response::new(self.gateway_info_response.clone()))
+    }
+
     async fn get_capabilities(
         &self,
         _request: Request<GetCapabilitiesRequest>,

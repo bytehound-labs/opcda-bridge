@@ -52,6 +52,11 @@ a working opcda-bridge, not a redesign of it.
   every reported count before indexing so malformed native counts cannot panic the worker.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
+- **Compatibility contract**: Client and gateway package versions are independent. Runtime
+  compatibility is negotiated by the gateway-wide `GetGatewayInfo` protocol-feature ranges, with
+  legacy `GetCapabilities` fallback only when an explicit OPC server is supplied. The canonical
+  release-line catalog is `crates/opcda-bridge-proto/compatibility.toml`; generated
+  `COMPATIBILITY.md` and `compatibility.json` must stay synchronized.
 
 ## Reference test environment
 
@@ -79,6 +84,8 @@ target for early gateway development.
 - **Lint**: `cargo fmt --check --all` and
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - **Coverage**: `cargo llvm-cov --workspace --lcov`
+- **Cross-version compatibility**: `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`
+- **Report drift**: `python3 scripts/generate-compatibility-report.py --check`
 
 ### Security and release validation
 
@@ -90,6 +97,15 @@ provenance attestations; `workflow_dispatch` builds package artifacts without pu
 
 The gateway crate is Windows-only (COM); the client crate is cross-platform. Tests that require
 the `OpcClient` trait use a mock implementation so they run on all platforms.
+
+The cross-version workflow exercises published 0.3.2 and 0.4.0 boundary clients against current
+and historical gateway services backed by mock `OpcClient` implementations. An exact package pair
+does not need prior CI evidence when its negotiated protocol ranges overlap, but the CLI reports
+such pairings as `unverified`.
+
+An intentional Protobuf break requires the `breaking-protobuf` label, a new or changed catalog
+boundary, updated evidence, and regenerated compatibility reports. Release-integrity validation
+rejects publishable package versions that do not fall within exactly one catalog release line.
 
 ### Coverage enforcement
 

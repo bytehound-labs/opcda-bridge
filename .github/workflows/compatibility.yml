@@ -1,0 +1,98 @@
+name: Cross-version compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: compatibility-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect compatibility changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.compatibility == 'true' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Detect changed paths
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        with:
+          filters: |
+            compatibility:
+              - 'compatibility-tests/**'
+              - 'compatibility.json'
+              - 'COMPATIBILITY.md'
+              - 'crates/opcda-bridge-proto/compatibility.toml'
+              - 'crates/opcda-bridge-proto/proto/**'
+              - 'crates/opcda-bridge-proto/build.rs'
+              - 'crates/opcda-bridge-proto/Cargo.toml'
+              - 'crates/opcda-bridge/src/**'
+              - 'crates/opcda-bridge/Cargo.toml'
+              - 'crates/opcda-bridge-gateway/src/**'
+              - 'crates/opcda-bridge-gateway/Cargo.toml'
+              - 'scripts/generate-compatibility-report.py'
+              - 'scripts/check-compatibility-catalog.py'
+              - '.github/workflows/compatibility.yml'
+
+  cross-version:
+    name: Exercise compatibility boundaries
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        with:
+          tool: protoc
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Check generated compatibility reports
+        run: python3 scripts/generate-compatibility-report.py --check
+
+      - name: Run cross-version boundary tests
+        run: cargo test --manifest-path compatibility-tests/Cargo.toml --locked
+
+  compatibility:
+    if: always()
+    needs: [changes, cross-version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail if change detection failed
+        if: needs.changes.result != 'success'
+        run: |
+          echo "Compatibility change detection did not complete successfully."
+          exit 1
+
+      - name: Report skipped compatibility tests
+        if: needs.changes.outputs.run != 'true'
+        run: echo "No compatibility-affecting files changed; cross-version tests skipped."
+
+      - name: Verify compatibility result
+        if: needs.changes.outputs.run == 'true' && needs.cross-version.result != 'success'
+        run: |
+          echo "Cross-version compatibility ended with: ${{ needs.cross-version.result }}"
+          exit 1

@@ -3,10 +3,10 @@
 use opcda_bridge_proto::bridge::bridge_server::{Bridge, BridgeServer};
 use opcda_bridge_proto::bridge::{
     BrowsePage, BrowseRequest, CloseBrowseSessionRequest, ControlSearchIndexRequest,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSearchIndexStatusRequest,
-    ListServersRequest, ListServersResponse, ReadRequest, ReadResponse, RefreshSearchIndexRequest,
-    SearchEvent, SearchIndexRequest, SearchIndexResponse, SearchIndexStatus, SearchRequest,
-    WriteRequest, WriteResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetSearchIndexStatusRequest, ListServersRequest, ListServersResponse, ReadRequest,
+    ReadResponse, RefreshSearchIndexRequest, SearchEvent, SearchIndexRequest, SearchIndexResponse,
+    SearchIndexStatus, SearchRequest, WriteRequest, WriteResponse,
 };
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -16,6 +16,9 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 pub(crate) struct MockBridgeService {
+    pub(crate) gateway_info_response: GetGatewayInfoResponse,
+    pub(crate) gateway_info_error: Option<Status>,
+    pub(crate) gateway_info_requests: Arc<Mutex<Vec<GetGatewayInfoRequest>>>,
     pub(crate) capabilities_response: GetCapabilitiesResponse,
     pub(crate) capabilities_error: Option<Status>,
     pub(crate) capabilities_requests: Arc<Mutex<Vec<GetCapabilitiesRequest>>>,
@@ -53,6 +56,9 @@ pub(crate) struct MockBridgeService {
 impl Default for MockBridgeService {
     fn default() -> Self {
         Self {
+            gateway_info_response: GetGatewayInfoResponse::default(),
+            gateway_info_error: None,
+            gateway_info_requests: Arc::default(),
             capabilities_response: GetCapabilitiesResponse::default(),
             capabilities_error: None,
             capabilities_requests: Arc::default(),
@@ -97,6 +103,20 @@ impl Default for MockBridgeService {
 
 #[tonic::async_trait]
 impl Bridge for MockBridgeService {
+    async fn get_gateway_info(
+        &self,
+        request: Request<GetGatewayInfoRequest>,
+    ) -> Result<Response<GetGatewayInfoResponse>, Status> {
+        self.gateway_info_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        if let Some(status) = self.gateway_info_error.clone() {
+            return Err(status);
+        }
+        Ok(Response::new(self.gateway_info_response.clone()))
+    }
+
     async fn get_capabilities(
         &self,
         request: Request<GetCapabilitiesRequest>,
