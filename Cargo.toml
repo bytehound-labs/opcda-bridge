@@ -19,7 +19,7 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
-opc-da-client = { package = "bytehound-opc-da-client", version = "0.2.5" }
+opc-da-client = { package = "bytehound-opc-da-client", version = "0.2.6" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
 prost = "0.14"

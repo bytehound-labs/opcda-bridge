@@ -17,10 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_secs(60);
 const CLEANUP_BATCH_SIZE: usize = 10_000;
 const CLEANUP_BATCH_PAUSE: Duration = Duration::from_millis(1);
+const CLEANUP_RETRY_LIMIT: u32 = 3;
+const CLEANUP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexState {
@@ -103,6 +105,8 @@ struct BackgroundTaskGuard {
 struct CleanupTaskState {
     running: bool,
     requested: bool,
+    #[cfg(test)]
+    failures: usize,
 }
 
 impl BackgroundTasks {
@@ -483,20 +487,23 @@ impl IndexDb {
                  value TEXT NOT NULL
              );",
         )?;
-        if let Some(version) = connection
+        let schema_version = connection
             .query_row(
                 "SELECT value FROM index_meta WHERE key = 'schema_version'",
                 [],
                 |row| row.get::<_, String>(0),
             )
             .optional()?
+            .map(|version| {
+                version.parse::<i64>().map_err(|_| {
+                    anyhow::anyhow!("invalid namespace index schema version {version:?}")
+                })
+            })
+            .transpose()?;
+        if let Some(version) = schema_version
+            && !matches!(version, 2 | SCHEMA_VERSION)
         {
-            let version = version.parse::<i64>().map_err(|_| {
-                anyhow::anyhow!("invalid namespace index schema version {version:?}")
-            })?;
-            if version != SCHEMA_VERSION {
-                anyhow::bail!("unsupported namespace index schema version {version}");
-            }
+            anyhow::bail!("unsupported namespace index schema version {version}");
         }
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS generations (
@@ -510,6 +517,7 @@ impl IndexDb {
                  entry_count INTEGER NOT NULL DEFAULT 0,
                  unique_item_count INTEGER NOT NULL DEFAULT 0,
                  last_error TEXT,
+                 compatibility_fallback INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (server, generation)
              );
              CREATE TABLE IF NOT EXISTS entries (
@@ -537,10 +545,35 @@ impl IndexDb {
                  display_name,
                  breadcrumbs,
                  tokenize = 'trigram'
-             );
-             INSERT OR REPLACE INTO index_meta(key, value)
-               VALUES ('schema_version', '2');",
+             );",
         )?;
+        if schema_version == Some(2) {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE generations
+                   ADD COLUMN compatibility_fallback INTEGER NOT NULL DEFAULT 0;
+                 INSERT OR REPLACE INTO index_meta(key, value)
+                   VALUES ('schema_version', '3');
+                 COMMIT;",
+            )?;
+        } else {
+            connection.execute(
+                "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('schema_version', ?1)",
+                [SCHEMA_VERSION.to_string()],
+            )?;
+        }
+        let relational_entries_exist =
+            connection.query_row("SELECT EXISTS(SELECT 1 FROM entries LIMIT 1)", [], |row| {
+                row.get::<_, bool>(0)
+            })?;
+        let full_text_entries_exist = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries_fts LIMIT 1)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if relational_entries_exist != full_text_entries_exist {
+            anyhow::bail!("namespace index relational and full-text data are inconsistent");
+        }
         connection.execute(
             "UPDATE generations
              SET state = 'failed',
@@ -605,10 +638,11 @@ impl IndexDb {
         server: &str,
         generation: u64,
         entries: &[InventoryEntry],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         let generation = i64::try_from(generation)
             .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
         let transaction = self.connection.transaction()?;
+        let mut inserted_count = 0_u64;
         for entry in entries {
             if entry.item_id.is_empty() {
                 anyhow::bail!("inventory entry has an empty ItemID");
@@ -630,6 +664,7 @@ impl IndexDb {
                 ],
             )?;
             if inserted > 0 {
+                inserted_count = inserted_count.saturating_add(u64::try_from(inserted)?);
                 transaction.execute(
                     "INSERT INTO entries_fts
                      (server, generation, item_id, display_name, breadcrumbs)
@@ -651,9 +686,10 @@ impl IndexDb {
             server,
             generation,
             batch_size = entries.len(),
+            inserted_count,
             "committed namespace index entries"
         );
-        Ok(())
+        Ok(inserted_count)
     }
 
     fn update_progress(
@@ -694,7 +730,14 @@ impl IndexDb {
         completed_at: &str,
         progress: &InventoryProgress,
     ) -> anyhow::Result<()> {
-        self.promote_with_profile(server, generation, completed_at, progress, None, None)
+        self.promote_with_profile(
+            server,
+            generation,
+            completed_at,
+            progress.unique_items,
+            None,
+            None,
+        )
     }
 
     fn promote_with_profile(
@@ -702,12 +745,12 @@ impl IndexDb {
         server: &str,
         generation: u64,
         completed_at: &str,
-        progress: &InventoryProgress,
+        searchable_item_count: u64,
         profile: Option<(NamespaceOrganization, BrowseSource)>,
         warning: Option<&str>,
     ) -> anyhow::Result<()> {
         let activation_started = Instant::now();
-        let searchable_item_count = i64::try_from(progress.unique_items)
+        let searchable_item_count = i64::try_from(searchable_item_count)
             .map_err(|_| anyhow::anyhow!("namespace index entry count exceeds SQLite range"))?;
         let (organization, source) = profile
             .map(|(organization, source)| {
@@ -730,6 +773,8 @@ impl IndexDb {
              SET state = 'active', completed_at = ?1,
                  entry_count = ?2, unique_item_count = ?2,
                  organization = COALESCE(?3, organization),
+                 compatibility_fallback =
+                   CASE WHEN source = 'da3' AND ?4 = 'da2' THEN 1 ELSE 0 END,
                  source = COALESCE(?4, source), last_error = ?5
              WHERE server = ?6 AND generation = ?7 AND state = 'staging'",
             params![
@@ -842,6 +887,27 @@ impl IndexDb {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn active_profile(&self, server: &str) -> anyhow::Result<Option<StoredIndexProfile>> {
+        self.connection
+            .query_row(
+                "SELECT organization, source, compatibility_fallback
+                 FROM generations
+                 WHERE server = ?1 AND state = 'active'
+                 ORDER BY generation DESC
+                 LIMIT 1",
+                [server],
+                |row| {
+                    Ok(StoredIndexProfile {
+                        organization: parse_namespace(&row.get::<_, String>(0)?),
+                        source: parse_source(&row.get::<_, String>(1)?),
+                        compatibility_fallback: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     fn search_generation(&self, server: &str) -> anyhow::Result<Option<u64>> {
@@ -1065,6 +1131,7 @@ async fn run_scheduled_cleanup(
     background_tasks: Arc<BackgroundTasks>,
     cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
 ) {
+    let mut consecutive_failures = 0_u32;
     loop {
         let should_run = cleanup_tasks
             .lock()
@@ -1084,7 +1151,7 @@ async fn run_scheduled_cleanup(
         let cleanup_path = path.clone();
         let cleanup_server = server.clone();
         let cleanup_tasks_for_blocking = Arc::clone(&background_tasks);
-        match tokio::task::spawn_blocking(move || {
+        let result = match tokio::task::spawn_blocking(move || {
             cleanup_obsolete_generations(
                 &cleanup_path,
                 &cleanup_server,
@@ -1093,21 +1160,39 @@ async fn run_scheduled_cleanup(
         })
         .await
         {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => tracing::warn!(
-                process_id = std::process::id(),
-                database = %path.display(),
-                server,
-                error = %error,
-                "namespace index obsolete-generation cleanup failed"
-            ),
-            Err(error) => tracing::warn!(
-                process_id = std::process::id(),
-                database = %path.display(),
-                server,
-                error = %error,
-                "namespace index cleanup worker failed"
-            ),
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "namespace index cleanup worker failed: {error}"
+            )),
+        };
+        match result {
+            Ok(_) => {}
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                #[cfg(test)]
+                if let Ok(mut tasks) = cleanup_tasks.lock()
+                    && let Some(task) = tasks.get_mut(&server)
+                {
+                    task.failures = task.failures.saturating_add(1);
+                }
+                let retry = consecutive_failures <= CLEANUP_RETRY_LIMIT
+                    && !background_tasks.is_shutting_down();
+                tracing::warn!(
+                    process_id = std::process::id(),
+                    database = %path.display(),
+                    server,
+                    error = %error,
+                    attempt = consecutive_failures,
+                    retry,
+                    "namespace index obsolete-generation cleanup failed"
+                );
+                if retry {
+                    let multiplier = 2_u32.pow(consecutive_failures.saturating_sub(1));
+                    tokio::time::sleep(CLEANUP_RETRY_INITIAL_BACKOFF.saturating_mul(multiplier))
+                        .await;
+                    continue;
+                }
+            }
         }
 
         let rerun = cleanup_tasks
@@ -1125,6 +1210,7 @@ async fn run_scheduled_cleanup(
         if !rerun {
             return;
         }
+        consecutive_failures = 0;
     }
 }
 
@@ -1139,6 +1225,13 @@ struct DbStatus {
     entry_count: u64,
     unique_item_count: u64,
     last_error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct StoredIndexProfile {
+    organization: NamespaceOrganization,
+    source: BrowseSource,
+    compatibility_fallback: bool,
 }
 
 pub struct IndexManager<C: OpcClient> {
@@ -1265,19 +1358,38 @@ impl<C: OpcClient> IndexManager<C> {
             Ok(status)
                 if status.active_generation > 0 && status.state != IndexState::Refreshing =>
             {
-                let profile_changed = self
-                    .client
-                    .get_capabilities(server)
-                    .await
-                    .map(|capabilities| {
-                        !index_profile_is_compatible(
-                            status.organization,
-                            status.source,
-                            capabilities.organization,
-                            capabilities.source,
-                        )
-                    })
-                    .unwrap_or(false);
+                let stored_profile = self.with_database(|db| db.active_profile(server));
+                let profile_changed = match stored_profile {
+                    Ok(Some(stored_profile)) => self
+                        .client
+                        .get_capabilities(server)
+                        .await
+                        .map(|capabilities| {
+                            !index_profile_is_compatible(
+                                stored_profile.organization,
+                                stored_profile.source,
+                                stored_profile.compatibility_fallback,
+                                capabilities.organization,
+                                capabilities.source,
+                            )
+                        })
+                        .unwrap_or(false),
+                    Ok(None) => {
+                        tracing::warn!(
+                            server = %server,
+                            "active namespace index profile is unavailable"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            server = %server,
+                            error = %error,
+                            "unable to inspect active namespace index profile"
+                        );
+                        false
+                    }
+                };
                 if profile_changed {
                     if let Err(error) = self.with_database(|db| db.clear_server(server)) {
                         tracing::warn!(
@@ -1439,6 +1551,12 @@ impl<C: OpcClient> IndexManager<C> {
         let active_row = rows.iter().find(|row| row.state == "active").cloned();
         let staging_row = rows.iter().find(|row| row.state == "staging").cloned();
         let failed_row = rows.iter().find(|row| row.state == "failed").cloned();
+        let failed_after_active = active_row.as_ref().and_then(|active| {
+            failed_row
+                .as_ref()
+                .filter(|failed| failed.generation > active.generation)
+                .cloned()
+        });
         let (build, runtime_error) = {
             let runtime = self
                 .runtime
@@ -1453,7 +1571,10 @@ impl<C: OpcClient> IndexManager<C> {
         let build_active = build.is_some();
         let database_bytes = self.database_bytes()?;
         let mut status = if let Some(build) = build {
-            let row = active_row.clone().or(staging_row.clone()).or(failed_row);
+            let row = active_row
+                .clone()
+                .or(staging_row.clone())
+                .or(failed_row.clone());
             if let Some(row) = row {
                 let state = if active_row.is_some() {
                     IndexState::Refreshing
@@ -1494,7 +1615,7 @@ impl<C: OpcClient> IndexManager<C> {
                         .unwrap_or_default()
                         > Duration::from_secs(self.settings.refresh_interval_seconds)
                 });
-            let state = if failed_row.is_some() {
+            let state = if failed_after_active.is_some() {
                 IndexState::Failed
             } else if stale {
                 IndexState::Stale
@@ -1502,7 +1623,7 @@ impl<C: OpcClient> IndexManager<C> {
                 IndexState::Ready
             };
             let mut status = status_from_row(server, row, state, None, database_bytes);
-            if let Some(failed) = failed_row {
+            if let Some(failed) = failed_after_active {
                 status.last_error = failed.last_error;
             }
             status
@@ -1820,6 +1941,7 @@ impl<C: OpcClient> IndexManager<C> {
         let mut completion_profile = None;
         let mut terminal = false;
         let mut accounted_active_time_ms = 0_u64;
+        let mut persisted_item_count = 0_u64;
         let mut rate_limiter =
             ItemRateLimiter::new(self.settings.item_rate_limit, self.settings.burst_size);
         let mut next_health_probe = Instant::now();
@@ -1855,11 +1977,17 @@ impl<C: OpcClient> IndexManager<C> {
                     }
                     pending.push(entry);
                     if pending.len() >= self.settings.batch_size as usize {
-                        if let Err(error) = self
+                        match self
                             .with_database(|db| db.insert_entries(&server, generation, &pending))
                         {
-                            failed = Some(error.to_string());
-                            break;
+                            Ok(inserted) => {
+                                persisted_item_count =
+                                    persisted_item_count.saturating_add(inserted);
+                            }
+                            Err(error) => {
+                                failed = Some(error.to_string());
+                                break;
+                            }
                         }
                         pending.clear();
                     }
@@ -1936,22 +2064,25 @@ impl<C: OpcClient> IndexManager<C> {
         if !terminal && failed.is_none() {
             failed = Some("inventory stream ended before completion".to_string());
         }
-        if !pending.is_empty()
-            && failed.is_none()
-            && let Err(error) =
-                self.with_database(|db| db.insert_entries(&server, generation, &pending))
-        {
-            tracing::error!(
-                process_id = std::process::id(),
-                database = %self.settings.database_path.display(),
-                server = %server,
-                generation,
-                operation = "insert_entries",
-                batch_size = pending.len(),
-                error = %error,
-                "namespace index database operation failed"
-            );
-            failed = Some(error.to_string());
+        if !pending.is_empty() && failed.is_none() {
+            match self.with_database(|db| db.insert_entries(&server, generation, &pending)) {
+                Ok(inserted) => {
+                    persisted_item_count = persisted_item_count.saturating_add(inserted);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        process_id = std::process::id(),
+                        database = %self.settings.database_path.display(),
+                        server = %server,
+                        generation,
+                        operation = "insert_entries",
+                        batch_size = pending.len(),
+                        error = %error,
+                        "namespace index database operation failed"
+                    );
+                    failed = Some(error.to_string());
+                }
+            }
         }
 
         if let Some(error) = failed {
@@ -1973,7 +2104,7 @@ impl<C: OpcClient> IndexManager<C> {
                     &server,
                     generation,
                     &completed_at,
-                    &last_progress,
+                    persisted_item_count,
                     completion_profile,
                     completion_warning.as_deref(),
                 )
@@ -1992,6 +2123,7 @@ impl<C: OpcClient> IndexManager<C> {
                         duration_ms = build_started.elapsed().as_millis() as u64,
                         entries_seen = last_progress.entries_seen,
                         unique_items = last_progress.unique_items,
+                        persisted_items = persisted_item_count,
                         "namespace index build completed"
                     );
                     if let Some(warning) = completion_warning {
@@ -2475,6 +2607,7 @@ fn is_quarantinable_index_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
     message.contains("unsupported namespace index schema version")
         || message.contains("invalid namespace index schema version")
+        || message.contains("namespace index relational and full-text data are inconsistent")
         || message.contains("file is not a database")
         || message.contains("database disk image is malformed")
 }
@@ -2549,12 +2682,15 @@ fn parse_source(value: &str) -> BrowseSource {
 fn index_profile_is_compatible(
     indexed_organization: NamespaceOrganization,
     indexed_source: BrowseSource,
+    compatibility_fallback: bool,
     raw_organization: NamespaceOrganization,
     raw_source: BrowseSource,
 ) -> bool {
     indexed_organization == raw_organization
         && (indexed_source == raw_source
-            || (indexed_source == BrowseSource::Da2 && raw_source == BrowseSource::Da3))
+            || (compatibility_fallback
+                && indexed_source == BrowseSource::Da2
+                && raw_source == BrowseSource::Da3))
 }
 
 fn node_kind_number(value: InventoryNodeKind) -> i64 {
@@ -2722,18 +2858,28 @@ mod tests {
         assert!(index_profile_is_compatible(
             NamespaceOrganization::Hierarchical,
             BrowseSource::Da2,
+            true,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da3,
+        ));
+        assert!(!index_profile_is_compatible(
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            false,
             NamespaceOrganization::Hierarchical,
             BrowseSource::Da3,
         ));
         assert!(!index_profile_is_compatible(
             NamespaceOrganization::Hierarchical,
             BrowseSource::Da3,
+            false,
             NamespaceOrganization::Hierarchical,
             BrowseSource::Da2,
         ));
         assert!(!index_profile_is_compatible(
             NamespaceOrganization::Hierarchical,
             BrowseSource::Da2,
+            true,
             NamespaceOrganization::Flat,
             BrowseSource::Da2,
         ));
@@ -2984,6 +3130,115 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_migrates_v2_and_records_confirmed_compatibility_fallbacks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("v2.sqlite3");
+        drop(IndexDb::open(&path).unwrap());
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE entries;
+                 DROP TABLE entries_fts;
+                 DROP TABLE generations;
+                 CREATE TABLE generations (
+                     server TEXT NOT NULL,
+                     generation INTEGER NOT NULL,
+                     state TEXT NOT NULL,
+                     organization TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     started_at TEXT NOT NULL,
+                     completed_at TEXT,
+                     entry_count INTEGER NOT NULL DEFAULT 0,
+                     unique_item_count INTEGER NOT NULL DEFAULT 0,
+                     last_error TEXT,
+                     PRIMARY KEY (server, generation)
+                 );
+                 INSERT INTO generations (
+                     server, generation, state, organization, source, started_at,
+                     completed_at, entry_count, unique_item_count
+                 ) VALUES ('S', 1, 'active', 'hierarchical', 'da2', '1', '2', 0, 0);
+                 UPDATE index_meta SET value = '2' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let mut migrated = IndexDb::open_once(&path).unwrap();
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT value FROM index_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            SCHEMA_VERSION.to_string()
+        );
+        assert!(
+            !migrated
+                .active_profile("S")
+                .unwrap()
+                .unwrap()
+                .compatibility_fallback
+        );
+
+        let generation = migrated
+            .start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da3,
+                "3",
+            )
+            .unwrap();
+        migrated
+            .insert_entries("S", generation, &[inventory_entry("Tag", "S.Tag")])
+            .unwrap();
+        migrated
+            .promote_with_profile(
+                "S",
+                generation,
+                "4",
+                1,
+                Some((NamespaceOrganization::Hierarchical, BrowseSource::Da2)),
+                Some("DA3 compatibility fallback"),
+            )
+            .unwrap();
+        let profile = migrated.active_profile("S").unwrap().unwrap();
+        assert_eq!(profile.source, BrowseSource::Da2);
+        assert!(profile.compatibility_fallback);
+    }
+
+    #[test]
+    fn sqlite_quarantines_inconsistent_full_text_data() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("fts-inconsistent.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries("S", generation, &[inventory_entry("Tag", "S.Tag")])
+            .unwrap();
+        db.promote("S", generation, "2", &completed_progress(1))
+            .unwrap();
+        db.connection
+            .execute("DELETE FROM entries_fts", [])
+            .unwrap();
+        drop(db);
+
+        let recovered = IndexDb::open(&path).unwrap();
+        assert!(recovered.status_rows("S").unwrap().is_empty());
+        assert!(
+            directory
+                .path()
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains("quarantine-"))
+        );
+    }
+
+    #[test]
     fn sqlite_validation_failure_discard_and_clear_paths_work() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("index.sqlite3");
@@ -3180,7 +3435,7 @@ mod tests {
             )
             .unwrap();
         drop(rebuild);
-        assert!(IndexDb::open_once(&rebuild_path).is_ok());
+        assert!(IndexDb::open_once(&rebuild_path).is_err());
 
         let mut start_db = IndexDb::open(&directory.path().join("start.sqlite3")).unwrap();
         drop_table(&mut start_db, "generations");
@@ -3551,6 +3806,113 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_retries_transient_failures() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("cleanup-retry.sqlite3")),
+        ));
+        let (obsolete, active) = manager
+            .with_database(|db| {
+                let obsolete =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", obsolete, &[inventory_entry("Obsolete", "S.Obsolete")])?;
+                db.promote("S", obsolete, "2", &completed_progress(1))?;
+                let active =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "3")?;
+                db.insert_entries("S", active, &[inventory_entry("Active", "S.Active")])?;
+                db.promote("S", active, "4", &completed_progress(1))?;
+                db.connection.execute_batch(
+                    "CREATE TRIGGER fail_obsolete_cleanup_once
+                     BEFORE DELETE ON entries
+                     WHEN OLD.generation = 1
+                     BEGIN
+                       SELECT RAISE(FAIL, 'transient obsolete cleanup rejection');
+                     END;",
+                )?;
+                Ok((obsolete, active))
+            })
+            .unwrap();
+        manager.schedule_cleanup("S");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed_once = manager
+                    .cleanup_tasks
+                    .lock()
+                    .ok()
+                    .and_then(|tasks| tasks.get("S").map(|task| task.failures > 0))
+                    .unwrap_or(false);
+                if failed_once {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        manager
+            .with_database(|db| {
+                db.connection
+                    .execute_batch("DROP TRIGGER fail_obsolete_cleanup_once;")?;
+                Ok(())
+            })
+            .unwrap();
+        manager.background_tasks.wait_for_idle().await;
+
+        assert_eq!(
+            manager
+                .with_database(|db| {
+                    db.connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM generations
+                         WHERE server = 'S' AND generation = ?1",
+                            [i64::try_from(obsolete)?],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .unwrap(),
+            0
+        );
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.active_generation, active);
+        assert!(matches!(
+            status.state,
+            IndexState::Ready | IndexState::Stale
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn older_failed_generations_do_not_poison_active_status() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("older-failed.sqlite3")),
+        ));
+        let active = manager
+            .with_database(|db| {
+                let failed =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", failed, &[inventory_entry("Failed", "S.Failed")])?;
+                db.fail_generation("S", failed, "old refresh failed")?;
+                let active =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "2")?;
+                db.insert_entries("S", active, &[inventory_entry("Active", "S.Active")])?;
+                db.promote("S", active, &timestamp_now(), &completed_progress(1))?;
+                Ok(active)
+            })
+            .unwrap();
+
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.active_generation, active);
+        assert!(matches!(
+            status.state,
+            IndexState::Ready | IndexState::Stale
+        ));
+        assert_eq!(status.last_error, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4499,6 +4861,8 @@ mod tests {
         let status = manager.status("S").await.unwrap();
         assert_eq!(status.state, IndexState::Ready);
         assert_eq!(status.active_generation, 1);
+        assert_eq!(status.entry_count, 1);
+        assert_eq!(status.unique_item_count, 1);
         assert_eq!(status.last_error.as_deref(), Some(warning));
         assert_eq!(
             manager
@@ -5517,14 +5881,63 @@ mod tests {
         seed_active_generation(
             &manager,
             NamespaceOrganization::Hierarchical,
+            BrowseSource::Da3,
+            &timestamp_now(),
+        );
+        manager
+            .with_database(|db| {
+                db.connection.execute(
+                    "UPDATE generations
+                     SET source = 'da2', compatibility_fallback = 1
+                     WHERE server = 'S' AND state = 'active'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let profile = manager
+            .with_database(|db| {
+                db.active_profile("S")?
+                    .ok_or_else(|| anyhow::anyhow!("active profile missing"))
+            })
+            .unwrap();
+        assert_eq!(profile.source, BrowseSource::Da2);
+        assert!(profile.compatibility_fallback);
+
+        manager.refresh_if_due("S").await;
+
+        assert_eq!(manager.status("S").await.unwrap().active_generation, 1);
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn genuine_da2_profile_triggers_da3_invalidation() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(LifecycleClient::new(
+            vec![],
+            vec![Ok(BrowseCapabilities {
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da3,
+                supports_browse_sessions: true,
+                supports_search: true,
+                max_page_size: 100,
+            })],
+        ));
+        let manager = Arc::new(IndexManager::new(
+            Arc::clone(&client),
+            settings(directory.path().join("genuine-da2.sqlite3")),
+        ));
+        seed_active_generation(
+            &manager,
+            NamespaceOrganization::Hierarchical,
             BrowseSource::Da2,
             &timestamp_now(),
         );
 
         manager.refresh_if_due("S").await;
 
-        assert_eq!(manager.status("S").await.unwrap().active_generation, 1);
-        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
+        assert_eq!(manager.status("S").await.unwrap().active_generation, 0);
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -5678,7 +6091,6 @@ mod tests {
                 )
             })
             .unwrap();
-
         manager.refresh_if_due("S").await;
         assert_eq!(
             client
@@ -6143,7 +6555,7 @@ mod tests {
                     generation,
                     &[inventory_entry("Persisted", "Persisted.Tag")],
                 )?;
-                db.promote("S", generation, completed_at, &zero_progress())
+                db.promote("S", generation, completed_at, &completed_progress(1))
             })
             .unwrap();
     }
