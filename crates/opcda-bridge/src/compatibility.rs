@@ -265,10 +265,9 @@ fn catalog_evidence(
             && !exact_client.is_empty()
             && exact_client == client_version
             && exact_gateway == gateway_version
+            && let Some(status) = evidence_status(status)
         {
-            if let Some(status) = evidence_status(status) {
-                return status;
-            }
+            return status;
         }
     }
     for &(catalog_client_line, catalog_gateway_line, status, exact_client, exact_gateway) in
@@ -278,10 +277,9 @@ fn catalog_evidence(
             && catalog_gateway_line == gateway_line
             && exact_client.is_empty()
             && exact_gateway.is_empty()
+            && let Some(status) = evidence_status(status)
         {
-            if let Some(status) = evidence_status(status) {
-                return status;
-            }
+            return status;
         }
     }
     CompatibilityEvidence::Unverified
