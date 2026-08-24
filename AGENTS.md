@@ -40,6 +40,16 @@ a working opcda-bridge, not a redesign of it.
   gateway-owned opaque session, page, and node tokens. Flat namespaces are reported as flat rather
   than reconstructed into a potentially incomplete hierarchy, and exact ItemIDs remain separate
   from display names.
+- **Index databases are process-scoped resources.** Every gateway process that can index a server
+  must use a unique, explicit `index.database_path`; an executable launched next to the shared
+  TOML automatically loads that file, so two direct launches can otherwise build into the same
+  SQLite database. Gateway logs include the process ID, resolved database path, server,
+  generation, operation, and terminal build outcome to make this class of deployment error
+  diagnosable.
+- **Inventory failures are terminal, typed failures.** The native inventory worker catches
+  unexpected panics, logs the payload type without exposing panic contents through the public
+  protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
+  every reported count before indexing so malformed native counts cannot panic the worker.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 
@@ -99,6 +109,10 @@ over `OpcClient` too, so it runs under tests on any platform even though the gat
 for Windows. Both `server`'s and `run`'s tests share one `MockOpcClient`
 (`crates/opcda-bridge-gateway/src/test_support.rs`) to exercise all RPC handler and shutdown paths without touching
 COM.
+
+Index lifecycle tests must cover an active build with an obsolete runtime error, exact database
+operation diagnostics, and failed/cancelled generation cleanup. Operational SQLite errors such
+as lock contention must not be treated as corrupt-cache evidence and must not trigger quarantine.
 
 ### Config file precedence
 
@@ -244,6 +258,12 @@ page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.sea
 - **Published distribution**: `opcda-bridge` is consumed from crates.io with a normal SemVer
   dependency (`opcda-bridge = "0.4"`). Git dependencies are not part of the supported consumer
   path.
+- **OPC DA client publication**: Publish `bytehound-opc-da-client` through
+  `.github/workflows/publish-opcda-client.yml` from an authenticated GitHub CLI session rather
+  than requiring local Cargo registry credentials. Pass the exact upstream `opc-cli` ref and run
+  the workflow with `dry_run=true` first; after it succeeds, rerun with `dry_run=false`. The
+  Windows workflow supplies the repository's `CARGO_REGISTRY_TOKEN` secret only to the publishing
+  step. Never paste or print that token.
 - **Release automation**: release-plz runs separate release-PR and publish jobs and publishes only
   after a merged release PR. The `release_commits` allowlist excludes both scoped and unscoped
   release-plz commit forms; the required `release-integrity` check rejects release PRs containing

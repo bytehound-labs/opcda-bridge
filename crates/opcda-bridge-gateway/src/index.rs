@@ -8,8 +8,9 @@ use crate::opc::{
 use chrono::{DateTime, Local, Timelike};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -82,6 +83,8 @@ struct BackgroundTasks {
     state: Mutex<BackgroundTaskState>,
     shutdown: tokio::sync::watch::Sender<bool>,
     idle: tokio::sync::Notify,
+    #[cfg(test)]
+    reject_next_spawn: AtomicBool,
 }
 
 #[derive(Default)]
@@ -101,6 +104,8 @@ impl BackgroundTasks {
             state: Mutex::new(BackgroundTaskState::default()),
             shutdown,
             idle: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            reject_next_spawn: AtomicBool::new(false),
         }
     }
 
@@ -133,10 +138,19 @@ impl BackgroundTasks {
         }
     }
 
+    #[cfg(test)]
+    fn reject_next_spawn(&self) {
+        self.reject_next_spawn.store(true, Ordering::Release);
+    }
+
     fn spawn<F>(self: &Arc<Self>, future: F) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        #[cfg(test)]
+        if self.reject_next_spawn.swap(false, Ordering::AcqRel) {
+            self.request_shutdown();
+        }
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => return false,
@@ -348,6 +362,74 @@ struct IndexDb {
     connection: Connection,
 }
 
+#[derive(Debug)]
+struct BuildFileLock {
+    path: PathBuf,
+}
+
+impl BuildFileLock {
+    fn acquire(database_path: &Path, server: &str) -> anyhow::Result<Self> {
+        Self::acquire_with(database_path, server, |file, metadata| {
+            file.write_all(metadata)?;
+            file.sync_all()
+        })
+    }
+
+    fn acquire_with<F>(database_path: &Path, server: &str, initialize: F) -> anyhow::Result<Self>
+    where
+        F: FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+    {
+        let file_name = database_path
+            .file_name()
+            .map_or_else(|| "index.sqlite3".into(), |name| name.to_os_string());
+        let lock_path =
+            database_path.with_file_name(format!("{}.build.lock", file_name.to_string_lossy()));
+        lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(fs::create_dir_all)
+            .transpose()?;
+        let mut file = match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = fs::read_to_string(&lock_path)
+                    .unwrap_or_else(|_| "owner details unavailable".to_string());
+                anyhow::bail!(
+                    "namespace index build lock already exists at {} ({})",
+                    lock_path.display(),
+                    owner.trim()
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = format!("process_id={}\nserver={server}\n", std::process::id());
+        if let Err(error) = initialize(&mut file, metadata.as_bytes()) {
+            let _ = fs::remove_file(&lock_path);
+            return Err(error.into());
+        }
+        Ok(Self { path: lock_path })
+    }
+}
+
+impl Drop for BuildFileLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                process_id = std::process::id(),
+                lock = %self.path.display(),
+                error = %error,
+                "unable to remove namespace index build lock"
+            );
+        }
+    }
+}
+
 impl IndexDb {
     fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path
@@ -356,9 +438,17 @@ impl IndexDb {
         {
             fs::create_dir_all(parent)?;
         }
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %path.display(),
+            "opening namespace index database"
+        );
         match Self::open_once(path) {
             Ok(db) => Ok(db),
             Err(error) => {
+                if !is_quarantinable_index_error(&error) {
+                    return Err(error);
+                }
                 let quarantine = path.with_extension(format!("quarantine-{}", Uuid::new_v4()));
                 if path.exists() {
                     fs::rename(path, &quarantine)?;
@@ -392,7 +482,9 @@ impl IndexDb {
             )
             .optional()?
         {
-            let version = version.parse::<i64>()?;
+            let version = version.parse::<i64>().map_err(|_| {
+                anyhow::anyhow!("invalid namespace index schema version {version:?}")
+            })?;
             if version != SCHEMA_VERSION {
                 anyhow::bail!("unsupported namespace index schema version {version}");
             }
@@ -517,6 +609,13 @@ impl IndexDb {
             ],
         )?;
         transaction.commit()?;
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %self.path.display(),
+            server,
+            generation,
+            "started namespace index generation"
+        );
         Ok(generation as u64)
     }
 
@@ -563,6 +662,14 @@ impl IndexDb {
             }
         }
         transaction.commit()?;
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %self.path.display(),
+            server,
+            generation,
+            batch_size = entries.len(),
+            "committed namespace index entries"
+        );
         Ok(())
     }
 
@@ -582,6 +689,15 @@ impl IndexDb {
                 generation as i64
             ],
         )?;
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %self.path.display(),
+            server,
+            generation,
+            entries_seen = progress.entries_seen,
+            unique_items = progress.unique_items,
+            "updated namespace index progress"
+        );
         Ok(())
     }
 
@@ -590,7 +706,18 @@ impl IndexDb {
         server: &str,
         generation: u64,
         completed_at: &str,
+        progress: &InventoryProgress,
+    ) -> anyhow::Result<()> {
+        self.promote_with_warning(server, generation, completed_at, progress, None)
+    }
+
+    fn promote_with_warning(
+        &mut self,
+        server: &str,
+        generation: u64,
+        completed_at: &str,
         _progress: &InventoryProgress,
+        warning: Option<&str>,
     ) -> anyhow::Result<()> {
         let (entry_count, unique_item_count) = self.connection.query_row(
             "SELECT COUNT(*), COUNT(DISTINCT item_id)
@@ -610,12 +737,13 @@ impl IndexDb {
         let promoted = transaction.execute(
             "UPDATE generations
              SET state = 'active', completed_at = ?1,
-                 entry_count = ?2, unique_item_count = ?3, last_error = NULL
-             WHERE server = ?4 AND generation = ?5 AND state = 'staging'",
+                 entry_count = ?2, unique_item_count = ?3, last_error = ?4
+             WHERE server = ?5 AND generation = ?6 AND state = 'staging'",
             params![
                 completed_at,
                 entry_count,
                 unique_item_count,
+                warning,
                 server,
                 generation as i64
             ],
@@ -646,6 +774,16 @@ impl IndexDb {
             [server],
         )?;
         transaction.commit()?;
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %self.path.display(),
+            server,
+            generation,
+            entry_count,
+            unique_item_count,
+            warning = warning.unwrap_or(""),
+            "promoted namespace index generation"
+        );
         Ok(())
     }
 
@@ -655,6 +793,14 @@ impl IndexDb {
              WHERE server = ?2 AND generation = ?3 AND state = 'staging'",
             params![error, server, generation as i64],
         )?;
+        tracing::warn!(
+            process_id = std::process::id(),
+            database = %self.path.display(),
+            server,
+            generation,
+            error,
+            "marked namespace index generation failed"
+        );
         Ok(())
     }
 
@@ -847,6 +993,7 @@ pub struct IndexManager<C: OpcClient> {
     client: Arc<C>,
     settings: ResolvedIndexConfig,
     database: Arc<Mutex<Option<IndexDb>>>,
+    build_locks: Arc<Mutex<HashMap<PathBuf, BuildFileLock>>>,
     runtime: Arc<Mutex<HashMap<String, RuntimeState>>>,
     active_builds: Arc<Mutex<HashSet<String>>>,
     foreground_users: Arc<Mutex<HashMap<String, usize>>>,
@@ -858,10 +1005,19 @@ pub struct IndexManager<C: OpcClient> {
 impl<C: OpcClient> IndexManager<C> {
     pub fn new(client: Arc<C>, settings: ResolvedIndexConfig) -> Self {
         let cache_capacity = settings.query_cache_capacity.max(1);
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %settings.database_path.display(),
+            configured_servers = ?settings.servers,
+            enabled = settings.enabled,
+            concurrency = settings.concurrency,
+            "created namespace index manager"
+        );
         Self {
             client,
             settings,
             database: Arc::new(Mutex::new(None)),
+            build_locks: Arc::new(Mutex::new(HashMap::new())),
             runtime: Arc::new(Mutex::new(HashMap::new())),
             active_builds: Arc::new(Mutex::new(HashSet::new())),
             foreground_users: Arc::new(Mutex::new(HashMap::new())),
@@ -1136,6 +1292,7 @@ impl<C: OpcClient> IndexManager<C> {
                 state.and_then(|state| state.last_error.clone()),
             )
         };
+        let build_active = build.is_some();
         let database_bytes = self.database_bytes()?;
         let mut status = if let Some(build) = build {
             let row = active_row.clone().or(staging_row.clone()).or(failed_row);
@@ -1200,7 +1357,7 @@ impl<C: OpcClient> IndexManager<C> {
             status.database_bytes = database_bytes;
             status
         };
-        if let Some(error) = runtime_error {
+        if !build_active && let Some(error) = runtime_error {
             status.state = IndexState::Failed;
             status.last_error = Some(error);
         }
@@ -1217,6 +1374,13 @@ impl<C: OpcClient> IndexManager<C> {
             return self.status(server).await;
         }
         let should_start = {
+            let foreground_users = self
+                .foreground_users
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index foreground lock poisoned"))?
+                .get(server)
+                .copied()
+                .unwrap_or(0);
             let mut runtime = self
                 .runtime
                 .lock()
@@ -1236,13 +1400,18 @@ impl<C: OpcClient> IndexManager<C> {
             } else if active_builds >= self.settings.concurrency.max(1) as usize {
                 anyhow::bail!("namespace index build concurrency limit reached");
             } else {
-                let foreground_users = self
-                    .foreground_users
+                let mut build_locks = self
+                    .build_locks
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("index foreground lock poisoned"))?
-                    .get(server)
-                    .copied()
-                    .unwrap_or(0);
+                    .map_err(|_| anyhow::anyhow!("index build-lock registry poisoned"))?;
+                if build_locks.contains_key(&self.settings.database_path) {
+                    anyhow::bail!(
+                        "namespace index build lock is already held in this process: {}",
+                        self.settings.database_path.display()
+                    );
+                }
+                let lock = BuildFileLock::acquire(&self.settings.database_path, server)?;
+                build_locks.insert(self.settings.database_path.clone(), lock);
                 state.build = Some(RuntimeBuild {
                     control: None,
                     progress: None,
@@ -1274,6 +1443,13 @@ impl<C: OpcClient> IndexManager<C> {
                 return Err(error);
             }
         };
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server,
+            batch_size = self.settings.batch_size,
+            "started namespace index inventory"
+        );
         if self.background_tasks.is_shutting_down() {
             handle.control.cancel();
             self.finish_build(server, None);
@@ -1293,6 +1469,14 @@ impl<C: OpcClient> IndexManager<C> {
         let generation = match generation {
             Ok(generation) => generation,
             Err(error) => {
+                tracing::error!(
+                    process_id = std::process::id(),
+                    database = %self.settings.database_path.display(),
+                    server,
+                    operation = "start_generation",
+                    error = %error,
+                    "namespace index database operation failed"
+                );
                 handle.control.cancel();
                 self.record_start_failure(server, &error.to_string())?;
                 return Err(error);
@@ -1333,7 +1517,7 @@ impl<C: OpcClient> IndexManager<C> {
         }) {
             control.cancel();
             let _ = self.with_database(|db| db.discard_generation(server, generation));
-            self.finish_build(server, None);
+            self.finish_build_for_control(server, &control, None);
         }
         self.status(server).await
     }
@@ -1448,6 +1632,7 @@ impl<C: OpcClient> IndexManager<C> {
         generation: u64,
         mut handle: InventoryHandle,
     ) {
+        let build_started = Instant::now();
         let maintenance_windows =
             match parse_maintenance_windows(&self.settings.maintenance_windows) {
                 Ok(windows) => windows,
@@ -1456,7 +1641,7 @@ impl<C: OpcClient> IndexManager<C> {
                     let message = error.to_string();
                     let _ =
                         self.with_database(|db| db.fail_generation(&server, generation, &message));
-                    self.finish_build(&server, Some(message));
+                    self.finish_build_for_control(&server, &handle.control, Some(message));
                     return;
                 }
             };
@@ -1473,6 +1658,7 @@ impl<C: OpcClient> IndexManager<C> {
         let mut completed = false;
         let mut cancelled = false;
         let mut failed = None;
+        let mut completion_warning = None;
         let mut terminal = false;
         let mut accounted_active_time_ms = 0_u64;
         let mut rate_limiter =
@@ -1528,6 +1714,17 @@ impl<C: OpcClient> IndexManager<C> {
                     if let Err(error) =
                         self.with_database(|db| db.update_progress(&server, generation, &progress))
                     {
+                        tracing::error!(
+                            process_id = std::process::id(),
+                            database = %self.settings.database_path.display(),
+                            server = %server,
+                            generation,
+                            operation = "update_progress",
+                            entries_seen = progress.entries_seen,
+                            unique_items = progress.unique_items,
+                            error = %error,
+                            "namespace index database operation failed"
+                        );
                         failed = Some(error.to_string());
                         break;
                     }
@@ -1555,10 +1752,22 @@ impl<C: OpcClient> IndexManager<C> {
                                 .warning
                                 .unwrap_or_else(|| "inventory was truncated".to_string()),
                         );
+                    } else {
+                        completion_warning = result.warning;
                     }
                     break;
                 }
                 Err(error) => {
+                    tracing::error!(
+                        process_id = std::process::id(),
+                        database = %self.settings.database_path.display(),
+                        server = %server,
+                        generation,
+                        operation = "insert_entries",
+                        batch_size = pending.len(),
+                        error = %error,
+                        "namespace index database operation failed"
+                    );
                     failed = Some(error.to_string());
                     break;
                 }
@@ -1572,33 +1781,104 @@ impl<C: OpcClient> IndexManager<C> {
             && let Err(error) =
                 self.with_database(|db| db.insert_entries(&server, generation, &pending))
         {
+            tracing::error!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                server = %server,
+                generation,
+                operation = "insert_entries",
+                batch_size = pending.len(),
+                error = %error,
+                "namespace index database operation failed"
+            );
             failed = Some(error.to_string());
         }
 
         if let Some(error) = failed {
             let _ = self.with_database(|db| db.fail_generation(&server, generation, &error));
-            self.finish_build(&server, Some(error));
+            tracing::error!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                server = %server,
+                generation,
+                duration_ms = build_started.elapsed().as_millis() as u64,
+                error = %error,
+                "namespace index build failed"
+            );
+            self.finish_build_for_control(&server, &handle.control, Some(error));
         } else if completed && !cancelled && !handle.control.is_cancelled() {
             let result = self.with_database(|db| {
-                db.promote(&server, generation, &timestamp_now(), &last_progress)
+                let completed_at = timestamp_now();
+                match completion_warning.as_deref() {
+                    Some(warning) => db.promote_with_warning(
+                        &server,
+                        generation,
+                        &completed_at,
+                        &last_progress,
+                        Some(warning),
+                    ),
+                    None => db.promote(&server, generation, &completed_at, &last_progress),
+                }
             });
             match result {
                 Ok(()) => {
                     if let Ok(mut cache) = self.cache.lock() {
                         cache.clear_server(&server);
                     }
-                    self.finish_build(&server, None);
+                    tracing::info!(
+                        process_id = std::process::id(),
+                        database = %self.settings.database_path.display(),
+                        server = %server,
+                        generation,
+                        duration_ms = build_started.elapsed().as_millis() as u64,
+                        entries_seen = last_progress.entries_seen,
+                        unique_items = last_progress.unique_items,
+                        "namespace index build completed"
+                    );
+                    if let Some(warning) = completion_warning {
+                        tracing::warn!(
+                            process_id = std::process::id(),
+                            database = %self.settings.database_path.display(),
+                            server = %server,
+                            generation,
+                            warning = %warning,
+                            "namespace index completed with warning"
+                        );
+                    }
+                    self.finish_build_for_control(&server, &handle.control, None);
                 }
                 Err(error) => {
+                    tracing::error!(
+                        process_id = std::process::id(),
+                        database = %self.settings.database_path.display(),
+                        server = %server,
+                        generation,
+                        operation = "promote",
+                        error = %error,
+                        "namespace index database operation failed"
+                    );
                     let _ = self.with_database(|db| {
                         db.fail_generation(&server, generation, &error.to_string())
                     });
-                    self.finish_build(&server, Some(error.to_string()));
+                    self.finish_build_for_control(
+                        &server,
+                        &handle.control,
+                        Some(error.to_string()),
+                    );
                 }
             }
         } else {
             let _ = self.with_database(|db| db.discard_generation(&server, generation));
-            self.finish_build(&server, None);
+            tracing::warn!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                server = %server,
+                generation,
+                duration_ms = build_started.elapsed().as_millis() as u64,
+                cancelled,
+                "namespace index build cancelled"
+            );
+            self.finish_build_for_control(&server, &handle.control, None);
         }
     }
 
@@ -1747,7 +2027,55 @@ impl<C: OpcClient> IndexManager<C> {
             state.retry_after = error.map(|_| SystemTime::now() + RETRY_BACKOFF);
             state.build = None;
         }
+        self.clear_build_lock();
         self.clear_active_build(server);
+    }
+
+    fn finish_build_for_control(
+        &self,
+        server: &str,
+        control: &Arc<dyn InventoryControl>,
+        error: Option<String>,
+    ) {
+        let owns_build = match self.runtime.lock() {
+            Ok(mut runtime) => {
+                if let Some(state) = runtime.get_mut(server) {
+                    let is_current = state
+                        .build
+                        .as_ref()
+                        .and_then(|build| build.control.as_ref())
+                        .is_some_and(|current| Arc::ptr_eq(current, control));
+                    if is_current {
+                        state.last_error = error.clone();
+                        state.retry_after = error.map(|_| SystemTime::now() + RETRY_BACKOFF);
+                        let _ = state.build.take();
+                    }
+                    is_current
+                } else {
+                    false
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    process_id = std::process::id(),
+                    database = %self.settings.database_path.display(),
+                    server,
+                    "unable to finalize namespace index build because the runtime lock is poisoned"
+                );
+                return;
+            }
+        };
+        if owns_build {
+            self.clear_build_lock();
+            self.clear_active_build(server);
+        } else {
+            tracing::warn!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                server,
+                "ignored completion from obsolete namespace index build"
+            );
+        }
     }
 
     fn record_start_failure(&self, server: &str, error: &str) -> anyhow::Result<()> {
@@ -1760,8 +2088,15 @@ impl<C: OpcClient> IndexManager<C> {
         state.retry_after = Some(SystemTime::now() + RETRY_BACKOFF);
         state.build = None;
         drop(runtime);
+        self.clear_build_lock();
         self.clear_active_build(server);
         Ok(())
+    }
+
+    fn clear_build_lock(&self) {
+        if let Ok(mut build_locks) = self.build_locks.lock() {
+            build_locks.remove(&self.settings.database_path);
+        }
     }
 
     fn clear_active_build(&self, server: &str) {
@@ -1786,6 +2121,11 @@ impl<C: OpcClient> IndexManager<C> {
             .lock()
             .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
         if database.is_none() {
+            tracing::debug!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                "initializing namespace index database handle"
+            );
             *database = Some(IndexDb::open(&self.settings.database_path)?);
         }
         operation(database.as_mut().expect("database initialized"))
@@ -1880,6 +2220,14 @@ fn empty_status(server: &str, configured: bool, state: IndexState) -> IndexStatu
         source: BrowseSource::Unspecified,
         progress: None,
     }
+}
+
+fn is_quarantinable_index_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("unsupported namespace index schema version")
+        || message.contains("invalid namespace index schema version")
+        || message.contains("file is not a database")
+        || message.contains("database disk image is malformed")
 }
 
 pub(crate) fn normalize_query(value: &str) -> String {
@@ -2013,6 +2361,70 @@ mod tests {
             "unspecified"
         );
         assert_eq!(namespace_string(NamespaceOrganization::Flat), "flat");
+    }
+
+    #[test]
+    fn build_file_lock_is_exclusive_and_released() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let lock = BuildFileLock::acquire(&database, "S").unwrap();
+        assert!(lock.path.exists());
+        let error = BuildFileLock::acquire(&database, "S").unwrap_err();
+        assert!(error.to_string().contains("build lock already exists"));
+        drop(lock);
+        assert!(!database.with_file_name("index.sqlite3.build.lock").exists());
+        let replacement = BuildFileLock::acquire(&database, "S").unwrap();
+        drop(replacement);
+    }
+
+    #[test]
+    fn build_file_lock_reports_initialization_and_cleanup_errors() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let error = BuildFileLock::acquire_with(&database, "S", |_file, _metadata| {
+            Err(std::io::Error::other("lock metadata write failed"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("lock metadata write failed"));
+        assert!(!database.with_file_name("index.sqlite3.build.lock").exists());
+
+        #[cfg(unix)]
+        {
+            let error = BuildFileLock::acquire(Path::new("/proc/opcda-bridge-index.sqlite3"), "S")
+                .unwrap_err();
+            assert!(!error.to_string().is_empty());
+        }
+
+        let lock = BuildFileLock::acquire(&database, "S").unwrap();
+        let lock_path = lock.path.clone();
+        fs::remove_file(&lock_path).unwrap();
+        fs::create_dir(&lock_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || drop(lock));
+        assert!(lock_path.is_dir());
+        fs::remove_dir(lock_path).unwrap();
+    }
+
+    #[test]
+    fn only_corrupt_or_incompatible_index_errors_are_quarantinable() {
+        assert!(is_quarantinable_index_error(&anyhow::anyhow!(
+            "unsupported namespace index schema version 99"
+        )));
+        assert!(is_quarantinable_index_error(&anyhow::anyhow!(
+            "invalid namespace index schema version \"corrupt\""
+        )));
+        assert!(is_quarantinable_index_error(&anyhow::anyhow!(
+            "SQLite error: file is not a database"
+        )));
+        assert!(!is_quarantinable_index_error(&anyhow::anyhow!(
+            "FOREIGN KEY constraint failed"
+        )));
+        assert!(!is_quarantinable_index_error(&anyhow::anyhow!(
+            "database is locked"
+        )));
         assert_eq!(
             parse_namespace("hierarchical"),
             NamespaceOrganization::Hierarchical
@@ -2156,6 +2568,28 @@ mod tests {
             .unwrap();
         drop(invalid);
 
+        let invalid_version_path = directory.path().join("invalid-version.sqlite3");
+        let invalid_version = Connection::open(&invalid_version_path).unwrap();
+        invalid_version
+            .execute_batch(
+                "CREATE TABLE index_meta (
+                     key TEXT PRIMARY KEY NOT NULL,
+                     value TEXT NOT NULL
+                 );
+                 INSERT INTO index_meta(key, value)
+                 VALUES ('schema_version', 'corrupt');",
+            )
+            .unwrap();
+        drop(invalid_version);
+        let error = IndexDb::open_once(&invalid_version_path)
+            .err()
+            .expect("invalid schema version should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid namespace index schema version")
+        );
+
         let subscriber = tracing_subscriber::fmt()
             .with_test_writer()
             .with_max_level(tracing::Level::WARN)
@@ -2250,7 +2684,14 @@ mod tests {
                 .is_err()
         );
 
-        db.fail_generation("S", generation, "failed").unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            db.fail_generation("S", generation, "failed")
+        })
+        .unwrap();
         let failed = db.status_rows("S").unwrap();
         assert_eq!(failed[0].state, "failed");
         assert_eq!(failed[0].last_error.as_deref(), Some("failed"));
@@ -2718,13 +3159,17 @@ mod tests {
                     quiet_until: None,
                 }),
                 retry_after: None,
-                last_error: None,
+                last_error: Some("obsolete build failure".into()),
             },
         );
         let refreshing = manager.status("S").await.unwrap();
         assert_eq!(refreshing.state, IndexState::Refreshing);
         assert_eq!(refreshing.started_at.as_deref(), Some("runtime-start"));
         assert!(refreshing.progress.is_some());
+        assert_ne!(
+            refreshing.last_error.as_deref(),
+            Some("obsolete build failure")
+        );
 
         {
             let mut runtime = manager.runtime.lock().unwrap();
@@ -2987,9 +3432,15 @@ mod tests {
         assert_eq!(status.last_error.as_deref(), Some("capabilities failed"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn refresh_database_failure_cancels_inventory_and_records_error() {
         let directory = tempdir().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
         let control = Arc::new(RecordingInventoryControl::default());
         let client = Arc::new(LifecycleClient::new(
             vec![Ok(handle_with_control(
@@ -3023,6 +3474,124 @@ mod tests {
                 .clone(),
             Some(error)
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_a_duplicate_in_process_build_lock() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("index.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(LifecycleClient::new(vec![], vec![])),
+            settings(path.clone()),
+        ));
+        let lock = BuildFileLock::acquire(&path, "S").unwrap();
+        manager.build_locks.lock().unwrap().insert(path, lock);
+
+        let error = manager.refresh("S", true).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("build lock is already held in this process")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_cancels_inventory_when_shutdown_is_requested_after_start() {
+        let directory = tempdir().unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        let inventory_started = Arc::new(Notify::new());
+        let inventory_release = Arc::new(Notify::new());
+        let client = Arc::new(
+            LifecycleClient::new(
+                vec![Ok(handle_with_control(
+                    VecDeque::new(),
+                    Arc::clone(&control),
+                ))],
+                vec![],
+            )
+            .with_inventory_gate(
+                Arc::clone(&inventory_started),
+                Arc::clone(&inventory_release),
+            ),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        let refresh_manager = Arc::clone(&manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+
+        inventory_started.notified().await;
+        manager.background_tasks.request_shutdown();
+        inventory_release.notify_one();
+
+        let status = refresh.await.unwrap().unwrap();
+        assert_eq!(status.state, IndexState::NotIndexed);
+        assert!(control.cancelled.load(Ordering::Acquire));
+        assert!(!directory.path().join("index.sqlite3.build.lock").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_discards_generation_when_shutdown_is_requested_before_spawn() {
+        let directory = tempdir().unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        let capability_started = Arc::new(Notify::new());
+        let capability_release = Arc::new(Notify::new());
+        let client = Arc::new(
+            LifecycleClient::new(
+                vec![Ok(handle_with_control(
+                    VecDeque::new(),
+                    Arc::clone(&control),
+                ))],
+                vec![],
+            )
+            .with_capability_gate(
+                Arc::clone(&capability_started),
+                Arc::clone(&capability_release),
+            ),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        let refresh_manager = Arc::clone(&manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+
+        capability_started.notified().await;
+        manager.background_tasks.request_shutdown();
+        capability_release.notify_one();
+
+        let status = refresh.await.unwrap().unwrap();
+        assert_eq!(status.state, IndexState::NotIndexed);
+        assert!(control.cancelled.load(Ordering::Acquire));
+        assert!(
+            manager
+                .with_database(|db| db.status_rows("S"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_cleans_up_when_background_spawn_is_rejected() {
+        let directory = tempdir().unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(LifecycleClient::new(
+                vec![Ok(handle_with_control(
+                    VecDeque::new(),
+                    Arc::clone(&control),
+                ))],
+                vec![],
+            )),
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        manager.background_tasks.reject_next_spawn();
+
+        let status = manager.refresh("S", true).await.unwrap();
+        assert_eq!(status.state, IndexState::NotIndexed);
+        assert!(control.cancelled.load(Ordering::Acquire));
+        assert!(!directory.path().join("index.sqlite3.build.lock").exists());
     }
 
     #[tokio::test]
@@ -3128,6 +3697,7 @@ mod tests {
         ));
         manager.refresh("S", true).await.unwrap();
         wait_for_build(&manager, IndexState::Ready).await;
+        assert!(!directory.path().join("index.sqlite3.build.lock").exists());
         let ready = manager.status("S").await.unwrap();
         assert_eq!(ready.active_generation, 1);
         assert_eq!(
@@ -3147,6 +3717,7 @@ mod tests {
             .push_back(Err("inventory failed".into()));
         manager.refresh("S", true).await.unwrap();
         wait_for_build(&manager, IndexState::Failed).await;
+        assert!(!directory.path().join("index.sqlite3.build.lock").exists());
         let failed = manager.status("S").await.unwrap();
         assert_eq!(failed.active_generation, 1);
         assert_eq!(failed.state, IndexState::Failed);
@@ -3161,7 +3732,60 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_inventory_warning_keeps_generation_active_and_searchable() {
+        let directory = tempdir().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let warning = "skipped 1 DA2 branch name(s) rejected by the server";
+        let client = Arc::new(LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::from([
+                    Ok(InventoryEvent::Entry(inventory_entry("Tag", "S.Tag"))),
+                    Ok(InventoryEvent::Completed(InventoryCompleted {
+                        complete: true,
+                        cancelled: false,
+                        truncated: false,
+                        warning: Some(warning.into()),
+                        organization: NamespaceOrganization::Hierarchical,
+                        source: BrowseSource::Da2,
+                    })),
+                ]),
+                Arc::new(RecordingInventoryControl::default()),
+            ))],
+            vec![],
+        ));
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("index.sqlite3")),
+        ));
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Ready).await;
+
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::Ready);
+        assert_eq!(status.active_generation, 1);
+        assert_eq!(status.last_error.as_deref(), Some(warning));
+        assert_eq!(
+            manager
+                .search("S", "tag", 3, 10)
+                .await
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+        let rows = manager.with_database(|db| db.status_rows("S")).unwrap();
+        assert_eq!(rows[0].state, "active");
+        assert_eq!(rows[0].last_error.as_deref(), Some(warning));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn build_terminal_error_and_cancellation_paths_preserve_consistent_status() {
         async fn run_case(
             events: VecDeque<anyhow::Result<InventoryEvent>>,
@@ -3185,6 +3809,12 @@ mod tests {
             let status = manager.status("S").await.unwrap();
             assert_eq!(status.last_error.as_deref(), expected_error);
         }
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
 
         run_case(
             VecDeque::new(),
@@ -3244,6 +3874,13 @@ mod tests {
         )
         .await;
         run_case(
+            VecDeque::from([Err(anyhow::anyhow!("inventory stream failed"))]),
+            vec![],
+            IndexState::Failed,
+            Some("inventory stream failed"),
+        )
+        .await;
+        run_case(
             VecDeque::new(),
             vec!["invalid".into()],
             IndexState::Failed,
@@ -3252,9 +3889,15 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn build_reports_batch_progress_and_promotion_database_failures() {
         let directory = tempdir().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
         let mut successful_config = settings(directory.path().join("successful-batch.sqlite3"));
         successful_config.batch_size = 1;
         let successful_manager = Arc::new(IndexManager::new(
@@ -3366,6 +4009,51 @@ mod tests {
                 .last_error
                 .unwrap()
                 .contains("promotion failed")
+        );
+
+        let final_insert_client = Arc::new(LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::from([
+                    Ok(InventoryEvent::Entry(inventory_entry("Final", "S.Final"))),
+                    Ok(InventoryEvent::Completed(InventoryCompleted {
+                        complete: true,
+                        cancelled: false,
+                        truncated: false,
+                        warning: None,
+                        organization: NamespaceOrganization::Hierarchical,
+                        source: BrowseSource::Da2,
+                    })),
+                ]),
+                Arc::new(RecordingInventoryControl::default()),
+            ))],
+            vec![],
+        ));
+        let final_insert_manager = Arc::new(IndexManager::new(
+            final_insert_client,
+            settings(directory.path().join("final-insert.sqlite3")),
+        ));
+        final_insert_manager.refresh("S", true).await.unwrap();
+        final_insert_manager
+            .with_database(|db| {
+                db.connection.execute_batch(
+                    "CREATE TRIGGER fail_final_insert
+                     BEFORE INSERT ON entries
+                     BEGIN
+                       SELECT RAISE(FAIL, 'final insert failed');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        wait_for_state(&final_insert_manager, "S", IndexState::Failed).await;
+        assert!(
+            final_insert_manager
+                .status("S")
+                .await
+                .unwrap()
+                .last_error
+                .unwrap()
+                .contains("final insert failed")
         );
     }
 
@@ -3597,6 +4285,17 @@ mod tests {
         assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn background_task_registry_rejects_work_when_its_state_lock_is_poisoned() {
+        let tasks = Arc::new(BackgroundTasks::new());
+        let state = Arc::clone(&tasks);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = state.state.lock().unwrap();
+            panic!("poison background task state for error-path coverage");
+        });
+        assert!(!tasks.spawn(async {}));
+    }
+
     #[test]
     fn foreground_guard_resumes_synchronously_without_a_tokio_runtime() {
         let directory = tempdir().unwrap();
@@ -3652,6 +4351,44 @@ mod tests {
         ));
         manager.foreground_end("Missing");
         tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_build_for_control_handles_current_obsolete_and_poisoned_runtime() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let current: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, Arc::clone(&current));
+        manager.finish_build_for_control("S", &current, Some("failed".into()));
+        let state = manager.runtime.lock().unwrap();
+        assert!(state.get("S").unwrap().build.is_none());
+        assert_eq!(
+            state.get("S").unwrap().last_error.as_deref(),
+            Some("failed")
+        );
+        drop(state);
+
+        let current: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        let obsolete: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, Arc::clone(&current));
+        manager.finish_build_for_control("S", &obsolete, None);
+        manager.finish_build_for_control("Missing", &obsolete, None);
+
+        let runtime = Arc::clone(&manager.runtime);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = runtime.lock().unwrap();
+            panic!("poison index runtime for finalization error-path coverage");
+        });
+        manager.finish_build_for_control("S", &obsolete, None);
     }
 
     #[tokio::test]
@@ -3761,6 +4498,30 @@ mod tests {
         });
         assert!(!limiter.acquire(&rate_trait).await);
         cancel_task.await.unwrap();
+
+        let progress_control = Arc::new(RecordingInventoryControl::default());
+        progress_control.cancel_on_pause();
+        let progress_client = Arc::new(LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::from([Ok(InventoryEvent::Progress(InventoryProgress {
+                    branches_visited: 1,
+                    entries_seen: 1,
+                    unique_items: 1,
+                    active_time_ms: 1,
+                    paused_time_ms: 0,
+                    items_per_second: 1.0,
+                    estimated_remaining_ms: None,
+                }))]),
+                Arc::clone(&progress_control),
+            ))],
+            vec![],
+        ));
+        let mut progress_config = settings(directory.path().join("duty-progress.sqlite3"));
+        progress_config.duty_cycle_percent = 50;
+        let progress_manager = Arc::new(IndexManager::new(progress_client, progress_config));
+        progress_manager.refresh("S", true).await.unwrap();
+        wait_for_state(&progress_manager, "S", IndexState::Failed).await;
+        assert!(progress_control.cancelled.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -4310,6 +5071,7 @@ mod tests {
     struct RecordingInventoryControl {
         paused: AtomicBool,
         cancelled: AtomicBool,
+        cancel_on_pause: AtomicBool,
         pause_count: AtomicUsize,
         resume_count: AtomicUsize,
     }
@@ -4318,6 +5080,9 @@ mod tests {
         fn pause(&self) {
             self.pause_count.fetch_add(1, Ordering::Relaxed);
             self.paused.store(true, Ordering::Release);
+            if self.cancel_on_pause.load(Ordering::Acquire) {
+                self.cancelled.store(true, Ordering::Release);
+            }
         }
 
         fn resume(&self) {
@@ -4331,6 +5096,12 @@ mod tests {
 
         fn is_cancelled(&self) -> bool {
             self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    impl RecordingInventoryControl {
+        fn cancel_on_pause(&self) {
+            self.cancel_on_pause.store(true, Ordering::Release);
         }
     }
 
@@ -4387,6 +5158,8 @@ mod tests {
         capability_delay: Mutex<Duration>,
         capability_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
         capability_gate_used: AtomicBool,
+        inventory_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+        inventory_gate_used: AtomicBool,
         inventory_start_count: AtomicUsize,
     }
 
@@ -4401,6 +5174,8 @@ mod tests {
                 capability_delay: Mutex::new(Duration::ZERO),
                 capability_gate: Mutex::new(None),
                 capability_gate_used: AtomicBool::new(false),
+                inventory_gate: Mutex::new(None),
+                inventory_gate_used: AtomicBool::new(false),
                 inventory_start_count: AtomicUsize::new(0),
             }
         }
@@ -4412,6 +5187,11 @@ mod tests {
 
         fn with_capability_gate(self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
             *self.capability_gate.lock().unwrap() = Some((started, release));
+            self
+        }
+
+        fn with_inventory_gate(self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
+            *self.inventory_gate.lock().unwrap() = Some((started, release));
             self
         }
     }
@@ -4467,6 +5247,13 @@ mod tests {
             _batch_size: u32,
         ) -> anyhow::Result<InventoryHandle> {
             self.inventory_start_count.fetch_add(1, Ordering::Relaxed);
+            let gate = self.inventory_gate.lock().unwrap().clone();
+            if !self.inventory_gate_used.swap(true, Ordering::AcqRel)
+                && let Some((started, release)) = gate
+            {
+                started.notify_one();
+                release.notified().await;
+            }
             self.inventories
                 .lock()
                 .unwrap()

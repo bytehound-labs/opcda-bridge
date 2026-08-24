@@ -486,6 +486,11 @@ struct IndexStatusRow {
 }
 
 fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
+    let diagnostic_label = if status.state != "failed" && status.last_error.is_some() {
+        "Last warning"
+    } else {
+        "Last error"
+    };
     let mut rows = vec![
         ("Server", status.server.clone()),
         ("State", status.state.clone()),
@@ -505,7 +510,7 @@ fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
             status.completed_at.clone().unwrap_or_else(|| "-".into()),
         ),
         (
-            "Last error",
+            diagnostic_label,
             status.last_error.clone().unwrap_or_else(|| "-".into()),
         ),
     ];
@@ -1356,6 +1361,29 @@ mod tests {
                 .unwrap()
                 .contains("\"progress\": null")
         );
+    }
+
+    #[test]
+    fn indexed_search_status_renders_nonfailed_diagnostics_as_warnings() {
+        let status = IndexStatusOutput {
+            server: "S".into(),
+            state: "ready".into(),
+            configured: true,
+            active_generation: 1,
+            entry_count: 1,
+            unique_item_count: 1,
+            started_at: None,
+            completed_at: None,
+            last_error: Some("partial inventory".into()),
+            database_bytes: 1,
+            organization: "hierarchical".into(),
+            source: "da2".into(),
+            progress: None,
+        };
+
+        let table = output::render(index_status_rows(&status), OutputFormat::Table).unwrap();
+        assert!(table.contains("Last warning"));
+        assert!(table.contains("partial inventory"));
     }
 
     fn typed_page() -> BrowsePage {

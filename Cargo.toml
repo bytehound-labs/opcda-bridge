@@ -20,9 +20,7 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
-# The bridge uses the ByteHound-published fork while retaining the upstream
-# dependency alias in Rust source (`opc_da_client`).
-opc-da-client = { package = "bytehound-opc-da-client", version = "0.2.2" }
+opc-da-client = { package = "bytehound-opc-da-client", version = "0.2.3" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
 prost = "0.14"

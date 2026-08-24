@@ -146,7 +146,9 @@ config file — see [Configuration](#configuration) below.
   ```
   Operators can use `index-pause`, `index-resume`, and `index-cancel` for an active build.
   Refreshes run asynchronously, and responses distinguish `not-indexed`, `partial`, `ready`,
-  `stale`, `refreshing`, and `failed` states. A no-match response is authoritative only for a
+  `stale`, `refreshing`, and `failed` states. A completed inventory may also carry a non-fatal
+  warning while remaining `ready`; clients display that diagnostic as a warning rather than
+  treating the active generation as failed. A no-match response is authoritative only for a
   complete index.
 - Release a browse session before its gateway-side expiry:
 
@@ -289,6 +291,15 @@ The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (
 `$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS and
 `%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows. Maintenance-window entries are local
 24-hour ranges such as `22:00-06:00`; when configured, indexing is deferred outside those ranges.
+
+Run only one gateway process with a given index database path. A gateway automatically loads
+`opcda-bridge-gateway.toml` next to its executable, so launching a second copy from the same
+directory can otherwise start a second inventory against the same SQLite file. When multiple
+gateway instances are intentional, give each instance an explicit, different
+`index.database_path` and configure indexing on only the instance that should build that
+server's index. An active build also creates a sibling `.build.lock` file; it is removed when
+the build exits cleanly. If a process was terminated forcibly, inspect the lock contents and
+remove the stale lock only after confirming that no gateway is still using that database.
 
 ### Client
 
