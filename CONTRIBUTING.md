@@ -45,7 +45,8 @@ Example: `feat(gateway): add tag subscription support`.
 - Cross-version protocol checks run from the isolated `compatibility-tests/` workspace:
   `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`.
   The workflow regenerates that workspace's lockfile when package manifests change because path
-  dependencies carry the branch's package versions.
+  dependencies carry the branch's package versions, and release automation commits the matching
+  lockfile after a package release.
 
 ## CI
 

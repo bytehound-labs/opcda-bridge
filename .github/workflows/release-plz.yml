@@ -36,6 +36,30 @@ jobs:
           command: release
           token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+      - name: Synchronize compatibility test lockfile after release
+        shell: bash
+        env:
+          RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          release_commit_re='^chore(\([^)]*\))?!?:[[:space:]]release([[:space:]]|$)'
+          subject="$(git log -1 --format=%s)"
+          if [[ ! "$subject" =~ $release_commit_re ]]; then
+            echo "The current commit is not a release commit; no compatibility lockfile sync is needed."
+            exit 0
+          fi
+
+          cargo generate-lockfile --manifest-path compatibility-tests/Cargo.toml
+          if git diff --quiet -- compatibility-tests/Cargo.lock; then
+            echo "The compatibility test lockfile already matches the released package versions."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add compatibility-tests/Cargo.lock
+          git commit -m "chore: sync compatibility test lockfile"
+          git push "https://x-access-token:${RELEASE_PLZ_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest

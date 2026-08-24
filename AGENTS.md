@@ -103,7 +103,8 @@ and historical gateway services backed by mock `OpcClient` implementations. An e
 does not need prior CI evidence when its negotiated protocol ranges overlap, but the CLI reports
 such pairings as `unverified`. Release-plz pull requests regenerate the isolated test workspace's
 lockfile before running the same locked test command when package manifests change, because path
-package versions change in the release branch.
+package versions change in the release branch. The release workflow commits the matching lockfile
+after a release commit so the main branch remains runnable with `--locked`.
 
 An intentional Protobuf break requires the `breaking-protobuf` label, a new or changed catalog
 boundary, updated evidence, and regenerated compatibility reports. Release-integrity validation
