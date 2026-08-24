@@ -197,7 +197,8 @@ checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 [[package]]
 name = "bytehound-opc-da-client"
 version = "0.2.3"
-source = "git+https://github.com/bytehound-labs/opc-cli.git?rev=284dbbd#284dbbd17f06071d10c4ed7663f3296e9f5c1fcc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4659cc790ccd80b94334499452833e196e8891be8afdc2148b4e0ed7ecc5c3b3"
 dependencies = [
  "anyhow",
  "async-trait",
