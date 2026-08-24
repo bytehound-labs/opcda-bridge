@@ -747,7 +747,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e084c362f4cb9c6e93cf0e7f950c601e1fc4098d2eee75b676d42f03307d3173"
 dependencies = [
- "opcda-bridge-proto 0.4.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "opcda-bridge-proto 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
  "tonic",
  "tonic-prost",
@@ -755,9 +755,9 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
- "opcda-bridge-proto 0.4.4",
+ "opcda-bridge-proto 0.4.5",
  "serde",
  "thiserror",
  "tonic",
@@ -772,11 +772,11 @@ dependencies = [
  "async-trait",
  "opcda-bridge 0.3.2",
  "opcda-bridge 0.4.0",
- "opcda-bridge 0.4.4",
+ "opcda-bridge 0.4.5",
  "opcda-bridge-gateway 0.3.2",
- "opcda-bridge-gateway 0.4.4",
+ "opcda-bridge-gateway 0.4.5",
  "opcda-bridge-proto 0.3.2",
- "opcda-bridge-proto 0.4.4",
+ "opcda-bridge-proto 0.4.5",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -809,14 +809,14 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytehound-opc-da-client",
  "chrono",
  "clap",
- "opcda-bridge-proto 0.4.4",
+ "opcda-bridge-proto 0.4.5",
  "rusqlite",
  "serde",
  "serde_json",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "prost",
  "toml",
@@ -857,9 +857,9 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca809d8bd46ee8e6c0b11dbd3de11c3e02a5aeec4a08d2e4ce0f905d27215ede"
+checksum = "28af995bbbf320d5afc1a14d1352bd2f3862b00cf73f5c2ec7850f536b18334a"
 dependencies = [
  "prost",
  "toml",
