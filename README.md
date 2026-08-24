@@ -199,6 +199,12 @@ config file — see [Configuration](#configuration) below.
   warning while remaining `ready`; clients display that diagnostic as a warning rather than
   treating the active generation as failed. A no-match response is authoritative only for a
   complete index.
+  Active generations remain durable across restarts. Activation is an atomic metadata transition,
+  while superseded and abandoned data is reclaimed in bounded background batches, so indexing
+  maintenance does not interrupt indexed search or status requests.
+  DA3 root ItemIDs and unused filters are marshalled as required non-null empty strings. If the
+  first DA3 root browse still returns `RPC_X_NULL_REF_POINTER` or `E_NOTIMPL`, a server that also
+  supports DA2 continues through DA2 with an explicit compatibility warning.
   DA2 hierarchical inventory validates every server-reported branch before queueing it.
   Branch-only names rejected by native navigation with `E_INVALIDARG` are skipped and included in
   the completion warning, while names that resolve to exact items remain selectable.

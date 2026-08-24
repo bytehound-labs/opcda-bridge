@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 2;
 const RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const CLEANUP_BATCH_SIZE: usize = 10_000;
+const CLEANUP_BATCH_PAUSE: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexState {
@@ -95,6 +97,12 @@ struct BackgroundTaskState {
 
 struct BackgroundTaskGuard {
     tasks: Arc<BackgroundTasks>,
+}
+
+#[derive(Default)]
+struct CleanupTaskState {
+    running: bool,
+    requested: bool,
 }
 
 impl BackgroundTasks {
@@ -467,6 +475,7 @@ impl IndexDb {
     fn open_once(path: &Path) -> anyhow::Result<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS index_meta (
@@ -533,20 +542,13 @@ impl IndexDb {
                VALUES ('schema_version', '2');",
         )?;
         connection.execute(
-            "DELETE FROM entries
-             WHERE EXISTS (
-                 SELECT 1 FROM generations
-                 WHERE state = 'staging'
-                   AND generations.server = entries.server
-                   AND generations.generation = entries.generation
-             )",
-            [],
-        )?;
-        connection.execute("DELETE FROM generations WHERE state = 'staging'", [])?;
-        connection.execute("DELETE FROM entries_fts", [])?;
-        connection.execute(
-            "INSERT INTO entries_fts(server, generation, item_id, display_name, breadcrumbs)
-             SELECT server, generation, item_id, display_name, breadcrumbs FROM entries",
+            "UPDATE generations
+             SET state = 'failed',
+                 last_error = COALESCE(
+                     last_error,
+                     'namespace index build interrupted by gateway restart'
+                 )
+             WHERE state = 'staging'",
             [],
         )?;
         Ok(Self {
@@ -572,43 +574,22 @@ impl IndexDb {
             [server],
             |row| row.get::<_, i64>(0),
         )?;
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM entries_fts
-             WHERE server = ?1
-               AND generation IN (
-                   SELECT generation FROM generations
-                   WHERE server = ?1 AND state IN ('staging', 'failed')
-               )",
-            [server],
-        )?;
-        transaction.execute(
-            "DELETE FROM entries
-             WHERE server = ?1
-               AND generation IN (
-                   SELECT generation FROM generations
-                   WHERE server = ?1 AND state IN ('staging', 'failed')
-               )",
-            [server],
-        )?;
-        transaction.execute(
-            "DELETE FROM generations
-             WHERE server = ?1 AND state IN ('staging', 'failed')",
-            [server],
-        )?;
-        transaction.execute(
+        let generation = u64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation is negative"))?;
+        self.connection.execute(
             "INSERT INTO generations
              (server, generation, state, organization, source, started_at)
              VALUES (?1, ?2, 'staging', ?3, ?4, ?5)",
             params![
                 server,
-                generation,
+                i64::try_from(generation).map_err(|_| anyhow::anyhow!(
+                    "namespace index generation exceeds SQLite range"
+                ))?,
                 namespace_string(organization),
                 source_string(source),
                 started_at
             ],
         )?;
-        transaction.commit()?;
         tracing::debug!(
             process_id = std::process::id(),
             database = %self.path.display(),
@@ -616,7 +597,7 @@ impl IndexDb {
             generation,
             "started namespace index generation"
         );
-        Ok(generation as u64)
+        Ok(generation)
     }
 
     fn insert_entries(
@@ -625,6 +606,8 @@ impl IndexDb {
         generation: u64,
         entries: &[InventoryEntry],
     ) -> anyhow::Result<()> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
         let transaction = self.connection.transaction()?;
         for entry in entries {
             if entry.item_id.is_empty() {
@@ -637,7 +620,7 @@ impl IndexDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     server,
-                    generation as i64,
+                    generation,
                     entry.item_id,
                     normalize_query(&entry.item_id),
                     entry.display_name,
@@ -653,7 +636,7 @@ impl IndexDb {
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         server,
-                        generation as i64,
+                        generation,
                         entry.item_id,
                         entry.display_name,
                         entry.breadcrumbs.join(" ")
@@ -679,15 +662,17 @@ impl IndexDb {
         generation: u64,
         progress: &InventoryProgress,
     ) -> anyhow::Result<()> {
+        let entry_count = i64::try_from(progress.entries_seen)
+            .map_err(|_| anyhow::anyhow!("namespace index entry count exceeds SQLite range"))?;
+        let unique_item_count = i64::try_from(progress.unique_items).map_err(|_| {
+            anyhow::anyhow!("namespace index unique item count exceeds SQLite range")
+        })?;
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
         self.connection.execute(
             "UPDATE generations SET entry_count = ?1, unique_item_count = ?2
              WHERE server = ?3 AND generation = ?4 AND state = 'staging'",
-            params![
-                progress.entries_seen as i64,
-                progress.unique_items as i64,
-                server,
-                generation as i64
-            ],
+            params![entry_count, unique_item_count, server, generation],
         )?;
         tracing::debug!(
             process_id = std::process::id(),
@@ -701,6 +686,7 @@ impl IndexDb {
         Ok(())
     }
 
+    #[cfg(test)]
     fn promote(
         &mut self,
         server: &str,
@@ -708,26 +694,31 @@ impl IndexDb {
         completed_at: &str,
         progress: &InventoryProgress,
     ) -> anyhow::Result<()> {
-        self.promote_with_warning(server, generation, completed_at, progress, None)
+        self.promote_with_profile(server, generation, completed_at, progress, None, None)
     }
 
-    fn promote_with_warning(
+    fn promote_with_profile(
         &mut self,
         server: &str,
         generation: u64,
         completed_at: &str,
-        _progress: &InventoryProgress,
+        progress: &InventoryProgress,
+        profile: Option<(NamespaceOrganization, BrowseSource)>,
         warning: Option<&str>,
     ) -> anyhow::Result<()> {
-        let (entry_count, unique_item_count) = self.connection.query_row(
-            "SELECT COUNT(*), COUNT(DISTINCT item_id)
-             FROM entries WHERE server = ?1 AND generation = ?2",
-            params![server, generation as i64],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )?;
-        if entry_count < 0 || unique_item_count < 0 || entry_count != unique_item_count {
-            anyhow::bail!("namespace index generation count validation failed");
-        }
+        let activation_started = Instant::now();
+        let searchable_item_count = i64::try_from(progress.unique_items)
+            .map_err(|_| anyhow::anyhow!("namespace index entry count exceeds SQLite range"))?;
+        let (organization, source) = profile
+            .map(|(organization, source)| {
+                (
+                    Some(namespace_string(organization)),
+                    Some(source_string(source)),
+                )
+            })
+            .unwrap_or((None, None));
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "UPDATE generations SET state = 'superseded'
@@ -737,61 +728,47 @@ impl IndexDb {
         let promoted = transaction.execute(
             "UPDATE generations
              SET state = 'active', completed_at = ?1,
-                 entry_count = ?2, unique_item_count = ?3, last_error = ?4
-             WHERE server = ?5 AND generation = ?6 AND state = 'staging'",
+                 entry_count = ?2, unique_item_count = ?2,
+                 organization = COALESCE(?3, organization),
+                 source = COALESCE(?4, source), last_error = ?5
+             WHERE server = ?6 AND generation = ?7 AND state = 'staging'",
             params![
                 completed_at,
-                entry_count,
-                unique_item_count,
+                searchable_item_count,
+                organization,
+                source,
                 warning,
                 server,
-                generation as i64
+                generation
             ],
         )?;
         if promoted != 1 {
             anyhow::bail!("namespace index generation is not staging");
         }
-        transaction.execute(
-            "DELETE FROM entries_fts
-             WHERE server = ?1
-               AND generation IN (
-                   SELECT generation FROM generations
-                   WHERE server = ?1 AND state = 'superseded'
-               )",
-            [server],
-        )?;
-        transaction.execute(
-            "DELETE FROM entries
-             WHERE server = ?1
-               AND generation IN (
-                   SELECT generation FROM generations
-                   WHERE server = ?1 AND state = 'superseded'
-               )",
-            [server],
-        )?;
-        transaction.execute(
-            "DELETE FROM generations WHERE server = ?1 AND state = 'superseded'",
-            [server],
-        )?;
         transaction.commit()?;
         tracing::info!(
             process_id = std::process::id(),
             database = %self.path.display(),
             server,
             generation,
-            entry_count,
-            unique_item_count,
+            entry_count = searchable_item_count,
+            unique_item_count = searchable_item_count,
+            effective_organization = organization.unwrap_or(""),
+            effective_source = source.unwrap_or(""),
             warning = warning.unwrap_or(""),
-            "promoted namespace index generation"
+            activation_duration_ms = activation_started.elapsed().as_millis() as u64,
+            "activated namespace index generation"
         );
         Ok(())
     }
 
     fn fail_generation(&self, server: &str, generation: u64, error: &str) -> anyhow::Result<()> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
         self.connection.execute(
             "UPDATE generations SET state = 'failed', last_error = ?1
              WHERE server = ?2 AND generation = ?3 AND state = 'staging'",
-            params![error, server, generation as i64],
+            params![error, server, generation],
         )?;
         tracing::warn!(
             process_id = std::process::id(),
@@ -804,22 +781,33 @@ impl IndexDb {
         Ok(())
     }
 
-    fn discard_generation(&mut self, server: &str, generation: u64) -> anyhow::Result<()> {
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM entries_fts WHERE server = ?1 AND generation = ?2",
-            params![server, generation as i64],
+    fn discard_empty_generation(&self, server: &str, generation: u64) -> anyhow::Result<bool> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
+        Ok(self.connection.execute(
+            "DELETE FROM generations
+             WHERE server = ?1 AND generation = ?2 AND state = 'staging'
+               AND NOT EXISTS (
+                   SELECT 1 FROM entries
+                   WHERE entries.server = generations.server
+                     AND entries.generation = generations.generation
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM entries_fts
+                   WHERE entries_fts.server = generations.server
+                     AND entries_fts.generation = generations.generation
+               )",
+            params![server, generation],
+        )? == 1)
+    }
+
+    fn obsolete_servers(&self) -> anyhow::Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT server FROM generations
+             WHERE state IN ('superseded', 'failed')",
         )?;
-        transaction.execute(
-            "DELETE FROM entries WHERE server = ?1 AND generation = ?2",
-            params![server, generation as i64],
-        )?;
-        transaction.execute(
-            "DELETE FROM generations WHERE server = ?1 AND generation = ?2 AND state = 'staging'",
-            params![server, generation as i64],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     fn clear_server(&mut self, server: &str) -> anyhow::Result<()> {
@@ -976,6 +964,170 @@ impl IndexDb {
     }
 }
 
+#[derive(Default)]
+struct CleanupStats {
+    batches: u64,
+    entries: u64,
+    fts_entries: u64,
+    generations: u64,
+    stopped_for_shutdown: bool,
+}
+
+fn cleanup_obsolete_generations(
+    path: &Path,
+    server: &str,
+    background_tasks: &BackgroundTasks,
+) -> anyhow::Result<CleanupStats> {
+    let cleanup_started = Instant::now();
+    let mut connection = Connection::open(path)?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+
+    let mut stats = CleanupStats::default();
+    loop {
+        if background_tasks.is_shutting_down() {
+            stats.stopped_for_shutdown = true;
+            break;
+        }
+        let transaction = connection.transaction()?;
+        let fts_entries = transaction.execute(
+            "DELETE FROM entries_fts
+             WHERE rowid IN (
+                 SELECT f.rowid
+                 FROM entries_fts f
+                 INNER JOIN generations g
+                   ON g.server = f.server AND g.generation = f.generation
+                 WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
+                 LIMIT ?2
+             )",
+            params![server, CLEANUP_BATCH_SIZE as i64],
+        )?;
+        let entries = transaction.execute(
+            "DELETE FROM entries
+             WHERE rowid IN (
+                 SELECT e.rowid
+                 FROM entries e
+                 INNER JOIN generations g
+                   ON g.server = e.server AND g.generation = e.generation
+                 WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
+                 LIMIT ?2
+             )",
+            params![server, CLEANUP_BATCH_SIZE as i64],
+        )?;
+        let generations = transaction.execute(
+            "DELETE FROM generations
+             WHERE rowid IN (
+                 SELECT g.rowid
+                 FROM generations g
+                 WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM entries e
+                       WHERE e.server = g.server AND e.generation = g.generation
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM entries_fts f
+                       WHERE f.server = g.server AND f.generation = g.generation
+                   )
+                 LIMIT ?2
+             )",
+            params![server, CLEANUP_BATCH_SIZE as i64],
+        )?;
+        transaction.commit()?;
+
+        stats.batches = stats.batches.saturating_add(1);
+        stats.fts_entries = stats.fts_entries.saturating_add(fts_entries as u64);
+        stats.entries = stats.entries.saturating_add(entries as u64);
+        stats.generations = stats.generations.saturating_add(generations as u64);
+        if fts_entries == 0 && entries == 0 && generations == 0 {
+            break;
+        }
+        std::thread::sleep(CLEANUP_BATCH_PAUSE);
+    }
+    tracing::info!(
+        process_id = std::process::id(),
+        database = %path.display(),
+        server,
+        batches = stats.batches,
+        entries_deleted = stats.entries,
+        fts_entries_deleted = stats.fts_entries,
+        generations_deleted = stats.generations,
+        stopped_for_shutdown = stats.stopped_for_shutdown,
+        duration_ms = cleanup_started.elapsed().as_millis() as u64,
+        "completed namespace index obsolete-generation cleanup"
+    );
+    Ok(stats)
+}
+
+async fn run_scheduled_cleanup(
+    path: PathBuf,
+    server: String,
+    background_tasks: Arc<BackgroundTasks>,
+    cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+) {
+    loop {
+        let should_run = cleanup_tasks
+            .lock()
+            .map(|mut tasks| {
+                let task = tasks.entry(server.clone()).or_default();
+                task.requested = false;
+                !background_tasks.is_shutting_down()
+            })
+            .unwrap_or(false);
+        if !should_run {
+            if let Ok(mut tasks) = cleanup_tasks.lock() {
+                tasks.remove(&server);
+            }
+            return;
+        }
+
+        let cleanup_path = path.clone();
+        let cleanup_server = server.clone();
+        let cleanup_tasks_for_blocking = Arc::clone(&background_tasks);
+        match tokio::task::spawn_blocking(move || {
+            cleanup_obsolete_generations(
+                &cleanup_path,
+                &cleanup_server,
+                cleanup_tasks_for_blocking.as_ref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(
+                process_id = std::process::id(),
+                database = %path.display(),
+                server,
+                error = %error,
+                "namespace index obsolete-generation cleanup failed"
+            ),
+            Err(error) => tracing::warn!(
+                process_id = std::process::id(),
+                database = %path.display(),
+                server,
+                error = %error,
+                "namespace index cleanup worker failed"
+            ),
+        }
+
+        let rerun = cleanup_tasks
+            .lock()
+            .map(|mut tasks| {
+                let rerun = tasks
+                    .get(&server)
+                    .is_some_and(|task| task.requested && !background_tasks.is_shutting_down());
+                if !rerun {
+                    tasks.remove(&server);
+                }
+                rerun
+            })
+            .unwrap_or(false);
+        if !rerun {
+            return;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DbStatus {
     generation: u64,
@@ -999,6 +1151,7 @@ pub struct IndexManager<C: OpcClient> {
     foreground_users: Arc<Mutex<HashMap<String, usize>>>,
     cache: Arc<Mutex<QueryCache>>,
     background_tasks: Arc<BackgroundTasks>,
+    cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
     background_started: AtomicBool,
 }
 
@@ -1027,6 +1180,7 @@ impl<C: OpcClient> IndexManager<C> {
                 capacity: cache_capacity,
             })),
             background_tasks: Arc::new(BackgroundTasks::new()),
+            cleanup_tasks: Arc::new(Mutex::new(HashMap::new())),
             background_started: AtomicBool::new(false),
         }
     }
@@ -1116,8 +1270,12 @@ impl<C: OpcClient> IndexManager<C> {
                     .get_capabilities(server)
                     .await
                     .map(|capabilities| {
-                        capabilities.organization != status.organization
-                            || capabilities.source != status.source
+                        !index_profile_is_compatible(
+                            status.organization,
+                            status.source,
+                            capabilities.organization,
+                            capabilities.source,
+                        )
                     })
                     .unwrap_or(false);
                 if profile_changed {
@@ -1482,6 +1640,7 @@ impl<C: OpcClient> IndexManager<C> {
                 return Err(error);
             }
         };
+        self.schedule_cleanup(server);
         let control_result = self
             .runtime
             .lock()
@@ -1499,13 +1658,13 @@ impl<C: OpcClient> IndexManager<C> {
             });
         if let Err(error) = control_result {
             handle.control.cancel();
-            let _ = self.with_database(|db| db.discard_generation(server, generation));
+            self.abandon_generation(server, generation, &error.to_string());
             self.finish_build(server, Some(error.to_string()));
             return Err(error);
         }
         if self.background_tasks.is_shutting_down() {
             handle.control.cancel();
-            let _ = self.with_database(|db| db.discard_generation(server, generation));
+            self.abandon_generation(server, generation, "gateway shutdown before index build");
             self.finish_build(server, None);
             return self.status(server).await;
         }
@@ -1516,7 +1675,7 @@ impl<C: OpcClient> IndexManager<C> {
             manager.run_build(server_name, generation, handle).await;
         }) {
             control.cancel();
-            let _ = self.with_database(|db| db.discard_generation(server, generation));
+            self.abandon_generation(server, generation, "index build task was not started");
             self.finish_build_for_control(server, &control, None);
         }
         self.status(server).await
@@ -1639,8 +1798,7 @@ impl<C: OpcClient> IndexManager<C> {
                 Err(error) => {
                     handle.control.cancel();
                     let message = error.to_string();
-                    let _ =
-                        self.with_database(|db| db.fail_generation(&server, generation, &message));
+                    self.fail_generation_and_schedule_cleanup(&server, generation, &message);
                     self.finish_build_for_control(&server, &handle.control, Some(message));
                     return;
                 }
@@ -1659,6 +1817,7 @@ impl<C: OpcClient> IndexManager<C> {
         let mut cancelled = false;
         let mut failed = None;
         let mut completion_warning = None;
+        let mut completion_profile = None;
         let mut terminal = false;
         let mut accounted_active_time_ms = 0_u64;
         let mut rate_limiter =
@@ -1746,6 +1905,7 @@ impl<C: OpcClient> IndexManager<C> {
                     terminal = true;
                     completed = result.complete;
                     cancelled = result.cancelled;
+                    completion_profile = Some((result.organization, result.source));
                     if result.truncated {
                         failed = Some(
                             result
@@ -1795,7 +1955,7 @@ impl<C: OpcClient> IndexManager<C> {
         }
 
         if let Some(error) = failed {
-            let _ = self.with_database(|db| db.fail_generation(&server, generation, &error));
+            self.fail_generation_and_schedule_cleanup(&server, generation, &error);
             tracing::error!(
                 process_id = std::process::id(),
                 database = %self.settings.database_path.display(),
@@ -1809,19 +1969,18 @@ impl<C: OpcClient> IndexManager<C> {
         } else if completed && !cancelled && !handle.control.is_cancelled() {
             let result = self.with_database(|db| {
                 let completed_at = timestamp_now();
-                match completion_warning.as_deref() {
-                    Some(warning) => db.promote_with_warning(
-                        &server,
-                        generation,
-                        &completed_at,
-                        &last_progress,
-                        Some(warning),
-                    ),
-                    None => db.promote(&server, generation, &completed_at, &last_progress),
-                }
+                db.promote_with_profile(
+                    &server,
+                    generation,
+                    &completed_at,
+                    &last_progress,
+                    completion_profile,
+                    completion_warning.as_deref(),
+                )
             });
             match result {
                 Ok(()) => {
+                    self.schedule_cleanup(&server);
                     if let Ok(mut cache) = self.cache.lock() {
                         cache.clear_server(&server);
                     }
@@ -1857,9 +2016,11 @@ impl<C: OpcClient> IndexManager<C> {
                         error = %error,
                         "namespace index database operation failed"
                     );
-                    let _ = self.with_database(|db| {
-                        db.fail_generation(&server, generation, &error.to_string())
-                    });
+                    self.fail_generation_and_schedule_cleanup(
+                        &server,
+                        generation,
+                        &error.to_string(),
+                    );
                     self.finish_build_for_control(
                         &server,
                         &handle.control,
@@ -1868,7 +2029,7 @@ impl<C: OpcClient> IndexManager<C> {
                 }
             }
         } else {
-            let _ = self.with_database(|db| db.discard_generation(&server, generation));
+            self.abandon_generation(&server, generation, "namespace index build cancelled");
             tracing::warn!(
                 process_id = std::process::id(),
                 database = %self.settings.database_path.display(),
@@ -2105,6 +2266,76 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    fn fail_generation_and_schedule_cleanup(&self, server: &str, generation: u64, error: &str) {
+        match self.with_database(|db| db.fail_generation(server, generation, error)) {
+            Ok(()) => self.schedule_cleanup(server),
+            Err(database_error) => tracing::error!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                server,
+                generation,
+                error = %database_error,
+                "unable to mark failed namespace index generation for cleanup"
+            ),
+        }
+    }
+
+    fn abandon_generation(&self, server: &str, generation: u64, reason: &str) {
+        match self.with_database(|db| db.discard_empty_generation(server, generation)) {
+            Ok(true) => {}
+            Ok(false) => self.fail_generation_and_schedule_cleanup(server, generation, reason),
+            Err(error) => tracing::error!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                server,
+                generation,
+                error = %error,
+                "unable to abandon namespace index generation"
+            ),
+        }
+    }
+
+    fn schedule_cleanup(&self, server: &str) {
+        if self.background_tasks.is_shutting_down() {
+            return;
+        }
+        let should_spawn = match self.cleanup_tasks.lock() {
+            Ok(mut tasks) => {
+                let task = tasks.entry(server.to_string()).or_default();
+                task.requested = true;
+                if task.running {
+                    false
+                } else {
+                    task.running = true;
+                    true
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    process_id = std::process::id(),
+                    database = %self.settings.database_path.display(),
+                    server,
+                    "namespace index cleanup registry lock is poisoned"
+                );
+                return;
+            }
+        };
+        if !should_spawn {
+            return;
+        }
+
+        let path = self.settings.database_path.clone();
+        let cleanup_server = server.to_string();
+        let background_tasks = Arc::clone(&self.background_tasks);
+        let cleanup_tasks = Arc::clone(&self.cleanup_tasks);
+        if !self.background_tasks.spawn(async move {
+            run_scheduled_cleanup(path, cleanup_server, background_tasks, cleanup_tasks).await;
+        }) && let Ok(mut tasks) = self.cleanup_tasks.lock()
+        {
+            tasks.remove(server);
+        }
+    }
+
     fn require_configured(&self, server: &str) -> anyhow::Result<()> {
         if !self.settings.servers.iter().any(|value| value == server) {
             anyhow::bail!("server is not configured for namespace indexing");
@@ -2116,19 +2347,37 @@ impl<C: OpcClient> IndexManager<C> {
     where
         F: FnOnce(&mut IndexDb) -> anyhow::Result<R>,
     {
-        let mut database = self
-            .database
-            .lock()
-            .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
-        if database.is_none() {
-            tracing::debug!(
-                process_id = std::process::id(),
-                database = %self.settings.database_path.display(),
-                "initializing namespace index database handle"
-            );
-            *database = Some(IndexDb::open(&self.settings.database_path)?);
+        let (result, cleanup_servers) = {
+            let mut database = self
+                .database
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
+            let opened = database.is_none();
+            if opened {
+                tracing::debug!(
+                    process_id = std::process::id(),
+                    database = %self.settings.database_path.display(),
+                    "initializing namespace index database handle"
+                );
+                *database = Some(IndexDb::open(&self.settings.database_path)?);
+            }
+            let cleanup_servers = if opened {
+                database
+                    .as_ref()
+                    .expect("database initialized")
+                    .obsolete_servers()?
+            } else {
+                Vec::new()
+            };
+            (
+                operation(database.as_mut().expect("database initialized")),
+                cleanup_servers,
+            )
+        };
+        for server in cleanup_servers {
+            self.schedule_cleanup(&server);
         }
-        operation(database.as_mut().expect("database initialized"))
+        result
     }
 
     fn database_bytes(&self) -> anyhow::Result<u64> {
@@ -2297,6 +2546,17 @@ fn parse_source(value: &str) -> BrowseSource {
     }
 }
 
+fn index_profile_is_compatible(
+    indexed_organization: NamespaceOrganization,
+    indexed_source: BrowseSource,
+    raw_organization: NamespaceOrganization,
+    raw_source: BrowseSource,
+) -> bool {
+    indexed_organization == raw_organization
+        && (indexed_source == raw_source
+            || (indexed_source == BrowseSource::Da2 && raw_source == BrowseSource::Da3))
+}
+
 fn node_kind_number(value: InventoryNodeKind) -> i64 {
     match value {
         InventoryNodeKind::Item => 1,
@@ -2339,6 +2599,22 @@ mod tests {
             paused: false,
             max_results: 50,
         }
+    }
+
+    fn completed_progress(count: u64) -> InventoryProgress {
+        InventoryProgress {
+            entries_seen: count,
+            unique_items: count,
+            ..zero_progress()
+        }
+    }
+
+    fn synthetic_entries(prefix: &str, count: usize) -> Vec<InventoryEntry> {
+        (0..count)
+            .map(|index| {
+                inventory_entry(&format!("{prefix}-{index}"), &format!("{prefix}.{index}"))
+            })
+            .collect()
     }
 
     #[test]
@@ -2442,6 +2718,28 @@ mod tests {
     }
 
     #[test]
+    fn profile_compatibility_preserves_negotiated_da2_fallbacks() {
+        assert!(index_profile_is_compatible(
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da3,
+        ));
+        assert!(!index_profile_is_compatible(
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da3,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+        ));
+        assert!(!index_profile_is_compatible(
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            NamespaceOrganization::Flat,
+            BrowseSource::Da2,
+        ));
+    }
+
+    #[test]
     fn maintenance_windows_parse_and_match_day_boundaries() {
         let daytime = MaintenanceWindow::parse("08:30-17:00").unwrap();
         assert!(daytime.contains(8 * 60 + 30));
@@ -2535,7 +2833,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_open_quarantines_invalid_schema_and_cleans_interrupted_builds() {
+    fn sqlite_open_quarantines_invalid_schema_and_marks_interrupted_builds_failed() {
         let directory = tempdir().unwrap();
         let memory = IndexDb::open(Path::new(":memory:")).unwrap();
         assert_eq!(memory.database_bytes(), 0);
@@ -2610,6 +2908,29 @@ mod tests {
 
         let interrupted_path = directory.path().join("interrupted.sqlite3");
         let mut interrupted = IndexDb::open(&interrupted_path).unwrap();
+        let active = interrupted
+            .start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                "1",
+            )
+            .unwrap();
+        interrupted
+            .insert_entries("S", active, &[inventory_entry("Active", "S.Active")])
+            .unwrap();
+        interrupted
+            .promote(
+                "S",
+                active,
+                "2",
+                &InventoryProgress {
+                    entries_seen: 1,
+                    unique_items: 1,
+                    ..zero_progress()
+                },
+            )
+            .unwrap();
         let generation = interrupted
             .start_generation(
                 "S",
@@ -2624,8 +2945,42 @@ mod tests {
         drop(interrupted);
 
         let reopened = IndexDb::open(&interrupted_path).unwrap();
-        assert!(reopened.status_rows("S").unwrap().is_empty());
-        assert_eq!(reopened.search_generation("S").unwrap(), None);
+        let rows = reopened.status_rows("S").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].state, "active");
+        assert_eq!(rows[0].generation, active);
+        assert_eq!(rows[1].state, "failed");
+        assert_eq!(
+            rows[1].last_error.as_deref(),
+            Some("namespace index build interrupted by gateway restart")
+        );
+        assert_eq!(reopened.search_generation("S").unwrap(), Some(active));
+        assert_eq!(
+            reopened.search("S", active, "active", 1, 10).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE server = 'S' AND generation = ?1",
+                    [generation as i64],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM entries_fts WHERE server = 'S' AND generation = ?1",
+                    [generation as i64],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -2704,9 +3059,9 @@ mod tests {
                 "3",
             )
             .unwrap();
+        assert_eq!(db.status_rows("S").unwrap().len(), 2);
+        assert!(db.discard_empty_generation("S", replacement).unwrap());
         assert_eq!(db.status_rows("S").unwrap().len(), 1);
-        db.discard_generation("S", replacement).unwrap();
-        assert!(db.status_rows("S").unwrap().is_empty());
 
         let other = db
             .start_generation(
@@ -2788,8 +3143,13 @@ mod tests {
                  END;",
             )
             .unwrap();
+        cleanup
+            .fail_generation("S", cleanup_generation, "failed")
+            .unwrap();
         drop(cleanup);
-        assert!(IndexDb::open_once(&cleanup_path).is_err());
+        assert!(
+            cleanup_obsolete_generations(&cleanup_path, "S", &BackgroundTasks::new(),).is_err()
+        );
 
         let rebuild_path = directory.path().join("rebuild.sqlite3");
         let mut rebuild = IndexDb::open(&rebuild_path).unwrap();
@@ -2820,7 +3180,7 @@ mod tests {
             )
             .unwrap();
         drop(rebuild);
-        assert!(IndexDb::open_once(&rebuild_path).is_err());
+        assert!(IndexDb::open_once(&rebuild_path).is_ok());
 
         let mut start_db = IndexDb::open(&directory.path().join("start.sqlite3")).unwrap();
         drop_table(&mut start_db, "generations");
@@ -2861,8 +3221,15 @@ mod tests {
         );
 
         let mut promote_db = IndexDb::open(&directory.path().join("promote.sqlite3")).unwrap();
+        let generation = promote_db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
         drop_table(&mut promote_db, "entries");
-        assert!(promote_db.promote("S", 1, "2", &zero_progress()).is_err());
+        assert!(
+            promote_db
+                .promote("S", generation, "2", &zero_progress())
+                .is_ok()
+        );
 
         let mut fail_db = IndexDb::open(&directory.path().join("fail.sqlite3")).unwrap();
         drop_table(&mut fail_db, "generations");
@@ -2870,7 +3237,7 @@ mod tests {
 
         let mut discard_db = IndexDb::open(&directory.path().join("discard.sqlite3")).unwrap();
         drop_table(&mut discard_db, "entries_fts");
-        assert!(discard_db.discard_generation("S", 1).is_err());
+        assert!(discard_db.discard_empty_generation("S", 1).is_err());
 
         let mut clear_db = IndexDb::open(&directory.path().join("clear.sqlite3")).unwrap();
         drop_table(&mut clear_db, "entries_fts");
@@ -2887,7 +3254,7 @@ mod tests {
     }
 
     #[test]
-    fn promote_rejects_duplicate_item_ids_in_a_corrupted_schema() {
+    fn promotion_uses_inventory_metadata_without_scanning_entries() {
         let directory = tempdir().unwrap();
         let mut db = IndexDb::open(&directory.path().join("duplicates.sqlite3")).unwrap();
         let generation = db
@@ -2911,11 +3278,373 @@ mod tests {
                    ('S', 1, 'duplicate', 'duplicate', 'Two', 'two', 1, '[]');",
             )
             .unwrap();
-        assert_eq!(
-            db.promote("S", generation, "2", &zero_progress())
+        let progress = InventoryProgress {
+            entries_seen: 2,
+            unique_items: 1,
+            ..zero_progress()
+        };
+        db.promote("S", generation, "2", &progress).unwrap();
+        let row = db.status_rows("S").unwrap().remove(0);
+        assert_eq!(row.state, "active");
+        assert_eq!(row.entry_count, 1);
+        assert_eq!(row.unique_item_count, 1);
+    }
+
+    #[tokio::test]
+    async fn completed_inventory_profile_replaces_startup_capabilities() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::from([
+                    Ok(InventoryEvent::Entry(inventory_entry("Tag", "S.Tag"))),
+                    Ok(InventoryEvent::Progress(InventoryProgress {
+                        branches_visited: 2,
+                        entries_seen: 3,
+                        unique_items: 1,
+                        active_time_ms: 1,
+                        paused_time_ms: 0,
+                        items_per_second: 1.0,
+                        estimated_remaining_ms: None,
+                    })),
+                    Ok(InventoryEvent::Completed(InventoryCompleted {
+                        complete: true,
+                        cancelled: false,
+                        truncated: false,
+                        warning: None,
+                        organization: NamespaceOrganization::Hierarchical,
+                        source: BrowseSource::Da2,
+                    })),
+                ]),
+                Arc::new(RecordingInventoryControl::default()),
+            ))],
+            vec![Ok(BrowseCapabilities {
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da3,
+                supports_browse_sessions: true,
+                supports_search: true,
+                max_page_size: 100,
+            })],
+        ));
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("effective-profile.sqlite3")),
+        ));
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Ready).await;
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.organization, NamespaceOrganization::Hierarchical);
+        assert_eq!(status.source, BrowseSource::Da2);
+        assert_eq!(status.entry_count, 1);
+        assert_eq!(status.unique_item_count, 1);
+    }
+
+    #[test]
+    fn failed_activation_keeps_the_previous_generation_active() {
+        let directory = tempdir().unwrap();
+        let mut db = IndexDb::open(&directory.path().join("activation.sqlite3")).unwrap();
+        let previous = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries("S", previous, &[inventory_entry("Previous", "S.Previous")])
+            .unwrap();
+        db.promote("S", previous, "2", &completed_progress(1))
+            .unwrap();
+
+        let target = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "3")
+            .unwrap();
+        db.insert_entries("S", target, &[inventory_entry("Target", "S.Target")])
+            .unwrap();
+        db.connection
+            .execute_batch(
+                "CREATE TRIGGER reject_target_activation
+                 BEFORE UPDATE OF state ON generations
+                 WHEN NEW.generation = 2 AND NEW.state = 'active'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'target activation rejected');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.promote("S", target, "4", &completed_progress(1))
                 .unwrap_err()
-                .to_string(),
-            "namespace index generation count validation failed"
+                .to_string()
+                .contains("target activation rejected")
+        );
+        let rows = db.status_rows("S").unwrap();
+        assert_eq!(rows[0].state, "active");
+        assert_eq!(rows[0].generation, previous);
+        assert_eq!(rows[1].state, "staging");
+        assert_eq!(rows[1].generation, target);
+        assert_eq!(
+            db.search("S", previous, "previous", 1, 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn activation_defers_superseded_data_to_bounded_cleanup() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("deferred-cleanup.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let previous = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        let obsolete_entries = synthetic_entries("Obsolete", CLEANUP_BATCH_SIZE + 1);
+        db.insert_entries("S", previous, &obsolete_entries).unwrap();
+        db.promote(
+            "S",
+            previous,
+            "2",
+            &completed_progress(obsolete_entries.len() as u64),
+        )
+        .unwrap();
+
+        let active = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "3")
+            .unwrap();
+        db.insert_entries("S", active, &[inventory_entry("Active", "S.Active")])
+            .unwrap();
+        db.promote("S", active, "4", &completed_progress(1))
+            .unwrap();
+        assert_eq!(
+            db.connection
+                .query_row(
+                    "SELECT state FROM generations WHERE server = 'S' AND generation = ?1",
+                    [previous as i64],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            db.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE server = 'S' AND generation = ?1",
+                    [previous as i64],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            (CLEANUP_BATCH_SIZE + 1) as i64
+        );
+
+        let stats = cleanup_obsolete_generations(&path, "S", &BackgroundTasks::new()).unwrap();
+        assert!(stats.batches >= 2);
+        assert_eq!(stats.entries, (CLEANUP_BATCH_SIZE + 1) as u64);
+        assert_eq!(stats.fts_entries, (CLEANUP_BATCH_SIZE + 1) as u64);
+        assert_eq!(stats.generations, 1);
+        assert_eq!(db.status_rows("S").unwrap().len(), 1);
+        assert_eq!(db.search_generation("S").unwrap(), Some(active));
+        assert_eq!(db.search("S", active, "active", 1, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cleanup_uses_a_separate_connection_without_blocking_primary_reads() {
+        use std::thread;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("concurrent-cleanup.sqlite3");
+        let mut primary = IndexDb::open(&path).unwrap();
+        let obsolete = primary
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        let obsolete_entries = synthetic_entries("Obsolete", CLEANUP_BATCH_SIZE + 1);
+        primary
+            .insert_entries("S", obsolete, &obsolete_entries)
+            .unwrap();
+        primary
+            .promote(
+                "S",
+                obsolete,
+                "2",
+                &completed_progress(obsolete_entries.len() as u64),
+            )
+            .unwrap();
+        let active = primary
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "3")
+            .unwrap();
+        primary
+            .insert_entries("S", active, &[inventory_entry("Active", "S.Active")])
+            .unwrap();
+        primary
+            .promote("S", active, "4", &completed_progress(1))
+            .unwrap();
+
+        primary.connection.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            primary
+                .connection
+                .query_row("SELECT COUNT(*) FROM entries", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            (CLEANUP_BATCH_SIZE + 2) as i64
+        );
+        let cleanup_path = path.clone();
+        let background_tasks = Arc::new(BackgroundTasks::new());
+        let cleanup_tasks = Arc::clone(&background_tasks);
+        let cleanup = thread::spawn(move || {
+            cleanup_obsolete_generations(&cleanup_path, "S", cleanup_tasks.as_ref())
+        });
+
+        for _ in 0..100 {
+            assert_eq!(primary.search_generation("S").unwrap(), Some(active));
+            assert_eq!(
+                primary.search("S", active, "active", 1, 10).unwrap().len(),
+                1
+            );
+            if cleanup.is_finished() {
+                break;
+            }
+            thread::yield_now();
+        }
+        let stats = cleanup.join().unwrap().unwrap();
+        primary.connection.execute_batch("COMMIT").unwrap();
+        assert_eq!(stats.entries, (CLEANUP_BATCH_SIZE + 1) as u64);
+        assert_eq!(primary.search_generation("S").unwrap(), Some(active));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_errors_do_not_change_a_successfully_activated_generation() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("cleanup-error.sqlite3")),
+        ));
+        let active = manager
+            .with_database(|db| {
+                let obsolete =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", obsolete, &[inventory_entry("Obsolete", "S.Obsolete")])?;
+                db.promote("S", obsolete, "2", &completed_progress(1))?;
+                let active =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "3")?;
+                db.insert_entries("S", active, &[inventory_entry("Active", "S.Active")])?;
+                db.promote("S", active, "4", &completed_progress(1))?;
+                db.connection.execute_batch(
+                    "CREATE TRIGGER fail_obsolete_cleanup
+                     BEFORE DELETE ON entries
+                     WHEN OLD.generation = 1
+                     BEGIN
+                       SELECT RAISE(FAIL, 'obsolete cleanup rejected');
+                     END;",
+                )?;
+                Ok(active)
+            })
+            .unwrap();
+        manager.schedule_cleanup("S");
+        manager.background_tasks.wait_for_idle().await;
+
+        let status = manager.status("S").await.unwrap();
+        assert!(matches!(
+            status.state,
+            IndexState::Ready | IndexState::Stale
+        ));
+        assert_eq!(status.active_generation, active);
+        assert_eq!(
+            manager
+                .search("S", "active", 1, 10)
+                .await
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoning_a_populated_generation_defers_large_deletion_to_cleanup() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("abandon.sqlite3")),
+        ));
+        let generation = manager
+            .with_database(|db| {
+                let generation =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                let entries = synthetic_entries("Abandoned", CLEANUP_BATCH_SIZE + 1);
+                db.insert_entries("S", generation, &entries)?;
+                Ok(generation)
+            })
+            .unwrap();
+
+        manager
+            .with_database(|db| {
+                db.connection.execute_batch("BEGIN IMMEDIATE")?;
+                Ok(())
+            })
+            .unwrap();
+        manager.abandon_generation("S", generation, "inventory cancelled");
+        let failed = manager.with_database(|db| db.status_rows("S")).unwrap();
+        assert_eq!(failed[0].state, "failed");
+        assert_eq!(
+            manager
+                .with_database(|db| {
+                    db.connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM entries WHERE server = 'S' AND generation = ?1",
+                            [generation as i64],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .unwrap(),
+            (CLEANUP_BATCH_SIZE + 1) as i64
+        );
+        manager
+            .with_database(|db| {
+                db.connection.execute_batch("COMMIT")?;
+                Ok(())
+            })
+            .unwrap();
+        manager.background_tasks.wait_for_idle().await;
+        assert!(
+            manager
+                .with_database(|db| db.status_rows("S"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore = "production-scale regression: one million rows exercises activation without scans or cleanup"]
+    fn large_synthetic_generation_promotes_without_a_validation_scan() {
+        let directory = tempdir().unwrap();
+        let mut db = IndexDb::open(&directory.path().join("large-generation.sqlite3")).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        const STRESS_ROWS: usize = 1_000_000;
+        for offset in (0..STRESS_ROWS).step_by(1_000) {
+            let entries = synthetic_entries("Stress", 1_000)
+                .into_iter()
+                .enumerate()
+                .map(|(index, mut entry)| {
+                    let sequence = offset + index;
+                    entry.display_name = format!("Stress-{sequence}");
+                    entry.item_id = format!("Stress.{sequence}");
+                    entry
+                })
+                .collect::<Vec<_>>();
+            db.insert_entries("S", generation, &entries).unwrap();
+        }
+        let promotion_started = Instant::now();
+        db.promote(
+            "S",
+            generation,
+            "2",
+            &completed_progress(STRESS_ROWS as u64),
+        )
+        .unwrap();
+        assert_eq!(
+            db.status_rows("S").unwrap()[0].entry_count,
+            STRESS_ROWS as u64
+        );
+        assert!(
+            promotion_started.elapsed() < Duration::from_secs(5),
+            "activation should only update generation metadata"
         );
     }
 
@@ -4766,6 +5495,36 @@ mod tests {
             1
         );
         assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn negotiated_da2_profile_does_not_trigger_profile_invalidation() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(LifecycleClient::new(
+            vec![],
+            vec![Ok(BrowseCapabilities {
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da3,
+                supports_browse_sessions: true,
+                supports_search: true,
+                max_page_size: 100,
+            })],
+        ));
+        let manager = Arc::new(IndexManager::new(
+            Arc::clone(&client),
+            settings(directory.path().join("negotiated-da2.sqlite3")),
+        ));
+        seed_active_generation(
+            &manager,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            &timestamp_now(),
+        );
+
+        manager.refresh_if_due("S").await;
+
+        assert_eq!(manager.status("S").await.unwrap().active_generation, 1);
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
