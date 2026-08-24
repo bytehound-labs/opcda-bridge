@@ -10,6 +10,9 @@ bringing in the command-line client's presentation dependencies.
 opcda-bridge = "0.4"
 ```
 
+This crate has its own independent release version. It does not need to match the client or
+gateway version; applications should select a compatible protocol and capability contract.
+
 The library exposes typed capabilities, one-page browse sessions, explicit continuation and
 session close operations, progressive search events, and read/write methods. Browse pages are not
 automatically drained; callers that need bulk results must collect pages explicitly.

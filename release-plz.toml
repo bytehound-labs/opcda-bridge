@@ -2,5 +2,20 @@
 publish = true
 release = true
 release_always = false
+git_release_enable = false
 release_commits = "^(feat|fix|perf|refactor|docs|test|build|ci|revert)[(:]|^chore\\((deps|deps-dev|github|actions|ci)\\)!?:"
 publish_timeout = "30m"
+
+[[package]]
+name = "opcda-bridge"
+changelog_include = ["opcda-bridge-proto"]
+
+[[package]]
+name = "opcda-bridge-client"
+changelog_include = ["opcda-bridge", "opcda-bridge-proto"]
+git_release_enable = true
+
+[[package]]
+name = "opcda-bridge-gateway"
+changelog_include = ["opcda-bridge-proto"]
+git_release_enable = true

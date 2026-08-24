@@ -10,13 +10,21 @@ import sys
 import tomllib
 from collections.abc import Mapping
 
-WORKSPACE_PACKAGES = {
+WORKSPACE_PACKAGES = (
     "opcda-bridge",
     "opcda-bridge-client",
     "opcda-bridge-gateway",
     "opcda-bridge-proto",
+)
+PACKAGE_MANIFESTS = {
+    package: f"crates/{package}/Cargo.toml" for package in WORKSPACE_PACKAGES
 }
-RELEASE_TAG_PATTERN = "opcda-bridge-*-v*"
+PACKAGE_DIRECT_DEPENDENCIES = {
+    "opcda-bridge": ("opcda-bridge-proto",),
+    "opcda-bridge-client": ("opcda-bridge",),
+    "opcda-bridge-gateway": ("opcda-bridge-proto",),
+    "opcda-bridge-proto": (),
+}
 
 
 def git(*args: str) -> str:
@@ -39,6 +47,34 @@ def read_revision_file(revision: str, path: str) -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout
+
+
+def package_version(revision: str, package: str) -> str | None:
+    contents = read_revision_file(revision, PACKAGE_MANIFESTS[package])
+    if contents is None:
+        return None
+
+    try:
+        document = tomllib.loads(contents)
+    except tomllib.TOMLDecodeError as error:
+        print(f"Unable to parse {PACKAGE_MANIFESTS[package]}: {error}", file=sys.stderr)
+        return None
+
+    package_table = document.get("package")
+    if not isinstance(package_table, dict):
+        return None
+    version = package_table.get("version")
+    return version if isinstance(version, str) else None
+
+
+def released_packages(base: str, head: str) -> tuple[str, ...]:
+    released: list[str] = []
+    for package in WORKSPACE_PACKAGES:
+        base_version = package_version(base, package)
+        head_version = package_version(head, package)
+        if head_version is not None and base_version != head_version:
+            released.append(package)
+    return tuple(released)
 
 
 def normalise_manifest(contents: str) -> Mapping[str, object]:
@@ -101,16 +137,78 @@ def generated_metadata_only(path: str, base: str, head: str) -> bool:
     return False
 
 
-def latest_release_tag(base: str) -> str | None:
+def latest_release_tag(base: str, package: str) -> str | None:
     tags = git(
         "tag",
         "--merged",
         base,
         "--list",
-        RELEASE_TAG_PATTERN,
-        "--sort=-creatordate",
+        f"{package}-v*",
+        "--sort=-version:refname",
     )
     return tags.splitlines()[0] if tags else None
+
+
+def release_scope(package: str) -> tuple[str, ...]:
+    scope: list[str] = []
+    pending = [package]
+    while pending:
+        current = pending.pop()
+        if current in scope:
+            continue
+        scope.append(current)
+        pending.extend(PACKAGE_DIRECT_DEPENDENCIES[current])
+    return tuple(scope)
+
+
+def path_in_scope(path: str, package: str) -> bool:
+    return path == f"crates/{package}" or path.startswith(f"crates/{package}/")
+
+
+def meaningful_paths_for_package(
+    package: str,
+    comparison: str,
+    head: str,
+) -> tuple[str, ...]:
+    changed_paths = git("diff", "--name-only", comparison, head).splitlines()
+    scope = release_scope(package)
+    return tuple(
+        path
+        for path in changed_paths
+        if any(path_in_scope(path, scoped_package) for scoped_package in scope)
+        and not generated_metadata_only(path, comparison, head)
+    )
+
+
+def check_release_content(base: str, head: str) -> int:
+    packages = released_packages(base, head)
+    if not packages:
+        print("No package version changes detected; release-content check passed.")
+        return 0
+
+    failures: list[str] = []
+    for package in packages:
+        tag = latest_release_tag(base, package)
+        comparison = tag or base
+        meaningful_paths = meaningful_paths_for_package(package, comparison, head)
+        if meaningful_paths:
+            source = f"since {tag}" if tag else "since the release PR base"
+            print(f"Release content for {package} found {source}:")
+            for path in meaningful_paths:
+                print(f"  {path}")
+        else:
+            failures.append(package)
+
+    if failures:
+        packages_text = ", ".join(failures)
+        print(
+            f"Release PR contains only generated metadata for {packages_text}; "
+            "a new version would publish unchanged source.",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
 
 
 def main() -> int:
@@ -125,28 +223,7 @@ def main() -> int:
         print("PR_BASE_SHA and PR_HEAD_SHA are required for a release-plz PR.", file=sys.stderr)
         return 1
 
-    tag = latest_release_tag(base)
-    if tag is None:
-        print("No reachable release tag was found; refusing to approve the release PR.", file=sys.stderr)
-        return 1
-
-    changed_paths = git("diff", "--name-only", tag, head).splitlines()
-    meaningful_paths = [
-        path for path in changed_paths if not generated_metadata_only(path, tag, head)
-    ]
-
-    if meaningful_paths:
-        print(f"Release content found since {tag}:")
-        for path in meaningful_paths:
-            print(f"  {path}")
-        return 0
-
-    print(
-        f"Release PR contains only generated metadata since {tag}; "
-        "a new version would publish unchanged source.",
-        file=sys.stderr,
-    )
-    return 1
+    return check_release_content(base, head)
 
 
 if __name__ == "__main__":

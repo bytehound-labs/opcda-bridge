@@ -264,7 +264,13 @@ page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.sea
   the workflow with `dry_run=true` first; after it succeeds, rerun with `dry_run=false`. The
   Windows workflow supplies the repository's `CARGO_REGISTRY_TOKEN` secret only to the publishing
   step. Never paste or print that token.
-- **Release automation**: release-plz runs separate release-PR and publish jobs and publishes only
-  after a merged release PR. The `release_commits` allowlist excludes both scoped and unscoped
-  release-plz commit forms; the required `release-integrity` check rejects release PRs containing
-  only generated metadata, and a crates.io rate limit bounds publishing if another guard regresses.
+- **Release automation**: the four published crates are independently versioned. release-plz runs
+  separate release-PR and publish jobs, creates package-specific tags, publishes only packages
+  with releasable changes, and cascades releases through the configured
+  `changelog_include` dependency edges when a reusable library or protocol change requires a
+  dependent rebuild. GitHub Releases are enabled only for the client and gateway packages; the
+  protocol and reusable library publish to crates.io without binary archives. The
+  `release_commits` allowlist excludes both scoped and unscoped release-plz commit forms; the
+  package-aware `release-integrity` check rejects release PRs containing only generated metadata,
+  and a crates.io rate limit bounds publishing if another guard regresses. Client/gateway runtime
+  compatibility is defined by protocol and capability versions, not equal crate versions.

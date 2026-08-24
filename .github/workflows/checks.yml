@@ -126,6 +126,9 @@ jobs:
       - name: Run Linux tests
         run: cargo test --workspace --locked
 
+      - name: Run script tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
   package:
     name: Package verification
     needs: changes

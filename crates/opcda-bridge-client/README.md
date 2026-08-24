@@ -9,6 +9,10 @@ Install it with Cargo:
 cargo install opcda-bridge-client
 ```
 
+The CLI is versioned independently from the gateway and reusable client library. Prebuilt archives
+use `opcda-bridge-client-vX.Y.Z` tags; a matching gateway version is not required when the wire
+protocol and advertised capabilities support the requested operations.
+
 Read output contains semantic values. An OPC DA `VT_BSTR` is returned exactly as supplied by the
 server, so a BSTR containing `AUT` produces `"value": "AUT"` rather than a display-quoted value.
 

@@ -13,13 +13,30 @@ A lightweight Rust gateway bridging classic OPC DA (Windows/COM) servers to remo
 
 Active development. Gateway and client are functional end-to-end — OPC DA read/write/browse passing
 against a live Kepware server. The workspace publishes the reusable client library, protocol
-definitions, cross-platform CLI, and Windows gateway as separate crates. Release-plz creates a
-release pull request and publishes only after its generated metadata passes the required release
-integrity check.
+definitions, cross-platform CLI, and Windows gateway as separate crates. Each crate is versioned
+independently, and release-plz publishes only packages with releasable changes after the generated
+metadata passes the required release integrity check.
 
 The 0.4 API line introduces indexed namespace search and extends the gRPC capabilities contract.
-The additive wire protocol remains compatible with older gateways and clients, but indexed-search
-features require matching 0.4 clients and gateways.
+The additive wire protocol remains compatible with older gateways and clients. Indexed-search
+availability is determined by the advertised protocol and capability versions, not by matching
+crate or binary version numbers.
+
+### Versions and compatibility
+
+The published packages have independent SemVer versions and package-specific tags:
+
+- `opcda-bridge-proto` — generated protocol types.
+- `opcda-bridge` — reusable Rust client library.
+- `opcda-bridge-client` — cross-platform CLI.
+- `opcda-bridge-gateway` — Windows OPC DA gateway.
+
+All four packages publish to crates.io. GitHub Releases and prebuilt archives are created only for
+the client and gateway tags. A client release and a gateway release therefore do not need to carry
+the same version number; choose and pin each binary independently. Client/gateway interoperability
+is defined by the wire protocol, `protocol_version`, indexed-search protocol and capability flags,
+and the compatibility checks in CI. Changes to a reusable dependency can also produce a dependent
+package release when the dependent binary or API needs to be rebuilt.
 
 ## Why
 
@@ -32,7 +49,8 @@ OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based 
 
 ## Installation
 
-Prebuilt binaries for every tagged release are attached to the [Releases](https://github.com/bytehound-labs/opcda-bridge/releases) page.
+Prebuilt client and gateway binaries are attached to their package-specific tags on the
+[Releases](https://github.com/bytehound-labs/opcda-bridge/releases) page.
 
 ### Gateway (Windows)
 
@@ -81,7 +99,8 @@ The gateway runs on the Windows host alongside the OPC DA server(s) you want to 
   ```
   This places `opcda-bridge-client` on `PATH` at `~/.cargo/bin/opcda-bridge-client`; re-run the same
   command (add `--force` to overwrite an existing install) to upgrade. Use
-  `cargo install opcda-bridge-client --version 0.4.0` to pin a specific published version.
+  `cargo install opcda-bridge-client --version 0.4.3` to pin a specific published version. The
+  client and gateway versions are independent, so pinning one does not select the other.
 
 ## Usage
 
@@ -406,7 +425,9 @@ boundaries have property tests plus standalone cargo-fuzz smoke targets.
 
 Tagged binary releases include SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures,
 and GitHub artifact provenance attestations. Running the release workflow manually builds and
-uploads packages as workflow artifacts without creating a GitHub release.
+uploads packages as workflow artifacts without creating a GitHub release. The client and gateway
+use their own package tags; protocol and library releases remain crates.io releases without binary
+archives.
 
 ## License
 

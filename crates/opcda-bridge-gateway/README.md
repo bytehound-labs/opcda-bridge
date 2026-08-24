@@ -9,6 +9,10 @@ Install it with Cargo on a Windows host:
 cargo install opcda-bridge-gateway
 ```
 
+The gateway is versioned independently from the client and protocol crates. Prebuilt archives use
+`opcda-bridge-gateway-vX.Y.Z` tags; client/gateway interoperability is determined by the wire
+protocol and advertised capabilities rather than matching package versions.
+
 The gateway must run on the Windows machine hosting the OPC DA server. See the repository README
 for service installation, configuration, and firewall setup.
 
