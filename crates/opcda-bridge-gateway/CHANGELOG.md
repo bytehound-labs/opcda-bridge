@@ -7,11 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- expose ItemIDs only for selectable browse nodes while retaining branch-only DA3 navigation
+  identifiers behind opaque node keys
+
 ## [0.4.6](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.5...opcda-bridge-gateway-v0.4.6) - 2026-08-25
 
 ### Fixed
 
-- *(gateway)* keep index promotion responsive ([#71](https://github.com/bytehound-labs/opcda-bridge/pull/71))
+- _(gateway)_ keep index promotion responsive ([#71](https://github.com/bytehound-labs/opcda-bridge/pull/71))
 
 ### Fixed
 

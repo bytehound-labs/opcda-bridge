@@ -116,6 +116,10 @@ fn map_browse_source(value: BrowseSource) -> ProtoBrowseSource {
 }
 
 fn map_browse_node(node: BrowseNode) -> ProtoBrowseNode {
+    let item_id = match node.kind {
+        BrowseNodeKind::Branch => None,
+        BrowseNodeKind::Item | BrowseNodeKind::BranchAndItem => node.item_id,
+    };
     ProtoBrowseNode {
         node_key: node.node_key,
         display_name: node.display_name,
@@ -126,7 +130,7 @@ fn map_browse_node(node: BrowseNode) -> ProtoBrowseNode {
                 opcda_bridge_proto::bridge::BrowseNodeKind::BranchAndItem
             }
         } as i32,
-        item_id: node.item_id,
+        item_id,
     }
 }
 
@@ -926,6 +930,9 @@ mod tests {
         assert_eq!(page.organization, ProtoNamespaceOrganization::Flat as i32);
         assert_eq!(page.source, ProtoBrowseSource::Derived as i32);
         assert_eq!(page.warning.as_deref(), Some("partial"));
+        assert_eq!(page.nodes[0].item_id, None);
+        assert_eq!(page.nodes[1].item_id.as_deref(), Some("item.item"));
+        assert_eq!(page.nodes[2].item_id.as_deref(), Some("both.item"));
 
         let values = map_to_proto_tag_values(
             [

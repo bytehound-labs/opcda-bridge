@@ -266,8 +266,11 @@ preserved only when they are part of the BSTR itself.
 
 `browse` emits a metadata object containing `session_id`, `nodes`, `next_page_token`, `complete`,
 `organization`, `source`, `warning`, and `pages`. Each node keeps its opaque `node_key`, local
-`display_name`, typed `kind`, and optional exact `item_id` separate. `search` emits newline-delimited
-JSON events so matches and progress remain streaming rather than waiting for the full search.
+`display_name`, typed `kind`, and optional exact `item_id` separate. Only selectable `item` and
+`branch_and_item` nodes expose an ItemID; branch-only nodes use their opaque key for navigation
+without presenting private DA3 navigation identifiers as selectable tags. `search` emits
+newline-delimited JSON events so matches and progress remain streaming rather than waiting for the
+full search.
 `index-search` emits one object containing ranked `matches`, `has_more`, and full index `status`;
 its matches contain exact ItemIDs and breadcrumb labels but no session-bound node keys.
 Commands that fail print a structured `{"error": "..."}` object to stderr instead of the usual
