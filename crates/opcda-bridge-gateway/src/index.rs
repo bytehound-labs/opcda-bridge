@@ -88,7 +88,7 @@ struct BackgroundTasks {
     shutdown: tokio::sync::watch::Sender<bool>,
     idle: tokio::sync::Notify,
     #[cfg(test)]
-    reject_next_spawn: AtomicBool,
+    panic_next_cleanup_worker: AtomicBool,
 }
 
 #[derive(Default)]
@@ -117,7 +117,7 @@ impl BackgroundTasks {
             shutdown,
             idle: tokio::sync::Notify::new(),
             #[cfg(test)]
-            reject_next_spawn: AtomicBool::new(false),
+            panic_next_cleanup_worker: AtomicBool::new(false),
         }
     }
 
@@ -151,18 +151,15 @@ impl BackgroundTasks {
     }
 
     #[cfg(test)]
-    fn reject_next_spawn(&self) {
-        self.reject_next_spawn.store(true, Ordering::Release);
+    fn panic_next_cleanup_worker(&self) {
+        self.panic_next_cleanup_worker
+            .store(true, Ordering::Release);
     }
 
     fn spawn<F>(self: &Arc<Self>, future: F) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        #[cfg(test)]
-        if self.reject_next_spawn.swap(false, Ordering::AcqRel) {
-            self.request_shutdown();
-        }
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => return false,
@@ -615,7 +612,7 @@ impl IndexDb {
             [server],
             |row| row.get::<_, i64>(0),
         )?;
-        let generation = u64::try_from(generation)
+        let public_generation = u64::try_from(generation)
             .map_err(|_| anyhow::anyhow!("namespace index generation is negative"))?;
         self.connection.execute(
             "INSERT INTO generations
@@ -623,9 +620,7 @@ impl IndexDb {
              VALUES (?1, ?2, 'staging', ?3, ?4, ?5)",
             params![
                 server,
-                i64::try_from(generation).map_err(|_| anyhow::anyhow!(
-                    "namespace index generation exceeds SQLite range"
-                ))?,
+                generation,
                 namespace_string(organization),
                 source_string(source),
                 started_at
@@ -635,10 +630,10 @@ impl IndexDb {
             process_id = std::process::id(),
             database = %self.path.display(),
             server,
-            generation,
+            generation = public_generation,
             "started namespace index generation"
         );
-        Ok(generation)
+        Ok(public_generation)
     }
 
     fn insert_entries(
@@ -1158,12 +1153,19 @@ async fn run_scheduled_cleanup(
 
         let cleanup_path = path.clone();
         let cleanup_server = server.clone();
-        let cleanup_tasks_for_blocking = Arc::clone(&background_tasks);
+        let background_tasks_for_blocking = Arc::clone(&background_tasks);
         let result = match tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if background_tasks_for_blocking
+                .panic_next_cleanup_worker
+                .swap(false, Ordering::AcqRel)
+            {
+                panic!("injected namespace index cleanup worker panic");
+            }
             cleanup_obsolete_generations(
                 &cleanup_path,
                 &cleanup_server,
-                cleanup_tasks_for_blocking.as_ref(),
+                background_tasks_for_blocking.as_ref(),
             )
         })
         .await
@@ -1254,6 +1256,10 @@ pub struct IndexManager<C: OpcClient> {
     background_tasks: Arc<BackgroundTasks>,
     cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
     background_started: AtomicBool,
+    #[cfg(test)]
+    reject_next_build_spawn: AtomicBool,
+    #[cfg(test)]
+    reject_next_cleanup_spawn: AtomicBool,
 }
 
 impl<C: OpcClient> IndexManager<C> {
@@ -1283,6 +1289,10 @@ impl<C: OpcClient> IndexManager<C> {
             background_tasks: Arc::new(BackgroundTasks::new()),
             cleanup_tasks: Arc::new(Mutex::new(HashMap::new())),
             background_started: AtomicBool::new(false),
+            #[cfg(test)]
+            reject_next_build_spawn: AtomicBool::new(false),
+            #[cfg(test)]
+            reject_next_cleanup_spawn: AtomicBool::new(false),
         }
     }
 
@@ -1361,43 +1371,46 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    async fn active_profile_changed(&self, server: &str) -> bool {
+        let stored_profile = match self.with_database(|db| db.active_profile(server)) {
+            Ok(Some(stored_profile)) => stored_profile,
+            Ok(None) => {
+                tracing::warn!(
+                    server = %server,
+                    "active namespace index profile is unavailable"
+                );
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    server = %server,
+                    error = %error,
+                    "unable to inspect active namespace index profile"
+                );
+                return false;
+            }
+        };
+        self.client
+            .get_capabilities(server)
+            .await
+            .map(|capabilities| {
+                !index_profile_is_compatible(
+                    stored_profile.organization,
+                    stored_profile.source,
+                    stored_profile.compatibility_fallback,
+                    capabilities.organization,
+                    capabilities.source,
+                )
+            })
+            .unwrap_or(false)
+    }
+
     async fn refresh_if_due(self: &Arc<Self>, server: &str) {
         match self.status(server).await {
             Ok(status)
                 if status.active_generation > 0 && status.state != IndexState::Refreshing =>
             {
-                let stored_profile = self.with_database(|db| db.active_profile(server));
-                let profile_changed = match stored_profile {
-                    Ok(Some(stored_profile)) => self
-                        .client
-                        .get_capabilities(server)
-                        .await
-                        .map(|capabilities| {
-                            !index_profile_is_compatible(
-                                stored_profile.organization,
-                                stored_profile.source,
-                                stored_profile.compatibility_fallback,
-                                capabilities.organization,
-                                capabilities.source,
-                            )
-                        })
-                        .unwrap_or(false),
-                    Ok(None) => {
-                        tracing::warn!(
-                            server = %server,
-                            "active namespace index profile is unavailable"
-                        );
-                        false
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            server = %server,
-                            error = %error,
-                            "unable to inspect active namespace index profile"
-                        );
-                        false
-                    }
-                };
+                let profile_changed = self.active_profile_changed(server).await;
                 if profile_changed {
                     if let Err(error) = self.with_database(|db| db.clear_server(server)) {
                         tracing::warn!(
@@ -1800,9 +1813,15 @@ impl<C: OpcClient> IndexManager<C> {
         let manager = Arc::clone(self);
         let server_name = server.to_string();
         let control = Arc::clone(&handle.control);
-        if !self.background_tasks.spawn(async move {
-            manager.run_build(server_name, generation, handle).await;
-        }) {
+        #[cfg(test)]
+        let reject_spawn = self.reject_next_build_spawn.swap(false, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let reject_spawn = false;
+        if reject_spawn
+            || !self.background_tasks.spawn(async move {
+                manager.run_build(server_name, generation, handle).await;
+            })
+        {
             control.cancel();
             self.abandon_generation(server, generation, "index build task was not started");
             self.finish_build_for_control(server, &control, None);
@@ -2468,9 +2487,15 @@ impl<C: OpcClient> IndexManager<C> {
         let cleanup_server = server.to_string();
         let background_tasks = Arc::clone(&self.background_tasks);
         let cleanup_tasks = Arc::clone(&self.cleanup_tasks);
-        if !self.background_tasks.spawn(async move {
-            run_scheduled_cleanup(path, cleanup_server, background_tasks, cleanup_tasks).await;
-        }) && let Ok(mut tasks) = self.cleanup_tasks.lock()
+        #[cfg(test)]
+        let reject_spawn = self.reject_next_cleanup_spawn.swap(false, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let reject_spawn = false;
+        if (reject_spawn
+            || !self.background_tasks.spawn(async move {
+                run_scheduled_cleanup(path, cleanup_server, background_tasks, cleanup_tasks).await;
+            }))
+            && let Ok(mut tasks) = self.cleanup_tasks.lock()
         {
             tasks.remove(server);
         }
@@ -3042,6 +3067,45 @@ mod tests {
                 .contains("invalid namespace index schema version")
         );
 
+        let duplicate_migration_path = directory.path().join("duplicate-migration.sqlite3");
+        drop(IndexDb::open(&duplicate_migration_path).unwrap());
+        let duplicate_migration = Connection::open(&duplicate_migration_path).unwrap();
+        duplicate_migration
+            .execute(
+                "UPDATE index_meta SET value = '2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(duplicate_migration);
+        assert!(
+            IndexDb::open_once(&duplicate_migration_path)
+                .err()
+                .expect("duplicate migration column should fail")
+                .to_string()
+                .contains("duplicate column")
+        );
+
+        let rejected_metadata_path = directory.path().join("rejected-metadata.sqlite3");
+        drop(IndexDb::open(&rejected_metadata_path).unwrap());
+        let rejected_metadata = Connection::open(&rejected_metadata_path).unwrap();
+        rejected_metadata
+            .execute_batch(
+                "CREATE TRIGGER reject_index_meta_insert
+                 BEFORE INSERT ON index_meta
+                 BEGIN
+                   SELECT RAISE(FAIL, 'index metadata update rejected');
+                 END;",
+            )
+            .unwrap();
+        drop(rejected_metadata);
+        assert!(
+            IndexDb::open_once(&rejected_metadata_path)
+                .err()
+                .expect("rejected metadata write should fail")
+                .to_string()
+                .contains("index metadata update rejected")
+        );
+
         let subscriber = tracing_subscriber::fmt()
             .with_test_writer()
             .with_max_level(tracing::Level::WARN)
@@ -3372,6 +3436,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.status_rows("S").unwrap()[0].entry_count, 1);
+        assert!(
+            db.update_progress(
+                "S",
+                generation,
+                &InventoryProgress {
+                    unique_items: u64::MAX,
+                    ..zero_progress()
+                },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unique item count exceeds SQLite range")
+        );
 
         db.connection
             .execute("UPDATE entries SET kind = 99 WHERE server = 'S'", [])
@@ -3845,9 +3922,6 @@ mod tests {
                 primary.search("S", active, "active", 1, 10).unwrap().len(),
                 1
             );
-            if cleanup.is_finished() {
-                break;
-            }
             thread::yield_now();
         }
         let stats = cleanup.join().unwrap().unwrap();
@@ -3873,14 +3947,16 @@ mod tests {
                     db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "3")?;
                 db.insert_entries("S", active, &[inventory_entry("Active", "S.Active")])?;
                 db.promote("S", active, "4", &completed_progress(1))?;
-                db.connection.execute_batch(
-                    "CREATE TRIGGER fail_obsolete_cleanup
+                db.connection
+                    .execute_batch(
+                        "CREATE TRIGGER fail_obsolete_cleanup
                      BEFORE DELETE ON entries
                      WHEN OLD.generation = 1
                      BEGIN
                        SELECT RAISE(FAIL, 'obsolete cleanup rejected');
                      END;",
-                )?;
+                    )
+                    .unwrap();
                 Ok(active)
             })
             .unwrap();
@@ -3921,14 +3997,16 @@ mod tests {
                     db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "3")?;
                 db.insert_entries("S", active, &[inventory_entry("Active", "S.Active")])?;
                 db.promote("S", active, "4", &completed_progress(1))?;
-                db.connection.execute_batch(
-                    "CREATE TRIGGER fail_obsolete_cleanup_once
+                db.connection
+                    .execute_batch(
+                        "CREATE TRIGGER fail_obsolete_cleanup_once
                      BEFORE DELETE ON entries
                      WHEN OLD.generation = 1
                      BEGIN
                        SELECT RAISE(FAIL, 'transient obsolete cleanup rejection');
                      END;",
-                )?;
+                    )
+                    .unwrap();
                 Ok((obsolete, active))
             })
             .unwrap();
@@ -3979,6 +4057,55 @@ mod tests {
             status.state,
             IndexState::Ready | IndexState::Stale
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_cleanup_stops_cleanly_during_shutdown() {
+        let directory = tempdir().unwrap();
+        let background_tasks = Arc::new(BackgroundTasks::new());
+        let cleanup_tasks = Arc::new(Mutex::new(HashMap::new()));
+        background_tasks.request_shutdown();
+
+        run_scheduled_cleanup(
+            directory.path().join("shutdown-cleanup.sqlite3"),
+            "S".into(),
+            Arc::clone(&background_tasks),
+            Arc::clone(&cleanup_tasks),
+        )
+        .await;
+
+        assert!(cleanup_tasks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_cleanup_retries_after_worker_panic() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("cleanup-panic.sqlite3")),
+        ));
+        manager.background_tasks.panic_next_cleanup_worker();
+        manager.schedule_cleanup("S");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed_once = manager
+                    .cleanup_tasks
+                    .lock()
+                    .ok()
+                    .and_then(|tasks| tasks.get("S").map(|task| task.failures > 0))
+                    .unwrap_or(false);
+                if failed_once {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.background_tasks.wait_for_idle().await;
+
+        assert!(manager.cleanup_tasks.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4066,6 +4193,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(coverage))]
     #[test]
     #[ignore = "production-scale regression: one million rows exercises activation without scans or cleanup"]
     fn large_synthetic_generation_promotes_without_a_validation_scan() {
@@ -4773,7 +4901,9 @@ mod tests {
             )),
             settings(directory.path().join("index.sqlite3")),
         ));
-        manager.background_tasks.reject_next_spawn();
+        manager
+            .reject_next_build_spawn
+            .store(true, Ordering::Release);
 
         let status = manager.refresh("S", true).await.unwrap();
         assert_eq!(status.state, IndexState::NotIndexed);
@@ -5466,6 +5596,11 @@ mod tests {
             Arc::clone(&client),
             settings(directory.path().join("index.sqlite3")),
         ));
+        manager
+            .reject_next_cleanup_spawn
+            .store(true, Ordering::Release);
+        manager.schedule_cleanup("S");
+        assert!(!manager.cleanup_tasks.lock().unwrap().contains_key("S"));
         manager.shutdown_background_indexing().await;
         assert_eq!(
             manager.refresh("S", true).await.unwrap().state,
@@ -5483,6 +5618,33 @@ mod tests {
             panic!("poison background task state for error-path coverage");
         });
         assert!(!tasks.spawn(async {}));
+    }
+
+    #[test]
+    fn cleanup_error_paths_tolerate_database_and_registry_failures() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("cleanup-errors.sqlite3")),
+        ));
+        manager
+            .with_database(|db| {
+                db.connection
+                    .execute_batch("DROP TABLE generations")
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        manager.fail_generation_and_schedule_cleanup("S", 1, "failed");
+        manager.abandon_generation("S", 1, "abandoned");
+
+        let cleanup_tasks = Arc::clone(&manager.cleanup_tasks);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = cleanup_tasks.lock().unwrap();
+            panic!("poison cleanup registry for error-path coverage");
+        });
+        manager.schedule_cleanup("S");
     }
 
     #[test]
@@ -5958,6 +6120,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_profile_check_handles_missing_invalid_and_unavailable_data() {
+        let directory = tempdir().unwrap();
+        let missing = IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("missing-profile.sqlite3")),
+        );
+        assert!(!missing.active_profile_changed("S").await);
+
+        let invalid = IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("invalid-profile.sqlite3")),
+        );
+        invalid
+            .with_database(|db| {
+                db.connection
+                    .execute_batch("DROP TABLE generations")
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert!(!invalid.active_profile_changed("S").await);
+
+        let unavailable_client = Arc::new(LifecycleClient::new(
+            vec![],
+            vec![Err("unavailable".into())],
+        ));
+        let unavailable = Arc::new(IndexManager::new(
+            unavailable_client,
+            settings(directory.path().join("unavailable-profile.sqlite3")),
+        ));
+        seed_active_generation(
+            &unavailable,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            &timestamp_now(),
+        );
+        assert!(!unavailable.active_profile_changed("S").await);
+    }
+
+    #[tokio::test]
     async fn negotiated_da2_profile_does_not_trigger_profile_invalidation() {
         let directory = tempdir().unwrap();
         let client = Arc::new(LifecycleClient::new(
@@ -5982,12 +6184,14 @@ mod tests {
         );
         manager
             .with_database(|db| {
-                db.connection.execute(
-                    "UPDATE generations
+                db.connection
+                    .execute(
+                        "UPDATE generations
                      SET source = 'da2', compatibility_fallback = 1
                      WHERE server = 'S' AND state = 'active'",
-                    [],
-                )?;
+                        [],
+                    )
+                    .unwrap();
                 Ok(())
             })
             .unwrap();
