@@ -2965,8 +2965,19 @@ mod tests {
         assert_eq!(escape_like(r"a%b_c\d"), r"a\%b\_c\\d");
         assert_eq!(build_fts_query("fcs0201 pv"), "\"fcs0201\" AND \"pv\"");
         assert_eq!(search_rank("219", "219", "display-exact"), 0);
+        assert_eq!(search_rank("219", "ordinary", "219"), 1);
+        assert_eq!(search_rank("219", "219 block", "ordinary"), 2);
         assert_eq!(search_rank("219", "ordinary", "219.item"), 3);
         assert_eq!(search_rank("219", "block 219", "display-contains"), 4);
+        assert_eq!(search_rank("219", "ordinary", "area.219.item"), 5);
+        assert_eq!(search_rank("219", "ordinary", "ordinary"), 6);
+        assert_eq!(parse_indexed_kind(2), Ok(InventoryNodeKind::BranchAndItem));
+        assert!(parse_indexed_kind(99).is_err());
+        assert_eq!(
+            parse_indexed_breadcrumbs(r#"["Area","Unit"]"#.into()).unwrap(),
+            vec!["Area", "Unit"]
+        );
+        assert!(parse_indexed_breadcrumbs("not-json".into()).is_err());
         assert!(parse_timestamp("not-a-timestamp").is_none());
         assert_eq!(
             parse_timestamp(u128::from(u64::MAX).to_string().as_str()),
@@ -3631,6 +3642,7 @@ mod tests {
             .execute("UPDATE entries SET kind = 99 WHERE server = 'S'", [])
             .unwrap();
         assert!(db.search("S", generation, "valid", 1, 10).is_err());
+        assert!(db.search("S", generation, "valid", 3, 10).is_err());
         db.connection
             .execute(
                 "UPDATE entries SET kind = 1, breadcrumbs = 'not-json'
@@ -3639,6 +3651,7 @@ mod tests {
             )
             .unwrap();
         assert!(db.search("S", generation, "valid", 1, 10).is_err());
+        assert!(db.search("S", generation, "valid", 3, 10).is_err());
         assert!(
             db.promote("S", generation + 1, "2", &zero_progress())
                 .is_err()
@@ -4895,11 +4908,11 @@ mod tests {
             "S",
             generation,
             &[
-                inventory_entry("219", "display-exact"),
-                inventory_entry("219 block", "display-prefix"),
-                inventory_entry("ordinary", "219.item"),
-                inventory_entry("block 219", "display-contains"),
                 inventory_entry("ordinary two", "area.219.item"),
+                inventory_entry("block 219", "display-contains"),
+                inventory_entry("ordinary", "219.item"),
+                inventory_entry("219 block", "display-prefix"),
+                inventory_entry("219", "display-exact"),
             ],
         )
         .unwrap();
@@ -4920,10 +4933,68 @@ mod tests {
             ]
         );
         assert_eq!(
+            db.search("S", generation, "219", 3, 2)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["display-exact", "display-prefix", "219.item"]
+        );
+        assert_eq!(
             db.search("S", generation, "ordinary two", 3, 10)
                 .unwrap()
                 .len(),
             1
+        );
+        db.connection
+            .execute(
+                "DELETE FROM entries
+                 WHERE server = 'S' AND generation = ?1 AND item_id = 'display-exact'",
+                [generation as i64],
+            )
+            .unwrap();
+        assert_eq!(db.search("S", generation, "219", 3, 10).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn full_text_search_reports_missing_tables() {
+        let directory = tempdir().unwrap();
+        let fts_path = directory.path().join("missing-fts.sqlite3");
+        let mut fts_db = IndexDb::open(&fts_path).unwrap();
+        let fts_generation = fts_db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        fts_db
+            .insert_entries("S", fts_generation, &[inventory_entry("Tag", "S.Tag")])
+            .unwrap();
+        fts_db
+            .promote("S", fts_generation, "2", &zero_progress())
+            .unwrap();
+        fts_db
+            .connection
+            .execute("DROP TABLE entries_fts", [])
+            .unwrap();
+        assert!(fts_db.search("S", fts_generation, "tag", 3, 10).is_err());
+
+        let entries_path = directory.path().join("missing-entries.sqlite3");
+        let mut entries_db = IndexDb::open(&entries_path).unwrap();
+        let entries_generation = entries_db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        entries_db
+            .insert_entries("S", entries_generation, &[inventory_entry("Tag", "S.Tag")])
+            .unwrap();
+        entries_db
+            .promote("S", entries_generation, "2", &zero_progress())
+            .unwrap();
+        entries_db
+            .connection
+            .execute("DROP TABLE entries", [])
+            .unwrap();
+        assert!(
+            entries_db
+                .search("S", entries_generation, "tag", 3, 10)
+                .is_err()
         );
     }
 

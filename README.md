@@ -210,7 +210,9 @@ config file — see [Configuration](#configuration) below.
   is quarantined rather than serving silently incomplete substring results.
   Indexed queries use a dedicated read-only SQLite connection and a bounded in-memory ranking
   pass for full-text candidates, keeping broad searches out of the foreground database mutex.
-  This preserves status, discovery, reads, writes, and lazy browse responsiveness during search.
+  Matching is case-insensitive with exact/prefix/contains ranking, and responses report
+  `has_more` when the requested result window is exceeded. This preserves status, discovery,
+  reads, writes, and lazy browse responsiveness during search.
   DA3 root ItemIDs and unused filters are marshalled as required non-null empty strings. If the
   first DA3 root browse still returns `RPC_X_NULL_REF_POINTER` or `E_NOTIMPL`, a server that also
   supports DA2 continues through DA2 with an explicit compatibility warning. The persisted
