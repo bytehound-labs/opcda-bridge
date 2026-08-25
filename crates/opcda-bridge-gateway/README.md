@@ -25,6 +25,9 @@ Tag browsing uses native one-level OPC DA enumeration with bounded pages. The ga
 browse sessions and continuation tokens, preserves exact ItemIDs separately from display names,
 and reports whether a page is complete. Namespace search is a bounded progressive operation that
 can be cancelled by dropping the client stream.
+DA3 root ItemIDs and unused filters are sent as required non-null empty strings. A server that
+also supports DA2 falls back only when its first DA3 root browse returns
+`RPC_X_NULL_REF_POINTER` or `E_NOTIMPL`, and reports that compatibility decision explicitly.
 
 The gateway also exposes persistent indexed-search status, refresh, pause, resume, cancel, and
 query operations for explicitly configured OPC servers. Capability responses advertise indexed
@@ -34,6 +37,12 @@ Refreshes run asynchronously, and gateway shutdown cancels active indexing befor
 An inventory can complete successfully with a non-fatal warning when the OPC server rejects
 specific namespace branches; the generation remains active and usable, and the status diagnostic
 is reported as a warning unless the index state is `failed`.
+Completed active generations are durable across gateway restarts. Activation is a short atomic
+metadata transition, so search and status remain responsive while a refresh becomes active.
+Superseded and abandoned data is reclaimed in bounded background batches through a separate
+SQLite WAL connection. An interrupted refresh is superseded when a complete active generation
+remains available, so status and search continue to use that snapshot while cleanup runs.
+An interrupted initial build remains failed and visible because no complete snapshot can replace it.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- keep namespace index activation responsive by promoting generation metadata atomically and
+  reclaiming obsolete generations in bounded background cleanup batches
+- preserve searchable active generations after restart while interrupted refresh data is
+  superseded for background cleanup without reporting the durable snapshot as failed
+- marshal required DA3 root and filter strings correctly, with a narrowly scoped DA2 fallback for
+  compatible servers that reject the first DA3 root browse
+- persist activated counts from committed index rows instead of relying on the final progress event
+- retry transient obsolete-generation cleanup failures and ignore failed generations older than
+  the active snapshot when reporting status
+- quarantine inconsistent relational/full-text cache data instead of serving incomplete substring
+  results, and distinguish confirmed DA3-to-DA2 fallbacks from genuine DA2-only profiles
+
 ## [0.4.5](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.4...opcda-bridge-gateway-v0.4.5) - 2026-08-24
 
 ### Fixed
