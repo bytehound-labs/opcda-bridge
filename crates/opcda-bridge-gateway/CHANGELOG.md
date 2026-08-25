@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.5...opcda-bridge-gateway-v0.4.6) - 2026-08-25
+
+### Fixed
+
+- *(gateway)* keep index promotion responsive ([#71](https://github.com/bytehound-labs/opcda-bridge/pull/71))
+
 ### Fixed
 
 - keep namespace index activation responsive by promoting generation metadata atomically and
