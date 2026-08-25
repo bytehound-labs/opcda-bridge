@@ -774,7 +774,7 @@ dependencies = [
  "opcda-bridge 0.4.0",
  "opcda-bridge 0.4.5",
  "opcda-bridge-gateway 0.3.2",
- "opcda-bridge-gateway 0.4.6",
+ "opcda-bridge-gateway 0.4.7",
  "opcda-bridge-proto 0.3.2",
  "opcda-bridge-proto 0.4.5",
  "tempfile",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "async-trait",
