@@ -23,8 +23,10 @@ for service installation, configuration, and firewall setup.
 
 Tag browsing uses native one-level OPC DA enumeration with bounded pages. The gateway owns opaque
 browse sessions and continuation tokens, preserves exact ItemIDs separately from display names,
-and reports whether a page is complete. Namespace search is a bounded progressive operation that
-can be cancelled by dropping the client stream.
+and reports whether a page is complete. Only selectable item and branch-and-item nodes expose
+ItemIDs; branch-only nodes retain their private navigation identifiers behind opaque node keys.
+Namespace search is a bounded progressive operation that can be cancelled by dropping the client
+stream.
 DA3 root ItemIDs and unused filters are sent as required non-null empty strings. A server that
 also supports DA2 falls back only when its first DA3 root browse returns
 `RPC_X_NULL_REF_POINTER` or `E_NOTIMPL`, and reports that compatibility decision explicitly.
