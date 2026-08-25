@@ -45,6 +45,10 @@ Superseded and abandoned data is reclaimed in bounded background batches through
 SQLite WAL connection. An interrupted refresh is superseded when a complete active generation
 remains available, so status and search continue to use that snapshot while cleanup runs.
 An interrupted initial build remains failed and visible because no complete snapshot can replace it.
+Uncached indexed searches use a separate read-only SQLite connection and rank only a bounded
+candidate set in memory, so a broad query cannot hold the coordinator's foreground database
+mutex while it scans the FTS index. Status, discovery, reads, writes, and lazy browse therefore
+remain available while search work is in progress.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the

@@ -6,8 +6,8 @@ use crate::opc::{
     InventoryNodeKind, InventoryProgress, NamespaceOrganization, OpcClient,
 };
 use chrono::{DateTime, Local, Timelike};
-use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::{HashMap, HashSet, VecDeque};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::Write;
@@ -108,6 +108,12 @@ struct CleanupTaskState {
     #[cfg(test)]
     failures: usize,
 }
+
+#[cfg(test)]
+type SearchGate = Option<(
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+)>;
 
 impl BackgroundTasks {
     fn new() -> Self {
@@ -595,6 +601,16 @@ impl IndexDb {
         })
     }
 
+    fn open_read_only(path: &Path) -> anyhow::Result<Self> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "query_only", true)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            connection,
+        })
+    }
+
     fn database_bytes(&self) -> u64 {
         fs::metadata(&self.path).map_or(0, |metadata| metadata.len())
     }
@@ -937,6 +953,12 @@ impl IndexDb {
         limit: u32,
     ) -> anyhow::Result<Vec<IndexedMatch>> {
         let normalized_query = normalize_query(query);
+        let fts_compatible = normalized_query
+            .split_whitespace()
+            .all(|term| term.chars().count() >= 3);
+        if normalized_query.chars().count() >= 3 && fts_compatible && mode != 1 && mode != 2 {
+            return self.search_full_text(server, generation, &normalized_query, limit);
+        }
         let mut sql = format!(
             "SELECT e.item_id, e.display_name, e.kind, e.breadcrumbs FROM entries e
              WHERE e.server = ? AND e.generation = {}",
@@ -957,30 +979,13 @@ impl IndexDb {
                 values.extend([pattern.clone(), pattern]);
             }
             _ => {
-                let fts_compatible = normalized_query
-                    .split_whitespace()
-                    .all(|term| term.chars().count() >= 3);
-                if normalized_query.chars().count() >= 3 && fts_compatible {
-                    let fts_query = format!("\"{}\"", normalized_query.replace('"', "\"\""));
-                    sql.push_str(
-                        " AND EXISTS (
-                             SELECT 1 FROM entries_fts f
-                             WHERE f.server = e.server
-                               AND f.generation = e.generation
-                               AND f.item_id = e.item_id
-                               AND entries_fts MATCH ?
-                         )",
-                    );
-                    values.push(fts_query);
-                } else {
-                    let pattern = format!("%{}%", escape_like(&normalized_query));
-                    sql.push_str(
-                        " AND (e.display_name_norm LIKE ? ESCAPE '\\'
-                            OR e.item_id_norm LIKE ? ESCAPE '\\'
-                            OR e.breadcrumbs LIKE ? ESCAPE '\\')",
-                    );
-                    values.extend([pattern.clone(), pattern.clone(), pattern]);
-                }
+                let pattern = format!("%{}%", escape_like(&normalized_query));
+                sql.push_str(
+                    " AND (e.display_name_norm LIKE ? ESCAPE '\\'
+                        OR e.item_id_norm LIKE ? ESCAPE '\\'
+                        OR e.breadcrumbs LIKE ? ESCAPE '\\')",
+                );
+                values.extend([pattern.clone(), pattern.clone(), pattern]);
             }
         }
         sql.push_str(
@@ -1031,6 +1036,131 @@ impl IndexDb {
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    fn search_full_text(
+        &self,
+        server: &str,
+        generation: u64,
+        normalized_query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<IndexedMatch>> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
+        let fts_query = build_fts_query(normalized_query);
+        let mut statement = self.connection.prepare(
+            "SELECT item_id, display_name
+             FROM entries_fts
+             WHERE entries_fts MATCH ?1 AND server = ?2 AND generation = ?3",
+        )?;
+        let rows = statement.query_map(params![fts_query, server, generation], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let capacity = usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX);
+        let mut candidates = BinaryHeap::with_capacity(capacity);
+        for row in rows {
+            let (item_id, display_name) = row?;
+            let display_name_norm = normalize_query(&display_name);
+            let item_id_norm = normalize_query(&item_id);
+            let candidate = SearchCandidate {
+                rank: SearchRank {
+                    tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
+                    display_name_len: display_name_norm.chars().count(),
+                    display_name_norm,
+                    item_id_norm,
+                },
+                item_id,
+            };
+            if candidates.len() < capacity {
+                candidates.push(candidate);
+            } else if candidates.peek().is_some_and(|worst| candidate < *worst) {
+                candidates.pop();
+                candidates.push(candidate);
+            }
+        }
+        drop(statement);
+
+        let mut statement = self.connection.prepare(
+            "SELECT display_name, kind, breadcrumbs
+             FROM entries
+             WHERE server = ?1 AND generation = ?2 AND item_id = ?3",
+        )?;
+        let mut matches = Vec::with_capacity(candidates.len());
+        for candidate in candidates.into_sorted_vec() {
+            let result =
+                statement.query_row(params![server, generation, candidate.item_id], |row| {
+                    let kind = parse_indexed_kind(row.get::<_, i64>(1)?)?;
+                    let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(2)?)?;
+                    Ok(IndexedMatch {
+                        item_id: candidate.item_id.clone(),
+                        display_name: row.get(0)?,
+                        kind,
+                        breadcrumbs,
+                    })
+                });
+            match result {
+                Ok(value) => matches.push(value),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(matches)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct SearchCandidate {
+    rank: SearchRank,
+    item_id: String,
+}
+
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct SearchRank {
+    tier: u8,
+    display_name_len: usize,
+    display_name_norm: String,
+    item_id_norm: String,
+}
+
+fn search_rank(query: &str, display_name_norm: &str, item_id_norm: &str) -> u8 {
+    if display_name_norm == query {
+        0
+    } else if item_id_norm == query {
+        1
+    } else if display_name_norm.starts_with(query) {
+        2
+    } else if item_id_norm.starts_with(query) {
+        3
+    } else if display_name_norm.contains(query) {
+        4
+    } else if item_id_norm.contains(query) {
+        5
+    } else {
+        6
+    }
+}
+
+fn build_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn parse_indexed_kind(value: i64) -> rusqlite::Result<InventoryNodeKind> {
+    match value {
+        1 => Ok(InventoryNodeKind::Item),
+        2 => Ok(InventoryNodeKind::BranchAndItem),
+        value => Err(rusqlite::Error::InvalidParameterName(format!(
+            "unknown indexed node kind {value}"
+        ))),
+    }
+}
+
+fn parse_indexed_breadcrumbs(value: String) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })
 }
 
 #[derive(Default)]
@@ -1260,6 +1390,8 @@ pub struct IndexManager<C: OpcClient> {
     reject_next_build_spawn: AtomicBool,
     #[cfg(test)]
     reject_next_cleanup_spawn: AtomicBool,
+    #[cfg(test)]
+    search_gate: Arc<Mutex<SearchGate>>,
 }
 
 impl<C: OpcClient> IndexManager<C> {
@@ -1293,11 +1425,26 @@ impl<C: OpcClient> IndexManager<C> {
             reject_next_build_spawn: AtomicBool::new(false),
             #[cfg(test)]
             reject_next_cleanup_spawn: AtomicBool::new(false),
+            #[cfg(test)]
+            search_gate: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn max_results(&self) -> u32 {
         self.settings.max_results
+    }
+
+    #[cfg(test)]
+    fn install_search_gate(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.search_gate.lock().unwrap() = Some((started_tx, release_rx));
+        (started_rx, release_tx)
     }
 
     pub fn start_background_indexing(self: &Arc<Self>) {
@@ -1886,50 +2033,76 @@ impl<C: OpcClient> IndexManager<C> {
         let limit = limit.max(1).min(self.settings.max_results);
         let status = self.status(server).await?;
         let normalized_query = normalize_query(query);
-        let result = self.with_database(|db| {
-            let Some(generation) = db.search_generation(server)? else {
-                return Ok(None);
-            };
-            let key = CacheKey {
-                server: server.to_string(),
-                generation,
-                query: normalized_query.clone(),
-                mode,
-                limit,
-            };
-            if status.active_generation == generation
-                && let Some(mut value) = self
-                    .cache
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
-                    .get(&key)
-            {
-                value.status = status.clone();
-                return Ok(Some(value));
-            }
-            let mut matches = db.search(server, generation, query, mode, limit)?;
-            let has_more = matches.len() > limit as usize;
-            matches.truncate(limit as usize);
-            let value = IndexedSearch {
-                matches,
-                has_more,
-                status: status.clone(),
-            };
-            if status.active_generation == generation {
-                self.cache
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
-                    .insert(key, value.clone());
-            }
-            Ok(Some(value))
-        })?;
-        let Some(value) = result else {
+        let Some(generation) = self.with_database(|db| db.search_generation(server))? else {
             return Ok(IndexedSearch {
                 matches: Vec::new(),
                 has_more: false,
                 status,
             });
         };
+        let key = CacheKey {
+            server: server.to_string(),
+            generation,
+            query: normalized_query.clone(),
+            mode,
+            limit,
+        };
+        if status.active_generation == generation
+            && let Some(mut value) = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
+                .get(&key)
+        {
+            value.status = status;
+            return Ok(value);
+        }
+
+        let search_started = Instant::now();
+        let database_path = self.settings.database_path.clone();
+        let server_name = server.to_string();
+        let query_name = query.to_string();
+        #[cfg(test)]
+        let search_gate = self.search_gate.lock().unwrap().take();
+        let mut matches = if database_path == Path::new(":memory:") {
+            self.with_database(|db| db.search(server, generation, query, mode, limit))?
+        } else {
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some((started, release)) = search_gate {
+                    let _ = started.send(());
+                    let _ = release.blocking_recv();
+                }
+                let db = IndexDb::open_read_only(&database_path)?;
+                db.search(&server_name, generation, &query_name, mode, limit)
+            })
+            .await??
+        };
+        let has_more = matches.len() > limit as usize;
+        matches.truncate(limit as usize);
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server,
+            generation,
+            mode,
+            limit,
+            matches = matches.len(),
+            has_more,
+            duration_ms = search_started.elapsed().as_millis() as u64,
+            "completed namespace index search"
+        );
+        let value = IndexedSearch {
+            matches,
+            has_more,
+            status,
+        };
+        if value.status.active_generation == generation {
+            self.cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
+                .insert(key, value.clone());
+        }
         Ok(value)
     }
 
@@ -2790,6 +2963,10 @@ mod tests {
     fn normalization_and_timestamp_helpers_are_safe() {
         assert_eq!(normalize_query("  FCS0201   PV "), "fcs0201 pv");
         assert_eq!(escape_like(r"a%b_c\d"), r"a\%b\_c\\d");
+        assert_eq!(build_fts_query("fcs0201 pv"), "\"fcs0201\" AND \"pv\"");
+        assert_eq!(search_rank("219", "219", "display-exact"), 0);
+        assert_eq!(search_rank("219", "ordinary", "219.item"), 3);
+        assert_eq!(search_rank("219", "block 219", "display-contains"), 4);
         assert!(parse_timestamp("not-a-timestamp").is_none());
         assert_eq!(
             parse_timestamp(u128::from(u64::MAX).to_string().as_str()),
@@ -4690,6 +4867,64 @@ mod tests {
             reopened.status_rows("S").unwrap().first().unwrap().state,
             "active"
         );
+        let read_only = IndexDb::open_read_only(&path).unwrap();
+        assert_eq!(
+            read_only
+                .search("S", second_generation, "second", 3, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            read_only
+                .connection
+                .execute("DELETE FROM entries", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn full_text_search_ranks_bounded_candidates_without_join_sort() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("ranked-search.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries(
+            "S",
+            generation,
+            &[
+                inventory_entry("219", "display-exact"),
+                inventory_entry("219 block", "display-prefix"),
+                inventory_entry("ordinary", "219.item"),
+                inventory_entry("block 219", "display-contains"),
+                inventory_entry("ordinary two", "area.219.item"),
+            ],
+        )
+        .unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+
+        let matches = db.search("S", generation, "219", 3, 10).unwrap();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "display-exact",
+                "display-prefix",
+                "219.item",
+                "display-contains",
+                "area.219.item",
+            ]
+        );
+        assert_eq!(
+            db.search("S", generation, "ordinary two", 3, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6041,6 +6276,62 @@ mod tests {
         let result = manager.search("S", "alpha", 2, 99).await.unwrap();
         assert_eq!(result.matches.len(), 2);
         assert!(result.has_more);
+    }
+
+    #[tokio::test]
+    async fn search_does_not_hold_database_lock_during_read_only_query() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        manager
+            .with_database(|db| {
+                let generation =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", generation, &[inventory_entry("Mock tag", "mock.tag")])?;
+                db.promote("S", generation, &timestamp_now(), &zero_progress())
+            })
+            .unwrap();
+
+        let (search_started, release_search) = manager.install_search_gate();
+        let search_manager = Arc::clone(&manager);
+        let search_task =
+            tokio::spawn(async move { search_manager.search("S", "mock", 3, 10).await });
+        tokio::time::timeout(Duration::from_secs(2), search_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(2), manager.status("S"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, IndexState::Ready);
+
+        release_search.send(()).unwrap();
+        let search = search_task.await.unwrap().unwrap();
+        assert_eq!(search.matches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_database_search_uses_primary_connection() {
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(PathBuf::from(":memory:")),
+        ));
+        manager
+            .with_database(|db| {
+                let generation =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", generation, &[inventory_entry("Mock tag", "mock.tag")])?;
+                db.promote("S", generation, &timestamp_now(), &zero_progress())
+            })
+            .unwrap();
+
+        let search = manager.search("S", "mock", 3, 10).await.unwrap();
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.status.state, IndexState::Ready);
     }
 
     #[tokio::test]
