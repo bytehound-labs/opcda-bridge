@@ -11,12 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(gateway)* hide branch-only browse item IDs ([#74](https://github.com/bytehound-labs/opcda-bridge/pull/74))
+- _(gateway)_ hide branch-only browse item IDs ([#74](https://github.com/bytehound-labs/opcda-bridge/pull/74))
 
 ### Fixed
 
 - expose ItemIDs only for selectable browse nodes while retaining branch-only DA3 navigation
   identifiers behind opaque node keys
+- keep broad indexed searches out of the foreground database mutex by using a dedicated
+  read-only connection and bounded full-text candidate ranking
 
 ## [0.4.6](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.5...opcda-bridge-gateway-v0.4.6) - 2026-08-25
 

@@ -50,6 +50,10 @@ a working opcda-bridge, not a redesign of it.
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
   every reported count before indexing so malformed native counts cannot panic the worker.
+- **Indexed search is isolated from foreground database coordination.** Uncached full-text
+  queries open a read-only SQLite connection outside the process-wide writable database mutex,
+  retain only a bounded ranked candidate set, and fetch metadata for the final result page.
+  Search must never make status, discovery, reads, writes, or lazy browse wait on a broad query.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 - **Compatibility contract**: Client and gateway package versions are independent. Runtime
@@ -130,8 +134,9 @@ for Windows. Both `server`'s and `run`'s tests share one `MockOpcClient`
 COM.
 
 Index lifecycle tests must cover an active build with an obsolete runtime error, exact database
-operation diagnostics, and failed/cancelled generation cleanup. Operational SQLite errors such
-as lock contention must not be treated as corrupt-cache evidence and must not trigger quarantine.
+operation diagnostics, failed/cancelled generation cleanup, read-only search access, and
+deterministic full-text ranking. Operational SQLite errors such as lock contention must not be
+treated as corrupt-cache evidence and must not trigger quarantine.
 
 ### Config file precedence
 
