@@ -508,6 +508,21 @@ runs CodeQL and Semgrep analysis, scans complete Git history with the open-sourc
 and audits workflow files with actionlint and zizmor. Configuration, output, and protocol
 boundaries have property tests plus standalone cargo-fuzz smoke targets.
 
+SonarQube Cloud analyzes the Rust workspace for maintainability, reliability, security, complexity,
+and duplication issues. Rust coverage is imported from the same `cargo llvm-cov` LCOV report used
+by the coverage workflow; integration tests, fuzz targets, the compatibility workspace, and build
+output are classified or excluded so they do not distort source coverage. Relevant pull requests
+and pushes to `main` run the analysis, with a full scan every Wednesday at 04:47 UTC and an
+available manual dispatch. Fork pull requests report an intentional skip because repository
+secrets are unavailable.
+
+With the SonarScanner CLI installed and `SONAR_TOKEN` exported, reproduce the analysis locally:
+
+```sh
+cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+sonar-scanner
+```
+
 Tagged binary releases include SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures,
 and GitHub artifact provenance attestations. Running the release workflow manually builds and
 uploads packages as workflow artifacts without creating a GitHub release. The client and gateway

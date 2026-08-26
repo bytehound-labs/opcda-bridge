@@ -32,6 +32,12 @@ Example: `feat(gateway): add tag subscription support`.
 - Both are enforced automatically by a [lefthook](https://github.com/evilmartians/lefthook)
   `pre-commit` hook (`.lefthook.yml`), which also formats `Cargo.toml`/TOML with `taplo` and
   Markdown/YAML/JSON with `prettier`. Run `lefthook install` once after cloning to enable it.
+- SonarQube Cloud analyzes the Rust workspace, compatibility support, and fuzz targets for
+  maintainability, reliability, security, complexity, and duplication issues. Reproduce its
+  coverage input locally with `cargo llvm-cov --workspace --locked --lcov --output-path lcov.info`,
+  then run `sonar-scanner` with `SONAR_TOKEN` exported. The workflow runs for relevant pull
+  requests and pushes to `main`, plus a Wednesday 04:47 UTC weekly scan; fork pull requests
+  intentionally skip the secret-bearing analysis.
 
 ## Testing
 
