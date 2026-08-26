@@ -757,7 +757,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e084c362f4cb9c6e93cf0e7f950c601e1fc4098d2eee75b676d42f03307d3173"
 dependencies = [
- "opcda-bridge-proto 0.4.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "opcda-bridge-proto 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror",
  "tonic",
  "tonic-prost",
@@ -765,9 +765,9 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
- "opcda-bridge-proto 0.4.5",
+ "opcda-bridge-proto 0.4.6",
  "serde",
  "thiserror",
  "tonic",
@@ -782,11 +782,11 @@ dependencies = [
  "async-trait",
  "opcda-bridge 0.3.2",
  "opcda-bridge 0.4.0",
- "opcda-bridge 0.4.5",
+ "opcda-bridge 0.4.6",
  "opcda-bridge-gateway 0.3.2",
- "opcda-bridge-gateway 0.4.8",
+ "opcda-bridge-gateway 0.4.9",
  "opcda-bridge-proto 0.3.2",
- "opcda-bridge-proto 0.4.5",
+ "opcda-bridge-proto 0.4.6",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -827,7 +827,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
- "opcda-bridge-proto 0.4.5",
+ "opcda-bridge-proto 0.4.6",
  "rusqlite",
  "serde",
  "serde_json",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "prost",
  "toml",
@@ -869,9 +869,9 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28af995bbbf320d5afc1a14d1352bd2f3862b00cf73f5c2ec7850f536b18334a"
+checksum = "967105bab622e91ce3389c18bde94b90540c1b5a07e83b9a1690e509f5b2cbef"
 dependencies = [
  "prost",
  "toml",
