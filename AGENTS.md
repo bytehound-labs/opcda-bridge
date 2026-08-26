@@ -82,6 +82,8 @@ target for early gateway development.
   merges, no `develop`/release branches, releases tagged directly off `main`. Contrast with the
   author's FalconTune/AccuTune repos, which use a `dev`-branch + `--no-ff` merge model — do not
   carry that convention over here.
+- **Agent workflow**: Always work on a feature branch, open a pull request, and merge only after
+  all required CI/CD checks pass. Never commit directly to `main`.
 - **Commits**: [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`,
   `chore:`, etc.).
 - **Formatting/linting**: `cargo fmt` (default settings) and
