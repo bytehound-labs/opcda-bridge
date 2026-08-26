@@ -189,6 +189,7 @@ mod tests {
             indexed_search_protocol_version: "1".into(),
             max_indexed_search_results: 50,
             search_index_state: SearchIndexState::Ready as i32,
+            search_index_promoting: false,
         };
         let close = CloseBrowseSessionRequest {
             session_id: "s".into(),
@@ -268,6 +269,7 @@ mod tests {
                 items_per_second: 5.0,
                 estimated_remaining_ms: Some(6),
             }),
+            ..Default::default()
         };
         let response = SearchIndexResponse {
             matches: vec![IndexedSearchMatch {

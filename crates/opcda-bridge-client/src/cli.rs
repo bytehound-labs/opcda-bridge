@@ -144,6 +144,9 @@ pub enum Commands {
     IndexStatus {
         #[arg(long)]
         server: Option<String>,
+        /// Refresh the status view every N seconds until Ctrl+C
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
     },
     /// Search the persistent namespace index without live traversal
     IndexSearch {
@@ -273,9 +276,9 @@ pub async fn run_command(
             )
             .await?
         }
-        Commands::IndexStatus { server } => {
+        Commands::IndexStatus { server, watch } => {
             let server = crate::config::resolve_server(server, config)?;
-            crate::commands::cmd_index_status(host, server, format).await?
+            crate::commands::cmd_index_status(host, server, format, watch).await?
         }
         Commands::IndexSearch {
             query,
@@ -396,6 +399,7 @@ mod tests {
             },
             Commands::IndexStatus {
                 server: Some("S".into()),
+                watch: None,
             },
             Commands::IndexSearch {
                 query: "PV1".into(),

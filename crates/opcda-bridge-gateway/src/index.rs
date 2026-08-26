@@ -1,16 +1,22 @@
 //! Persistent, gateway-owned namespace index and refresh coordinator.
 
-use crate::config::ResolvedIndexConfig;
+use crate::config::{InitialBuildPolicy, ResolvedIndexConfig};
+use crate::controller::{
+    AdaptiveIndexController, ControllerConfig, ControllerObservation, HostMetrics,
+    HostMetricsProvider, InventoryLimits, default_host_metrics_provider,
+};
 use crate::opc::{
     BrowseSource, InventoryControl, InventoryEntry, InventoryEvent, InventoryHandle,
-    InventoryNodeKind, InventoryProgress, NamespaceOrganization, OpcClient,
+    InventoryNodeKind, InventoryPacing, InventoryProgress, InventorySliceObservation,
+    MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization, OpcClient,
 };
 use chrono::{DateTime, Local, Timelike};
+use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +24,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 3;
-const RETRY_BACKOFF: Duration = Duration::from_secs(60);
+const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(300);
+const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(86_400);
 const CLEANUP_BATCH_SIZE: usize = 10_000;
 const CLEANUP_BATCH_PAUSE: Duration = Duration::from_millis(1);
 const CLEANUP_RETRY_LIMIT: u32 = 3;
@@ -31,6 +38,7 @@ pub enum IndexState {
     Ready,
     Stale,
     Refreshing,
+    Promoting,
     Failed,
 }
 
@@ -49,6 +57,132 @@ pub struct IndexStatus {
     pub organization: NamespaceOrganization,
     pub source: BrowseSource,
     pub progress: Option<InventoryProgress>,
+    pub effective_limits: Option<InventoryLimits>,
+    pub controller_state: Option<crate::controller::ControllerState>,
+    pub pause_reason: Option<crate::controller::PauseReason>,
+    pub recovery_deadline: Option<String>,
+    pub foreground_metrics: ForegroundMetrics,
+    pub host_metrics: HostMetrics,
+    pub health: HealthProbeState,
+    pub sentinel_configured: bool,
+    pub storage: StorageDiagnostics,
+    pub scheduler: SchedulerDiagnostics,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForegroundMetrics {
+    pub active_count: u64,
+    pub operations: u64,
+    pub errors: u64,
+    pub bad_quality: u64,
+    pub latency_p50_ms: Option<u64>,
+    pub latency_p95_ms: Option<u64>,
+    pub latency_max_ms: Option<u64>,
+    pub last_error: bool,
+    pub last_bad_quality: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HealthProbeState {
+    #[default]
+    Unavailable,
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageDiagnostics {
+    pub main_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    pub free_bytes: Option<u64>,
+    pub last_commit_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchedulerDiagnostics {
+    pub next_refresh_at: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_success_duration_ms: Option<u64>,
+    pub retry_after: Option<String>,
+    pub consecutive_failures: u32,
+    pub circuit_open: bool,
+}
+
+#[derive(Default)]
+struct ForegroundMetricState {
+    latencies_ms: VecDeque<u64>,
+    operations: u64,
+    errors: u64,
+    bad_quality: u64,
+    last_error: bool,
+    last_bad_quality: bool,
+    last_health_failure_at: Option<Instant>,
+    last_bad_quality_at: Option<Instant>,
+}
+
+impl ForegroundMetricState {
+    fn record_health_at(
+        &mut self,
+        now: Instant,
+        latency_ms: u64,
+        error: bool,
+        bad_quality: bool,
+        health_failure: bool,
+    ) {
+        const WINDOW: usize = 128;
+        self.latencies_ms.push_back(latency_ms);
+        if self.latencies_ms.len() > WINDOW {
+            self.latencies_ms.pop_front();
+        }
+        self.operations = self.operations.saturating_add(1);
+        self.errors += u64::from(error);
+        self.bad_quality += u64::from(bad_quality);
+        self.last_error = error;
+        self.last_bad_quality = bad_quality;
+        if health_failure {
+            self.last_health_failure_at = Some(now);
+        }
+        if bad_quality {
+            self.last_bad_quality_at = Some(now);
+        }
+    }
+
+    fn recent_health_failure(&self, now: Instant, max_age: Duration) -> bool {
+        self.last_health_failure_at
+            .is_some_and(|recorded| now.saturating_duration_since(recorded) <= max_age)
+    }
+
+    fn recent_bad_quality(&self, now: Instant, max_age: Duration) -> bool {
+        self.last_bad_quality_at
+            .is_some_and(|recorded| now.saturating_duration_since(recorded) <= max_age)
+    }
+
+    fn snapshot(&self, active_count: u64) -> ForegroundMetrics {
+        let mut sorted = self.latencies_ms.iter().copied().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        ForegroundMetrics {
+            active_count,
+            operations: self.operations,
+            errors: self.errors,
+            bad_quality: self.bad_quality,
+            latency_p50_ms: percentile(&sorted, 50),
+            latency_p95_ms: percentile(&sorted, 95),
+            latency_max_ms: sorted.last().copied(),
+            last_error: self.last_error,
+            last_bad_quality: self.last_bad_quality,
+        }
+    }
+}
+
+fn percentile(values: &[u64], percentile: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let rank = (values.len() * percentile).div_ceil(100).max(1);
+    let index = (rank - 1).min(values.len() - 1);
+    values.get(index).copied()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +208,11 @@ struct RuntimeBuild {
     foreground_users: usize,
     operator_paused: bool,
     quiet_until: Option<Instant>,
+    effective_limits: Option<InventoryLimits>,
+    controller_state: Option<crate::controller::ControllerState>,
+    pause_reason: Option<crate::controller::PauseReason>,
+    recovery_deadline: Option<Instant>,
+    last_commit_latency_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -81,6 +220,16 @@ struct RuntimeState {
     build: Option<RuntimeBuild>,
     retry_after: Option<SystemTime>,
     last_error: Option<String>,
+    consecutive_failures: u32,
+    circuit_open: bool,
+    health: HealthProbeState,
+    sentinel_checked_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PauseOverlayState {
+    maintenance: bool,
+    health: bool,
 }
 
 struct BackgroundTasks {
@@ -379,12 +528,14 @@ struct IndexDb {
 
 #[derive(Debug)]
 struct BuildFileLock {
-    path: PathBuf,
+    file: Option<fs::File>,
 }
 
 impl BuildFileLock {
     fn acquire(database_path: &Path, server: &str) -> anyhow::Result<Self> {
         Self::acquire_with(database_path, server, |file, metadata| {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
             file.write_all(metadata)?;
             file.sync_all()
         })
@@ -394,53 +545,62 @@ impl BuildFileLock {
     where
         F: FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
     {
-        let file_name = database_path
-            .file_name()
-            .map_or_else(|| "index.sqlite3".into(), |name| name.to_os_string());
-        let lock_path =
-            database_path.with_file_name(format!("{}.build.lock", file_name.to_string_lossy()));
+        let lock_path = build_lock_path(database_path, server);
         lock_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(fs::create_dir_all)
             .transpose()?;
-        let mut file = match OpenOptions::new()
-            .create_new(true)
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
             .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let owner = fs::read_to_string(&lock_path)
-                    .unwrap_or_else(|_| "owner details unavailable".to_string());
-                anyhow::bail!(
-                    "namespace index build lock already exists at {} ({})",
-                    lock_path.display(),
-                    owner.trim()
-                );
-            }
-            Err(error) => return Err(error.into()),
-        };
+            .truncate(false)
+            .open(&lock_path)?;
+        if let Err(error) = file.try_lock_exclusive() {
+            let owner = fs::read_to_string(&lock_path)
+                .unwrap_or_else(|_| "owner details unavailable".to_string());
+            anyhow::bail!(
+                "namespace index build lock is already held at {} ({})",
+                lock_path.display(),
+                if owner.trim().is_empty() {
+                    error.to_string()
+                } else {
+                    owner.trim().to_string()
+                }
+            );
+        }
         let metadata = format!("process_id={}\nserver={server}\n", std::process::id());
         if let Err(error) = initialize(&mut file, metadata.as_bytes()) {
-            let _ = fs::remove_file(&lock_path);
+            let _ = FileExt::unlock(&file);
             return Err(error.into());
         }
-        Ok(Self { path: lock_path })
+        Ok(Self { file: Some(file) })
+    }
+
+    fn is_held(database_path: &Path, server: &str) -> anyhow::Result<bool> {
+        let lock_path = build_lock_path(database_path, server);
+        let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                FileExt::unlock(&file)?;
+                Ok(false)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
 impl Drop for BuildFileLock {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(
-                process_id = std::process::id(),
-                lock = %self.path.display(),
-                error = %error,
-                "unable to remove namespace index build lock"
-            );
+        if let Some(file) = self.file.take() {
+            let _ = FileExt::unlock(&file);
+            drop(file);
         }
     }
 }
@@ -577,24 +737,42 @@ impl IndexDb {
         if relational_entries_exist != full_text_entries_exist {
             anyhow::bail!("namespace index relational and full-text data are inconsistent");
         }
-        connection.execute(
-            "UPDATE generations AS interrupted
-             SET state = CASE
-                     WHEN EXISTS (
-                         SELECT 1 FROM generations AS active
-                         WHERE active.server = interrupted.server
-                           AND active.state = 'active'
+        let staging_servers = {
+            let mut statement = connection
+                .prepare("SELECT DISTINCT server FROM generations WHERE state = 'staging'")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for server in staging_servers {
+            if BuildFileLock::is_held(path, &server)? {
+                tracing::debug!(
+                    database = %path.display(),
+                    server = %server,
+                    "preserving namespace index staging generation owned by a live process"
+                );
+                continue;
+            }
+            connection.execute(
+                "UPDATE generations AS interrupted
+                 SET state = CASE
+                         WHEN EXISTS (
+                             SELECT 1 FROM generations AS active
+                             WHERE active.server = interrupted.server
+                               AND active.state = 'active'
+                         )
+                         THEN 'superseded'
+                         ELSE 'failed'
+                     END,
+                     last_error = COALESCE(
+                         last_error,
+                         'namespace index build interrupted by gateway restart'
                      )
-                     THEN 'superseded'
-                     ELSE 'failed'
-                 END,
-                 last_error = COALESCE(
-                     last_error,
-                     'namespace index build interrupted by gateway restart'
-                 )
-             WHERE interrupted.state = 'staging'",
-            [],
-        )?;
+                 WHERE interrupted.server = ?1
+                   AND interrupted.state = 'staging'",
+                [server],
+            )?;
+        }
         Ok(Self {
             path: path.to_path_buf(),
             connection,
@@ -611,8 +789,73 @@ impl IndexDb {
         })
     }
 
-    fn database_bytes(&self) -> u64 {
-        fs::metadata(&self.path).map_or(0, |metadata| metadata.len())
+    fn storage_diagnostics(&self) -> StorageDiagnostics {
+        storage_diagnostics_for_path(&self.path)
+    }
+
+    fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        PathBuf::from(sidecar)
+    }
+
+    fn retry_state(&self, server: &str) -> anyhow::Result<(Option<SystemTime>, u32, bool)> {
+        let get = |key: String| -> anyhow::Result<Option<String>> {
+            Ok(self
+                .connection
+                .query_row(
+                    "SELECT value FROM index_meta WHERE key = ?1",
+                    [key],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        };
+        let retry_after = get(format!("retry_after:{server}"))?
+            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)));
+        let failures = get(format!("failures:{server}"))?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let circuit_open = get(format!("circuit:{server}"))?.is_some_and(|value| value == "1");
+        Ok((retry_after, failures, circuit_open))
+    }
+
+    fn set_retry_state(
+        &self,
+        server: &str,
+        retry_after: Option<SystemTime>,
+        failures: u32,
+        circuit_open: bool,
+    ) -> anyhow::Result<()> {
+        let retry = retry_after
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_millis().to_string())
+            .unwrap_or_default();
+        self.connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| {
+            for (key, value) in [
+                (format!("retry_after:{server}"), retry),
+                (format!("failures:{server}"), failures.to_string()),
+                (
+                    format!("circuit:{server}"),
+                    if circuit_open { "1" } else { "0" }.to_string(),
+                ),
+            ] {
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO index_meta(key, value) VALUES (?1, ?2)",
+                    params![key, value],
+                )?;
+            }
+            Ok::<(), rusqlite::Error>(())
+        })();
+        match result {
+            Ok(()) => self.connection.execute_batch("COMMIT;")?,
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK;");
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
 
     fn start_generation(
@@ -1243,6 +1486,9 @@ fn cleanup_obsolete_generations(
         }
         std::thread::sleep(CLEANUP_BATCH_PAUSE);
     }
+    let checkpoint = connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    });
     tracing::info!(
         process_id = std::process::id(),
         database = %path.display(),
@@ -1252,6 +1498,7 @@ fn cleanup_obsolete_generations(
         fts_entries_deleted = stats.fts_entries,
         generations_deleted = stats.generations,
         stopped_for_shutdown = stats.stopped_for_shutdown,
+        checkpoint = ?checkpoint,
         duration_ms = cleanup_started.elapsed().as_millis() as u64,
         "completed namespace index obsolete-generation cleanup"
     );
@@ -1378,11 +1625,16 @@ pub struct IndexManager<C: OpcClient> {
     client: Arc<C>,
     settings: ResolvedIndexConfig,
     database: Arc<Mutex<Option<IndexDb>>>,
-    build_locks: Arc<Mutex<HashMap<PathBuf, BuildFileLock>>>,
+    build_locks: Arc<Mutex<HashMap<String, BuildFileLock>>>,
     runtime: Arc<Mutex<HashMap<String, RuntimeState>>>,
     active_builds: Arc<Mutex<HashSet<String>>>,
+    pending_cancels: Arc<Mutex<HashSet<String>>>,
+    promoting: Arc<Mutex<HashSet<String>>>,
     foreground_users: Arc<Mutex<HashMap<String, usize>>>,
+    pause_overlays: Arc<Mutex<HashMap<String, PauseOverlayState>>>,
+    foreground_metrics: Arc<Mutex<HashMap<String, ForegroundMetricState>>>,
     cache: Arc<Mutex<QueryCache>>,
+    host_metrics: Arc<dyn HostMetricsProvider>,
     background_tasks: Arc<BackgroundTasks>,
     cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
     background_started: AtomicBool,
@@ -1394,9 +1646,30 @@ pub struct IndexManager<C: OpcClient> {
     search_gate: Arc<Mutex<SearchGate>>,
 }
 
+fn storage_diagnostics_for_path(path: &Path) -> StorageDiagnostics {
+    let main_bytes = fs::metadata(path).map_or(0, |metadata| metadata.len());
+    let wal_bytes = fs::metadata(IndexDb::sqlite_sidecar_path(path, "-wal"))
+        .map_or(0, |metadata| metadata.len());
+    let shm_bytes = fs::metadata(IndexDb::sqlite_sidecar_path(path, "-shm"))
+        .map_or(0, |metadata| metadata.len());
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let free_bytes = fs2::available_space(parent).ok();
+    StorageDiagnostics {
+        main_bytes,
+        wal_bytes,
+        shm_bytes,
+        free_bytes,
+        last_commit_latency_ms: None,
+    }
+}
+
 impl<C: OpcClient> IndexManager<C> {
     pub fn new(client: Arc<C>, settings: ResolvedIndexConfig) -> Self {
         let cache_capacity = settings.query_cache_capacity.max(1);
+        let host_metrics = default_host_metrics_provider(&settings.database_path);
         tracing::debug!(
             process_id = std::process::id(),
             database = %settings.database_path.display(),
@@ -1412,12 +1685,17 @@ impl<C: OpcClient> IndexManager<C> {
             build_locks: Arc::new(Mutex::new(HashMap::new())),
             runtime: Arc::new(Mutex::new(HashMap::new())),
             active_builds: Arc::new(Mutex::new(HashSet::new())),
+            pending_cancels: Arc::new(Mutex::new(HashSet::new())),
+            promoting: Arc::new(Mutex::new(HashSet::new())),
             foreground_users: Arc::new(Mutex::new(HashMap::new())),
+            pause_overlays: Arc::new(Mutex::new(HashMap::new())),
+            foreground_metrics: Arc::new(Mutex::new(HashMap::new())),
             cache: Arc::new(Mutex::new(QueryCache {
                 values: HashMap::new(),
                 order: VecDeque::new(),
                 capacity: cache_capacity,
             })),
+            host_metrics,
             background_tasks: Arc::new(BackgroundTasks::new()),
             cleanup_tasks: Arc::new(Mutex::new(HashMap::new())),
             background_started: AtomicBool::new(false),
@@ -1432,6 +1710,43 @@ impl<C: OpcClient> IndexManager<C> {
 
     pub fn max_results(&self) -> u32 {
         self.settings.max_results
+    }
+
+    pub fn with_host_metrics_provider(mut self, provider: Arc<dyn HostMetricsProvider>) -> Self {
+        self.host_metrics = provider;
+        self
+    }
+
+    pub fn record_foreground_operation(
+        &self,
+        server: &str,
+        elapsed: Duration,
+        error: bool,
+        bad_quality: bool,
+    ) {
+        self.record_foreground_operation_with_health(server, elapsed, error, bad_quality, error);
+    }
+
+    pub fn record_foreground_operation_with_health(
+        &self,
+        server: &str,
+        elapsed: Duration,
+        error: bool,
+        bad_quality: bool,
+        health_failure: bool,
+    ) {
+        if let Ok(mut metrics) = self.foreground_metrics.lock() {
+            metrics
+                .entry(server.to_string())
+                .or_default()
+                .record_health_at(
+                    Instant::now(),
+                    elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+                    error,
+                    bad_quality,
+                    health_failure,
+                );
+        }
     }
 
     #[cfg(test)]
@@ -1454,28 +1769,41 @@ impl<C: OpcClient> IndexManager<C> {
         if self.background_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        for server in self.settings.servers.clone() {
-            let manager = Arc::clone(self);
-            let mut shutdown = self.background_tasks.subscribe();
-            self.background_tasks.spawn(async move {
-                manager.refresh_if_due(&server).await;
-                loop {
-                    if *shutdown.borrow() {
-                        break;
-                    }
-                    let delay = manager.background_refresh_delay(&server).await;
-                    if *shutdown.borrow() {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = shutdown.changed() => {}
-                        _ = tokio::time::sleep(delay) => {
-                            manager.refresh_if_due(&server).await;
-                        }
-                    }
-                }
-            });
+        if self.settings.servers.is_empty() {
+            return;
         }
+        let manager = Arc::clone(self);
+        let mut shutdown = self.background_tasks.subscribe();
+        self.background_tasks.spawn(async move {
+            let startup_grace = Duration::from_secs(manager.settings.startup_grace_period_seconds);
+            if !startup_grace.is_zero() {
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(startup_grace) => {}
+                }
+            }
+
+            loop {
+                if *shutdown.borrow() {
+                    break;
+                }
+                let mut delay = Duration::from_secs(60);
+                for server in manager.settings.servers.clone() {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    manager.refresh_if_due(&server).await;
+                    delay = delay.min(manager.background_refresh_delay(&server).await);
+                }
+                if *shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => {}
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        });
     }
 
     pub async fn shutdown_background_indexing(&self) {
@@ -1495,30 +1823,65 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     async fn background_refresh_delay(&self, server: &str) -> Duration {
+        if let Ok(runtime) = self.runtime.lock()
+            && let Some(retry_after) = runtime.get(server).and_then(|state| state.retry_after)
+            && let Ok(remaining) = retry_after.duration_since(SystemTime::now())
+        {
+            return remaining.max(Duration::from_secs(1));
+        }
+
         match self.status(server).await {
             Ok(status) => match status.state {
-                IndexState::Ready | IndexState::Stale => status
-                    .completed_at
-                    .as_deref()
-                    .and_then(parse_timestamp)
-                    .and_then(|completed| {
-                        SystemTime::now()
-                            .duration_since(completed)
-                            .ok()
-                            .map(|elapsed| {
-                                Duration::from_secs(self.settings.refresh_interval_seconds.max(1))
-                                    .saturating_sub(elapsed)
-                            })
-                    })
-                    .unwrap_or(Duration::from_secs(1)),
+                IndexState::Ready | IndexState::Stale => {
+                    if status.state == IndexState::Stale && !self.maintenance_window_is_open() {
+                        return if self.settings.maintenance_windows.is_empty() {
+                            Duration::from_secs(1)
+                        } else {
+                            Duration::from_secs(60)
+                        };
+                    }
+                    let scheduled =
+                        Duration::from_secs(self.settings.refresh_interval_seconds.max(1))
+                            .saturating_add(deterministic_jitter(
+                                server,
+                                self.settings.schedule_jitter_seconds,
+                            ));
+                    status
+                        .completed_at
+                        .as_deref()
+                        .and_then(parse_timestamp)
+                        .and_then(|completed| {
+                            SystemTime::now()
+                                .duration_since(completed)
+                                .ok()
+                                .map(|elapsed| scheduled.saturating_sub(elapsed))
+                        })
+                        .unwrap_or(Duration::from_secs(1))
+                }
                 IndexState::Refreshing | IndexState::Partial => Duration::from_secs(30),
-                IndexState::Failed | IndexState::NotIndexed => RETRY_BACKOFF,
+                IndexState::Promoting => Duration::from_secs(1),
+                IndexState::Failed => {
+                    retry_delay(server, 1, false, self.settings.circuit_open_seconds)
+                }
+                IndexState::NotIndexed => match self.settings.initial_build_policy {
+                    InitialBuildPolicy::Immediate => {
+                        retry_delay(server, 1, false, self.settings.circuit_open_seconds)
+                    }
+                    InitialBuildPolicy::MaintenanceWindow
+                        if !self.settings.maintenance_windows.is_empty() =>
+                    {
+                        Duration::from_secs(60)
+                    }
+                    InitialBuildPolicy::MaintenanceWindow | InitialBuildPolicy::Manual => {
+                        Duration::from_secs(3600)
+                    }
+                },
             },
-            Err(_) => RETRY_BACKOFF,
+            Err(_) => retry_delay(server, 1, false, self.settings.circuit_open_seconds),
         }
     }
 
-    async fn active_profile_changed(&self, server: &str) -> bool {
+    async fn active_profile_changed(&self, server: &str) -> anyhow::Result<bool> {
         let stored_profile = match self.with_database(|db| db.active_profile(server)) {
             Ok(Some(stored_profile)) => stored_profile,
             Ok(None) => {
@@ -1526,7 +1889,7 @@ impl<C: OpcClient> IndexManager<C> {
                     server = %server,
                     "active namespace index profile is unavailable"
                 );
-                return false;
+                return Ok(false);
             }
             Err(error) => {
                 tracing::warn!(
@@ -1534,22 +1897,22 @@ impl<C: OpcClient> IndexManager<C> {
                     error = %error,
                     "unable to inspect active namespace index profile"
                 );
-                return false;
+                return Ok(false);
             }
         };
-        self.client
-            .get_capabilities(server)
-            .await
-            .map(|capabilities| {
-                !index_profile_is_compatible(
-                    stored_profile.organization,
-                    stored_profile.source,
-                    stored_profile.compatibility_fallback,
-                    capabilities.organization,
-                    capabilities.source,
-                )
-            })
-            .unwrap_or(false)
+        let capabilities = self
+            .with_opc_timeout(
+                "active profile capability probe",
+                self.client.get_capabilities(server),
+            )
+            .await?;
+        Ok(!index_profile_is_compatible(
+            stored_profile.organization,
+            stored_profile.source,
+            stored_profile.compatibility_fallback,
+            capabilities.organization,
+            capabilities.source,
+        ))
     }
 
     async fn refresh_if_due(self: &Arc<Self>, server: &str) {
@@ -1557,30 +1920,48 @@ impl<C: OpcClient> IndexManager<C> {
             Ok(status)
                 if status.active_generation > 0 && status.state != IndexState::Refreshing =>
             {
-                let profile_changed = self.active_profile_changed(server).await;
-                if profile_changed {
-                    if let Err(error) = self.with_database(|db| db.clear_server(server)) {
+                let profile_changed = match self.active_profile_changed(server).await {
+                    Ok(profile_changed) => profile_changed,
+                    Err(error) => {
                         tracing::warn!(
                             server = %server,
                             error = %error,
-                            "unable to invalidate namespace index after profile change"
+                            "unable to inspect namespace index profile before refresh"
                         );
                         return;
                     }
-                    if let Ok(mut cache) = self.cache.lock() {
-                        cache.clear_server(server);
-                    }
-                    if let Err(error) = self.refresh(server, true).await {
-                        tracing::warn!(
+                };
+                if profile_changed {
+                    if !self.automatic_refresh_allowed(&status) {
+                        tracing::debug!(
                             server = %server,
-                            error = %error,
-                            "automatic namespace index rebuild after profile change failed"
+                            "automatic namespace index rebuild is waiting for a maintenance window"
                         );
+                    } else {
+                        if let Err(error) = self.with_database(|db| db.clear_server(server)) {
+                            tracing::warn!(
+                                server = %server,
+                                error = %error,
+                                "unable to invalidate namespace index after profile change"
+                            );
+                            return;
+                        }
+                        if let Ok(mut cache) = self.cache.lock() {
+                            cache.clear_server(server);
+                        }
+                        if let Err(error) = self.refresh(server, true).await {
+                            tracing::warn!(
+                                server = %server,
+                                error = %error,
+                                "automatic namespace index rebuild after profile change failed"
+                            );
+                        }
                     }
                 } else if matches!(
                     status.state,
                     IndexState::Stale | IndexState::Failed | IndexState::NotIndexed
-                ) && let Err(error) = self.refresh(server, false).await
+                ) && self.automatic_refresh_allowed(&status)
+                    && let Err(error) = self.refresh(server, false).await
                 {
                     tracing::warn!(
                         server = %server,
@@ -1598,13 +1979,149 @@ impl<C: OpcClient> IndexManager<C> {
                         | IndexState::Failed
                 ) =>
             {
-                if let Err(error) = self.refresh(server, false).await {
+                if self.automatic_refresh_allowed(&status)
+                    && let Err(error) = self.refresh(server, false).await
+                {
                     tracing::warn!(server = %server, error = %error, "automatic namespace index refresh failed");
                 }
             }
             Ok(_) => {}
             Err(error) => {
                 tracing::warn!(server = %server, error = %error, "unable to inspect namespace index before refresh");
+            }
+        }
+    }
+
+    fn automatic_refresh_allowed(&self, status: &IndexStatus) -> bool {
+        if status.active_generation == 0 {
+            match self.settings.initial_build_policy {
+                InitialBuildPolicy::Immediate => true,
+                InitialBuildPolicy::Manual => {
+                    tracing::info!(
+                        server = %status.server,
+                        "automatic namespace index build is disabled until a manual refresh"
+                    );
+                    false
+                }
+                InitialBuildPolicy::MaintenanceWindow => {
+                    let allowed = self.maintenance_window_is_open();
+                    if !allowed {
+                        tracing::debug!(
+                            server = %status.server,
+                            "automatic namespace index build is waiting for a maintenance window"
+                        );
+                    }
+                    allowed
+                }
+            }
+        } else {
+            self.settings.maintenance_windows.is_empty() || self.maintenance_window_is_open()
+        }
+    }
+
+    fn maintenance_window_is_open(&self) -> bool {
+        match parse_maintenance_windows(&self.settings.maintenance_windows) {
+            Ok(windows) => maintenance_window_active(&windows, Local::now()),
+            Err(error) => {
+                tracing::warn!(error = %error, "invalid namespace index maintenance window");
+                false
+            }
+        }
+    }
+
+    fn set_pause_overlay(&self, server: &str, maintenance: Option<bool>, health: Option<bool>) {
+        let update_result = self.pause_overlays.lock().map(|mut overlays| {
+            let state = overlays.entry(server.to_string()).or_default();
+            if let Some(value) = maintenance {
+                state.maintenance = value;
+            }
+            if let Some(value) = health {
+                state.health = value;
+            }
+            if !state.maintenance && !state.health {
+                overlays.remove(server);
+            }
+        });
+        if update_result.is_err() {
+            tracing::error!(
+                server,
+                "unable to update namespace index pause overlays because the overlay lock is poisoned"
+            );
+            return;
+        }
+        self.reconcile_pause_state(server);
+    }
+
+    fn clear_pause_overlays(&self, server: &str) {
+        if self
+            .pause_overlays
+            .lock()
+            .map(|mut overlays| {
+                overlays.remove(server);
+            })
+            .is_err()
+        {
+            tracing::error!(
+                server,
+                "unable to clear namespace index pause overlays because the overlay lock is poisoned"
+            );
+        }
+    }
+
+    fn reconcile_pause_state(&self, server: &str) {
+        let overlay = match self.pause_overlays.lock() {
+            Ok(overlays) => overlays.get(server).copied().unwrap_or_default(),
+            Err(_) => {
+                tracing::error!(
+                    server,
+                    "unable to reconcile namespace index pause state because the overlay lock is poisoned"
+                );
+                return;
+            }
+        };
+        let (control, reason) = match self.runtime.lock() {
+            Ok(mut runtime) => {
+                let Some(build) = runtime
+                    .get_mut(server)
+                    .and_then(|state| state.build.as_mut())
+                else {
+                    return;
+                };
+                let foreground = build.foreground_users > 0
+                    || build
+                        .quiet_until
+                        .is_some_and(|deadline| deadline > Instant::now());
+                let reason = if build.operator_paused {
+                    Some(crate::controller::PauseReason::Operator)
+                } else if foreground {
+                    Some(crate::controller::PauseReason::Foreground)
+                } else if overlay.maintenance {
+                    Some(crate::controller::PauseReason::Maintenance)
+                } else if overlay.health {
+                    Some(crate::controller::PauseReason::OpcHealth)
+                } else if let Some(crate::controller::ControllerState::Paused(reason)) =
+                    build.controller_state
+                {
+                    Some(reason)
+                } else {
+                    None
+                };
+                build.pause_reason = reason;
+                (build.control.clone(), reason)
+            }
+            Err(_) => {
+                tracing::error!(
+                    server,
+                    "unable to reconcile namespace index pause state because the runtime lock is poisoned"
+                );
+                return;
+            }
+        };
+        if let Some(control) = control {
+            if reason.is_some() {
+                control.pause();
+            } else {
+                control.resume();
             }
         }
     }
@@ -1626,20 +2143,19 @@ impl<C: OpcClient> IndexManager<C> {
         {
             build.foreground_users = foreground_users;
             build.quiet_until = None;
-            if let Some(control) = &build.control {
-                control.pause();
-            }
         }
+        self.reconcile_pause_state(server);
         ForegroundGuard {
             manager: Arc::clone(self),
             server: server.to_string(),
         }
     }
 
-    fn foreground_end(&self, server: &str) {
+    fn foreground_end(self: &Arc<Self>, server: &str) {
         let quiet_period = Duration::from_secs(self.settings.quiet_period_seconds);
         let runtime = Arc::clone(&self.runtime);
         let foreground_users = Arc::clone(&self.foreground_users);
+        let manager = Arc::clone(self);
         let server_name = server.to_string();
         let resume_server_name = server_name.clone();
         let decrement_runtime = Arc::clone(&runtime);
@@ -1672,23 +2188,26 @@ impl<C: OpcClient> IndexManager<C> {
             }
         };
         decrement();
+        self.reconcile_pause_state(server);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 tokio::time::sleep(quiet_period).await;
-                if let Ok(mut states) = runtime.lock()
+                let should_reconcile = if let Ok(mut states) = runtime.lock()
                     && let Some(build) = states
                         .get_mut(&resume_server_name)
                         .and_then(|state| state.build.as_mut())
                     && build.foreground_users == 0
-                    && !build.operator_paused
                     && build
                         .quiet_until
                         .is_some_and(|deadline| deadline <= Instant::now())
                 {
                     build.quiet_until = None;
-                    if let Some(control) = &build.control {
-                        control.resume();
-                    }
+                    true
+                } else {
+                    false
+                };
+                if should_reconcile {
+                    manager.reconcile_pause_state(&resume_server_name);
                 }
             });
         } else {
@@ -1697,16 +2216,13 @@ impl<C: OpcClient> IndexManager<C> {
                     .get_mut(&resume_server_name)
                     .and_then(|state| state.build.as_mut())
                 && build.foreground_users == 0
-                && !build.operator_paused
                 && build
                     .quiet_until
                     .is_some_and(|deadline| deadline <= Instant::now())
             {
                 build.quiet_until = None;
-                if let Some(control) = &build.control {
-                    control.resume();
-                }
             }
+            self.reconcile_pause_state(server);
         }
     }
 
@@ -1715,7 +2231,33 @@ impl<C: OpcClient> IndexManager<C> {
         if !configured {
             return Ok(empty_status(server, false, IndexState::NotIndexed));
         }
-        let rows = self.with_database(|db| db.status_rows(server))?;
+        let sentinel_configured = self.settings.sentinel_tag.is_some();
+        let is_promoting = self
+            .promoting
+            .lock()
+            .ok()
+            .is_some_and(|servers| servers.contains(server));
+        let mut promotion_read_error = None;
+        let rows = if is_promoting && self.settings.database_path != Path::new(":memory:") {
+            match IndexDb::open_read_only(&self.settings.database_path)
+                .and_then(|db| db.status_rows(server))
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        process_id = std::process::id(),
+                        database = %self.settings.database_path.display(),
+                        server,
+                        error = %error,
+                        "unable to read namespace index status during promotion"
+                    );
+                    promotion_read_error = Some(error.to_string());
+                    Vec::new()
+                }
+            }
+        } else {
+            self.with_database(|db| db.status_rows(server))?
+        };
         let active_row = rows.iter().find(|row| row.state == "active").cloned();
         let staging_row = rows.iter().find(|row| row.state == "staging").cloned();
         let failed_row = rows.iter().find(|row| row.state == "failed").cloned();
@@ -1737,14 +2279,30 @@ impl<C: OpcClient> IndexManager<C> {
             )
         };
         let build_active = build.is_some();
-        let database_bytes = self.database_bytes()?;
+        let build_started_at = build.as_ref().map(|value| value.started_at.clone());
+        let last_success_at = active_row.as_ref().and_then(|row| row.completed_at.clone());
+        let last_attempt_at = build_started_at
+            .clone()
+            .or_else(|| failed_row.as_ref().map(|row| row.started_at.clone()))
+            .or_else(|| active_row.as_ref().map(|row| row.started_at.clone()));
+        let storage = if is_promoting {
+            storage_diagnostics_for_path(&self.settings.database_path)
+        } else {
+            self.storage_diagnostics()?
+        };
+        let database_bytes = storage
+            .main_bytes
+            .saturating_add(storage.wal_bytes)
+            .saturating_add(storage.shm_bytes);
         let mut status = if let Some(build) = build {
             let row = active_row
                 .clone()
                 .or(staging_row.clone())
                 .or(failed_row.clone());
             if let Some(row) = row {
-                let state = if active_row.is_some() {
+                let state = if is_promoting {
+                    IndexState::Promoting
+                } else if active_row.is_some() {
                     IndexState::Refreshing
                 } else if staging_row.is_some() {
                     IndexState::Partial
@@ -1758,7 +2316,11 @@ impl<C: OpcClient> IndexManager<C> {
             } else {
                 IndexStatus {
                     server: server.to_string(),
-                    state: IndexState::Partial,
+                    state: if is_promoting {
+                        IndexState::Promoting
+                    } else {
+                        IndexState::Partial
+                    },
                     configured: true,
                     active_generation: 0,
                     entry_count: build.progress.as_ref().map_or(0, |p| p.entries_seen),
@@ -1770,9 +2332,19 @@ impl<C: OpcClient> IndexManager<C> {
                     organization: NamespaceOrganization::Unspecified,
                     source: BrowseSource::Unspecified,
                     progress: build.progress,
+                    effective_limits: build.effective_limits,
+                    controller_state: build.controller_state,
+                    pause_reason: build.pause_reason,
+                    recovery_deadline: build.recovery_deadline.map(instant_timestamp),
+                    foreground_metrics: ForegroundMetrics::default(),
+                    host_metrics: HostMetrics::default(),
+                    health: HealthProbeState::Unavailable,
+                    sentinel_configured,
+                    storage: StorageDiagnostics::default(),
+                    scheduler: SchedulerDiagnostics::default(),
                 }
             }
-        } else if let Some(row) = active_row {
+        } else if let Some(row) = active_row.clone() {
             let stale = row
                 .completed_at
                 .as_deref()
@@ -1804,10 +2376,79 @@ impl<C: OpcClient> IndexManager<C> {
             status.database_bytes = database_bytes;
             status
         };
+        status.sentinel_configured = sentinel_configured;
         if !build_active && let Some(error) = runtime_error {
             status.state = IndexState::Failed;
             status.last_error = Some(error);
         }
+        if let Some(error) = promotion_read_error {
+            status.last_error = Some(error);
+        }
+        let active_count = self
+            .foreground_users
+            .lock()
+            .ok()
+            .and_then(|users| users.get(server).copied())
+            .unwrap_or(0) as u64;
+        status.foreground_metrics = self
+            .foreground_metrics
+            .lock()
+            .ok()
+            .and_then(|metrics| {
+                metrics
+                    .get(server)
+                    .map(|value| value.snapshot(active_count))
+            })
+            .unwrap_or(ForegroundMetrics {
+                active_count,
+                ..ForegroundMetrics::default()
+            });
+        status.host_metrics = self.host_metrics.snapshot();
+        status.storage = storage;
+        let mut scheduler = SchedulerDiagnostics {
+            next_refresh_at: last_success_at.as_deref().and_then(|completed| {
+                parse_timestamp(completed).and_then(|completed| {
+                    completed
+                        .checked_add(
+                            Duration::from_secs(self.settings.refresh_interval_seconds.max(1))
+                                .saturating_add(deterministic_jitter(
+                                    server,
+                                    self.settings.schedule_jitter_seconds,
+                                )),
+                        )
+                        .map(system_time_timestamp)
+                })
+            }),
+            last_attempt_at,
+            last_success_at,
+            last_success_duration_ms: active_row.as_ref().and_then(|row| {
+                row.completed_at
+                    .as_deref()
+                    .and_then(parse_timestamp)
+                    .and_then(|completed| {
+                        parse_timestamp(&row.started_at)
+                            .and_then(|started| completed.duration_since(started).ok())
+                    })
+                    .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+            }),
+            ..SchedulerDiagnostics::default()
+        };
+        if let Ok(runtime) = self.runtime.lock()
+            && let Some(state) = runtime.get(server)
+        {
+            scheduler.retry_after = state.retry_after.map(system_time_timestamp);
+            scheduler.consecutive_failures = state.consecutive_failures;
+            scheduler.circuit_open = state.circuit_open;
+            status.health = state.health;
+            if let Some(build) = &state.build {
+                status.effective_limits = build.effective_limits;
+                status.controller_state = build.controller_state;
+                status.pause_reason = build.pause_reason;
+                status.recovery_deadline = build.recovery_deadline.map(instant_timestamp);
+                status.storage.last_commit_latency_ms = build.last_commit_latency_ms;
+            }
+        }
+        status.scheduler = scheduler;
         Ok(status)
     }
 
@@ -1820,6 +2461,22 @@ impl<C: OpcClient> IndexManager<C> {
         if self.background_tasks.is_shutting_down() {
             return self.status(server).await;
         }
+        let storage = self.with_database(|db| Ok(db.storage_diagnostics()))?;
+        if storage.free_bytes.is_some_and(|free| {
+            free < self
+                .settings
+                .minimum_free_space_bytes
+                .saturating_add(self.settings.storage_headroom_bytes)
+        }) {
+            anyhow::bail!(
+                "insufficient free space for namespace index ({} bytes available, {} required)",
+                storage.free_bytes.unwrap_or_default(),
+                self.settings
+                    .minimum_free_space_bytes
+                    .saturating_add(self.settings.storage_headroom_bytes)
+            );
+        }
+        self.load_persisted_retry_state(server)?;
         let should_start = {
             let foreground_users = self
                 .foreground_users
@@ -1842,7 +2499,8 @@ impl<C: OpcClient> IndexManager<C> {
                 && state
                     .retry_after
                     .is_some_and(|retry| SystemTime::now() < retry);
-            if state.build.is_some() || backing_off {
+            let circuit_open = !force && state.circuit_open;
+            if state.build.is_some() || backing_off || circuit_open {
                 false
             } else if active_builds >= self.settings.concurrency.max(1) as usize {
                 anyhow::bail!("namespace index build concurrency limit reached");
@@ -1851,14 +2509,13 @@ impl<C: OpcClient> IndexManager<C> {
                     .build_locks
                     .lock()
                     .map_err(|_| anyhow::anyhow!("index build-lock registry poisoned"))?;
-                if build_locks.contains_key(&self.settings.database_path) {
+                if build_locks.contains_key(server) {
                     anyhow::bail!(
-                        "namespace index build lock is already held in this process: {}",
-                        self.settings.database_path.display()
+                        "namespace index build lock is already held in this process for server {server}"
                     );
                 }
                 let lock = BuildFileLock::acquire(&self.settings.database_path, server)?;
-                build_locks.insert(self.settings.database_path.clone(), lock);
+                build_locks.insert(server.to_string(), lock);
                 state.build = Some(RuntimeBuild {
                     control: None,
                     progress: None,
@@ -1866,6 +2523,11 @@ impl<C: OpcClient> IndexManager<C> {
                     foreground_users,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 });
                 state.last_error = None;
                 self.active_builds
@@ -1879,22 +2541,73 @@ impl<C: OpcClient> IndexManager<C> {
             return self.status(server).await;
         }
 
+        let initial_limits = self.initial_inventory_limits();
         let handle = match self
-            .client
-            .start_inventory(server, self.settings.batch_size)
+            .with_opc_timeout(
+                "start inventory",
+                self.client
+                    .start_inventory(server, initial_limits.batch_size),
+            )
             .await
         {
             Ok(handle) => handle,
             Err(error) => {
+                if self.take_pending_cancel(server) {
+                    self.finish_build(server, None);
+                    return self.status(server).await;
+                }
                 self.record_start_failure(server, &error.to_string())?;
                 return Err(error);
             }
         };
+        let control_was_cancelled_before_attach = handle.control.is_cancelled();
+        if let Err(error) = handle.control.set_pacing(pacing_for_limits(initial_limits)) {
+            let message = format!("unable to apply initial inventory pacing: {error}");
+            let cancelled = self.take_pending_cancel(server)
+                || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
+            handle.control.cancel();
+            if cancelled {
+                self.finish_build(server, None);
+                return self.status(server).await;
+            }
+            self.record_start_failure(server, &message)?;
+            return Err(anyhow::anyhow!(message));
+        }
+        let control_result = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))
+            .and_then(|mut runtime| {
+                let build = runtime
+                    .get_mut(server)
+                    .and_then(|state| state.build.as_mut())
+                    .ok_or_else(|| anyhow::anyhow!("index build disappeared before start"))?;
+                build.control = Some(Arc::clone(&handle.control));
+                Ok(())
+            });
+        if let Err(error) = control_result {
+            let cancelled = self.take_pending_cancel(server)
+                || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
+            handle.control.cancel();
+            if cancelled {
+                self.finish_build(server, None);
+                return self.status(server).await;
+            }
+            self.finish_build(server, Some(error.to_string()));
+            return Err(error);
+        }
+        if self.take_pending_cancel(server) {
+            handle.control.cancel();
+            self.finish_build_for_control(server, &handle.control, None);
+            return self.status(server).await;
+        }
         tracing::info!(
             process_id = std::process::id(),
             database = %self.settings.database_path.display(),
             server,
-            batch_size = self.settings.batch_size,
+            batch_size = initial_limits.batch_size,
+            item_rate_per_second = initial_limits.item_rate_per_second,
+            duty_cycle_percent = initial_limits.duty_cycle_percent,
             "started namespace index inventory"
         );
         if self.background_tasks.is_shutting_down() {
@@ -1902,10 +2615,22 @@ impl<C: OpcClient> IndexManager<C> {
             self.finish_build(server, None);
             return self.status(server).await;
         }
-        let (organization, source) = match self.client.get_capabilities(server).await {
+        let (organization, source) = match self
+            .with_opc_timeout(
+                "inventory capability probe",
+                self.client.get_capabilities(server),
+            )
+            .await
+        {
             Ok(capabilities) => (capabilities.organization, capabilities.source),
             Err(error) => {
+                let cancelled =
+                    !control_was_cancelled_before_attach && handle.control.is_cancelled();
                 handle.control.cancel();
+                if cancelled {
+                    self.finish_build_for_control(server, &handle.control, None);
+                    return self.status(server).await;
+                }
                 self.record_start_failure(server, &error.to_string())?;
                 return Err(error);
             }
@@ -1924,7 +2649,13 @@ impl<C: OpcClient> IndexManager<C> {
                     error = %error,
                     "namespace index database operation failed"
                 );
+                let cancelled =
+                    !control_was_cancelled_before_attach && handle.control.is_cancelled();
                 handle.control.cancel();
+                if cancelled {
+                    self.finish_build_for_control(server, &handle.control, None);
+                    return self.status(server).await;
+                }
                 self.record_start_failure(server, &error.to_string())?;
                 return Err(error);
             }
@@ -1934,23 +2665,39 @@ impl<C: OpcClient> IndexManager<C> {
             .runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))
-            .and_then(|mut runtime| {
+            .and_then(|runtime| {
                 let build = runtime
-                    .get_mut(server)
-                    .and_then(|state| state.build.as_mut())
+                    .get(server)
+                    .and_then(|state| state.build.as_ref())
                     .ok_or_else(|| anyhow::anyhow!("index build disappeared before start"))?;
-                build.control = Some(Arc::clone(&handle.control));
-                if build.foreground_users > 0 || build.operator_paused {
-                    handle.control.pause();
+                if build
+                    .control
+                    .as_ref()
+                    .is_some_and(|control| Arc::ptr_eq(control, &handle.control))
+                {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("index build disappeared before start"))
                 }
-                Ok(())
             });
         if let Err(error) = control_result {
+            let cancelled = handle.control.is_cancelled();
             handle.control.cancel();
             self.abandon_generation(server, generation, &error.to_string());
+            if cancelled {
+                self.finish_build(server, None);
+                return self.status(server).await;
+            }
             self.finish_build(server, Some(error.to_string()));
             return Err(error);
         }
+        if !control_was_cancelled_before_attach && handle.control.is_cancelled() {
+            handle.control.cancel();
+            self.abandon_generation(server, generation, "index build cancelled during startup");
+            self.finish_build_for_control(server, &handle.control, None);
+            return self.status(server).await;
+        }
+        self.reconcile_pause_state(server);
         if self.background_tasks.is_shutting_down() {
             handle.control.cancel();
             self.abandon_generation(server, generation, "gateway shutdown before index build");
@@ -1976,6 +2723,140 @@ impl<C: OpcClient> IndexManager<C> {
         self.status(server).await
     }
 
+    fn controller_config(&self) -> ControllerConfig {
+        ControllerConfig {
+            floor: InventoryLimits {
+                item_rate_per_second: self.settings.minimum_item_rate,
+                batch_size: self.settings.minimum_batch_size,
+                duty_cycle_percent: self.settings.minimum_duty_cycle_percent,
+            },
+            canary: InventoryLimits {
+                item_rate_per_second: self.settings.canary_item_rate,
+                batch_size: self.settings.canary_batch_size,
+                duty_cycle_percent: self.settings.canary_duty_cycle_percent,
+            },
+            ceiling: InventoryLimits {
+                item_rate_per_second: self.settings.item_rate_limit,
+                batch_size: self.settings.inventory_batch_size,
+                duty_cycle_percent: self.settings.duty_cycle_percent,
+            },
+            unlimited_item_rate: self.settings.item_rate_limit == 0,
+            healthy_window: Duration::from_secs(
+                self.settings.adaptive_healthy_window_seconds.max(1),
+            ),
+            recovery_delay: Duration::from_secs(
+                self.settings.adaptive_recovery_delay_seconds.max(1),
+            ),
+            maximum_recovery_delay: Duration::from_secs(
+                self.settings.adaptive_max_recovery_delay_seconds.max(1),
+            ),
+            foreground_latency_absolute_ms: self.settings.health_latency_threshold_ms.max(1),
+        }
+    }
+
+    async fn with_opc_timeout<T>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        let timeout = Duration::from_secs(self.settings.operation_timeout_seconds.max(1));
+        tokio::time::timeout(timeout, future).await.map_err(|_| {
+            anyhow::anyhow!(
+                "OPC namespace index {operation} timed out after {} seconds",
+                timeout.as_secs()
+            )
+        })?
+    }
+
+    fn mark_promoting(&self, server: &str) -> anyhow::Result<()> {
+        self.promoting
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index promotion lock poisoned"))?
+            .insert(server.to_string());
+        Ok(())
+    }
+
+    fn clear_promoting(&self, server: &str) {
+        if let Err(error) = self.promoting.lock().map(|mut servers| {
+            servers.remove(server);
+        }) {
+            tracing::error!(
+                server = %server,
+                error = %error,
+                "unable to clear namespace index promotion state"
+            );
+        }
+    }
+
+    fn load_persisted_retry_state(&self, server: &str) -> anyhow::Result<()> {
+        let persisted = self.with_database(|db| db.retry_state(server))?;
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
+        let state = runtime.entry(server.to_string()).or_default();
+        if state.build.is_none() {
+            state.retry_after = persisted.0;
+            state.consecutive_failures = persisted.1;
+            state.circuit_open = persisted.2
+                && state
+                    .retry_after
+                    .is_some_and(|retry| SystemTime::now() < retry);
+        }
+        Ok(())
+    }
+
+    fn storage_diagnostics(&self) -> anyhow::Result<StorageDiagnostics> {
+        let database = self
+            .database
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
+        Ok(database
+            .as_ref()
+            .map_or_else(StorageDiagnostics::default, IndexDb::storage_diagnostics))
+    }
+
+    fn initial_inventory_limits(&self) -> InventoryLimits {
+        if !self.settings.adaptive {
+            return InventoryLimits {
+                item_rate_per_second: self.settings.item_rate_limit,
+                batch_size: self.settings.inventory_batch_size,
+                duty_cycle_percent: self.settings.duty_cycle_percent,
+            };
+        }
+        AdaptiveIndexController::new(self.controller_config(), Instant::now()).limits()
+    }
+
+    fn take_pending_cancel(&self, server: &str) -> bool {
+        match self.pending_cancels.lock() {
+            Ok(mut pending) => pending.remove(server),
+            Err(error) => {
+                tracing::error!(
+                    process_id = std::process::id(),
+                    database = %self.settings.database_path.display(),
+                    server,
+                    error = %error,
+                    "unable to read pending namespace index cancellation; cancelling build defensively"
+                );
+                true
+            }
+        }
+    }
+
+    fn clear_pending_cancel(&self, server: &str) {
+        if let Err(error) = self.pending_cancels.lock().map(|mut pending| {
+            pending.remove(server);
+        }) {
+            tracing::error!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                server,
+                error = %error,
+                "unable to clear pending namespace index cancellation"
+            );
+        }
+    }
+
     pub async fn control(
         &self,
         server: &str,
@@ -1986,29 +2867,36 @@ impl<C: OpcClient> IndexManager<C> {
             if let Some(build) = runtime
                 .get_mut(server)
                 .and_then(|state| state.build.as_mut())
-                && let Some(control) = &build.control
             {
                 match action {
-                    IndexControlAction::Pause => {
-                        build.operator_paused = true;
-                        control.pause();
-                    }
+                    IndexControlAction::Pause => build.operator_paused = true,
                     IndexControlAction::Resume => {
                         build.operator_paused = false;
                         if build.foreground_users == 0
                             && build
                                 .quiet_until
-                                .is_none_or(|deadline| deadline <= Instant::now())
+                                .is_some_and(|deadline| deadline <= Instant::now())
                         {
                             build.quiet_until = None;
-                            control.resume();
                         }
                     }
-                    IndexControlAction::Cancel => control.cancel(),
+                    IndexControlAction::Cancel => {
+                        if let Some(control) = &build.control {
+                            control.cancel();
+                        } else {
+                            self.pending_cancels
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("index cancel lock poisoned"))?
+                                .insert(server.to_string());
+                        }
+                    }
                 }
             }
         } else {
             return Err(anyhow::anyhow!("index runtime lock poisoned"));
+        }
+        if !matches!(action, IndexControlAction::Cancel) {
+            self.reconcile_pause_state(server);
         }
         self.status(server).await
     }
@@ -2033,7 +2921,14 @@ impl<C: OpcClient> IndexManager<C> {
         let limit = limit.max(1).min(self.settings.max_results);
         let status = self.status(server).await?;
         let normalized_query = normalize_query(query);
-        let Some(generation) = self.with_database(|db| db.search_generation(server))? else {
+        let generation = if status.active_generation > 0 {
+            Some(status.active_generation)
+        } else if status.state == IndexState::Promoting {
+            None
+        } else {
+            self.with_database(|db| db.search_generation(server))?
+        };
+        let Some(generation) = generation else {
             return Ok(IndexedSearch {
                 matches: Vec::new(),
                 has_more: false,
@@ -2144,9 +3039,33 @@ impl<C: OpcClient> IndexManager<C> {
         let mut persisted_item_count = 0_u64;
         let mut rate_limiter =
             ItemRateLimiter::new(self.settings.item_rate_limit, self.settings.burst_size);
+        let mut controller = self
+            .settings
+            .adaptive
+            .then(|| AdaptiveIndexController::new(self.controller_config(), build_started));
+        let mut effective_duty_cycle_percent = self.settings.duty_cycle_percent;
+        let mut last_commit_at = Instant::now();
+        if let Some(controller) = controller.as_ref() {
+            self.update_runtime_controller(&server, controller.limits(), controller.state(), None);
+        }
         let mut next_health_probe = Instant::now();
         let mut health_backoff = Duration::from_secs(1);
         loop {
+            if !pending.is_empty()
+                && last_commit_at.elapsed()
+                    >= Duration::from_millis(self.settings.commit_interval_ms.max(1))
+            {
+                match self.commit_pending_entries(&server, generation, &mut pending) {
+                    Ok(inserted) => {
+                        persisted_item_count = persisted_item_count.saturating_add(inserted);
+                        last_commit_at = Instant::now();
+                    }
+                    Err(error) => {
+                        failed = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
             if !self
                 .wait_for_maintenance(&handle.control, &server, &maintenance_windows)
                 .await
@@ -2166,7 +3085,40 @@ impl<C: OpcClient> IndexManager<C> {
                 cancelled = true;
                 break;
             }
-            let Some(event) = handle.stream.next().await else {
+            if let Some(controller) = controller.as_mut() {
+                match self
+                    .wait_for_controller_recovery(&handle.control, &server, controller)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        cancelled = true;
+                        break;
+                    }
+                    Err(error) => {
+                        handle.control.cancel();
+                        failed = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            let event = match tokio::time::timeout(
+                Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
+                handle.stream.next(),
+            )
+            .await
+            {
+                Ok(event) => event,
+                Err(_) => {
+                    handle.control.cancel();
+                    failed = Some(format!(
+                        "inventory event timed out after {} seconds",
+                        self.settings.operation_timeout_seconds.max(1)
+                    ));
+                    break;
+                }
+            };
+            let Some(event) = event else {
                 break;
             };
             match event {
@@ -2176,20 +3128,18 @@ impl<C: OpcClient> IndexManager<C> {
                         break;
                     }
                     pending.push(entry);
-                    if pending.len() >= self.settings.batch_size as usize {
-                        match self
-                            .with_database(|db| db.insert_entries(&server, generation, &pending))
-                        {
+                    if pending.len() >= self.settings.commit_batch_size as usize {
+                        match self.commit_pending_entries(&server, generation, &mut pending) {
                             Ok(inserted) => {
                                 persisted_item_count =
                                     persisted_item_count.saturating_add(inserted);
+                                last_commit_at = Instant::now();
                             }
                             Err(error) => {
                                 failed = Some(error.to_string());
                                 break;
                             }
                         }
-                        pending.clear();
                     }
                 }
                 Ok(InventoryEvent::Progress(progress)) => {
@@ -2222,11 +3172,59 @@ impl<C: OpcClient> IndexManager<C> {
                                 &handle.control,
                                 &server,
                                 Duration::from_millis(active_time_delta_ms),
+                                effective_duty_cycle_percent,
                             )
                             .await
                     {
                         cancelled = true;
                         break;
+                    }
+                }
+                Ok(InventoryEvent::Slice(slice)) => {
+                    if let Some(controller) = controller.as_mut() {
+                        let decision = controller.observe(
+                            Instant::now(),
+                            self.controller_observation_for_slice(&server, &slice),
+                        );
+                        effective_duty_cycle_percent = decision.limits.duty_cycle_percent;
+                        self.update_runtime_controller(
+                            &server,
+                            decision.limits,
+                            decision.state,
+                            decision.recovery_at,
+                        );
+                        if let Err(error) = handle
+                            .control
+                            .set_pacing(pacing_for_limits(decision.limits))
+                        {
+                            let message = format!(
+                                "unable to update adaptive inventory pacing after slice {}: {error}",
+                                slice.sequence
+                            );
+                            tracing::error!(
+                                server = %server,
+                                generation,
+                                sequence = slice.sequence,
+                                error = %error,
+                                "namespace index pacing update failed"
+                            );
+                            handle.control.cancel();
+                            failed = Some(message);
+                            break;
+                        }
+                        tracing::debug!(
+                            server = %server,
+                            sequence = slice.sequence,
+                            backend = ?slice.backend,
+                            nodes_returned = slice.nodes_returned,
+                            native_operations = slice.native_operations,
+                            elapsed_ms = slice.elapsed_ms,
+                            state = ?decision.state,
+                            item_rate_per_second = decision.limits.item_rate_per_second,
+                            batch_size = decision.limits.batch_size,
+                            duty_cycle_percent = decision.limits.duty_cycle_percent,
+                            "updated adaptive namespace inventory pacing"
+                        );
                     }
                 }
                 Ok(InventoryEvent::Completed(result)) => {
@@ -2265,7 +3263,7 @@ impl<C: OpcClient> IndexManager<C> {
             failed = Some("inventory stream ended before completion".to_string());
         }
         if !pending.is_empty() && failed.is_none() {
-            match self.with_database(|db| db.insert_entries(&server, generation, &pending)) {
+            match self.commit_pending_entries(&server, generation, &mut pending) {
                 Ok(inserted) => {
                     persisted_item_count = persisted_item_count.saturating_add(inserted);
                 }
@@ -2298,17 +3296,24 @@ impl<C: OpcClient> IndexManager<C> {
             );
             self.finish_build_for_control(&server, &handle.control, Some(error));
         } else if completed && !cancelled && !handle.control.is_cancelled() {
-            let result = self.with_database(|db| {
-                let completed_at = timestamp_now();
-                db.promote_with_profile(
-                    &server,
-                    generation,
-                    &completed_at,
-                    persisted_item_count,
-                    completion_profile,
-                    completion_warning.as_deref(),
-                )
-            });
+            let result = match self.mark_promoting(&server) {
+                Ok(()) => {
+                    let completed_at = timestamp_now();
+                    let result = self.with_database(|db| {
+                        db.promote_with_profile(
+                            &server,
+                            generation,
+                            &completed_at,
+                            persisted_item_count,
+                            completion_profile,
+                            completion_warning.as_deref(),
+                        )
+                    });
+                    self.clear_promoting(&server);
+                    result
+                }
+                Err(error) => Err(error),
+            };
             match result {
                 Ok(()) => {
                     self.schedule_cleanup(&server);
@@ -2375,22 +3380,54 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    fn commit_pending_entries(
+        &self,
+        server: &str,
+        generation: u64,
+        pending: &mut Vec<InventoryEntry>,
+    ) -> anyhow::Result<u64> {
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let started = Instant::now();
+        let result = self.with_database(|db| db.insert_entries(server, generation, pending));
+        if let Ok(mut runtime) = self.runtime.lock()
+            && let Some(build) = runtime
+                .get_mut(server)
+                .and_then(|state| state.build.as_mut())
+        {
+            build.last_commit_latency_ms =
+                Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+        }
+        if result.is_ok() {
+            pending.clear();
+        }
+        result
+    }
+
     async fn enforce_duty_cycle(
         &self,
         control: &Arc<dyn InventoryControl>,
         server: &str,
         work_duration: Duration,
+        duty_cycle_percent: u8,
     ) -> bool {
-        let duty = u32::from(self.settings.duty_cycle_percent.clamp(1, 100));
+        let duty = u32::from(duty_cycle_percent.clamp(1, 100));
         if duty >= 100 {
             return !control.is_cancelled();
         }
         let pause_duration = work_duration.mul_f64(f64::from(100 - duty) / f64::from(duty));
+        let overlays = self
+            .pause_overlays
+            .lock()
+            .ok()
+            .and_then(|values| values.get(server).copied())
+            .unwrap_or_default();
         let can_pause = self.runtime.lock().ok().is_some_and(|runtime| {
             runtime
                 .get(server)
                 .and_then(|state| state.build.as_ref())
-                .is_some_and(|build| self.build_can_resume(build))
+                .is_some_and(|build| Self::build_can_resume(build, overlays))
         });
         if can_pause {
             control.pause();
@@ -2402,7 +3439,7 @@ impl<C: OpcClient> IndexManager<C> {
                 runtime
                     .get(server)
                     .and_then(|state| state.build.as_ref())
-                    .is_some_and(|build| self.build_can_resume(build))
+                    .is_some_and(|build| Self::build_can_resume(build, overlays))
             })
         {
             control.resume();
@@ -2416,14 +3453,15 @@ impl<C: OpcClient> IndexManager<C> {
         server: &str,
         windows: &[MaintenanceWindow],
     ) -> bool {
-        while !windows.is_empty() && !maintenance_window_active(windows, Local::now()) {
-            control.pause();
+        let mut outside_window =
+            !windows.is_empty() && !maintenance_window_active(windows, Local::now());
+        self.set_pause_overlay(server, Some(outside_window), None);
+        while outside_window {
             if !wait_with_cancellation(control, Duration::from_secs(1)).await {
                 return false;
             }
-        }
-        if self.can_resume_build(control, server) {
-            control.resume();
+            outside_window = !maintenance_window_active(windows, Local::now());
+            self.set_pause_overlay(server, Some(outside_window), None);
         }
         true
     }
@@ -2435,71 +3473,287 @@ impl<C: OpcClient> IndexManager<C> {
         next_probe: &mut Instant,
         backoff: &mut Duration,
     ) -> bool {
-        if control.is_cancelled() {
-            return false;
-        }
-        if Instant::now() < *next_probe {
-            return true;
-        }
-        let started = Instant::now();
-        control.pause();
-        let result = self.client.get_capabilities(server).await;
-        let elapsed = started.elapsed();
-        let healthy = result.is_ok()
-            && elapsed <= Duration::from_millis(self.settings.health_latency_threshold_ms);
-        if healthy {
-            *backoff = Duration::from_secs(1);
-            *next_probe = Instant::now()
-                + Duration::from_secs(self.settings.health_probe_interval_seconds.max(1));
-            if self.can_resume_build(control, server) {
-                control.resume();
+        loop {
+            if control.is_cancelled() {
+                self.set_pause_overlay(server, None, Some(false));
+                return false;
             }
-            return true;
-        }
+            let now = Instant::now();
+            let sentinel_due = self.settings.sentinel_tag.is_some()
+                && self
+                    .runtime
+                    .lock()
+                    .ok()
+                    .and_then(|runtime| {
+                        runtime
+                            .get(server)
+                            .and_then(|state| state.sentinel_checked_at)
+                    })
+                    .is_none_or(|checked| {
+                        now.duration_since(checked)
+                            >= Duration::from_secs(self.settings.sentinel_probe_interval_seconds)
+                    });
+            if now < *next_probe && !sentinel_due {
+                if self.health_overlay_active(server) {
+                    if !wait_with_cancellation(control, next_probe.saturating_duration_since(now))
+                        .await
+                    {
+                        self.set_pause_overlay(server, None, Some(false));
+                        return false;
+                    }
+                    continue;
+                }
+                return true;
+            }
+            let started = Instant::now();
+            self.set_pause_overlay(server, None, Some(true));
+            let result = self
+                .with_opc_timeout(
+                    "health capability probe",
+                    self.client.get_capabilities(server),
+                )
+                .await;
+            let elapsed = started.elapsed();
+            let sentinel = if let Some(tag) = self.settings.sentinel_tag.as_deref() {
+                match self
+                    .with_opc_timeout(
+                        "health sentinel read",
+                        self.client.read_tag_values(server, vec![tag.to_string()]),
+                    )
+                    .await
+                {
+                    Ok(values) if values.len() == 1 => {
+                        let healthy = values[0].quality.eq_ignore_ascii_case("good");
+                        Some((
+                            healthy,
+                            if healthy {
+                                None
+                            } else {
+                                Some("sentinel quality is not Good".to_string())
+                            },
+                        ))
+                    }
+                    Ok(_) => Some((false, Some("sentinel read returned no value".to_string()))),
+                    Err(error) => Some((false, Some(error.to_string()))),
+                }
+            } else {
+                None
+            };
+            let healthy = result.is_ok()
+                && elapsed <= Duration::from_millis(self.settings.health_latency_threshold_ms);
+            let healthy = healthy && sentinel.as_ref().is_none_or(|(healthy, _)| *healthy);
+            self.update_health_state(
+                server,
+                if self.settings.sentinel_tag.is_none() {
+                    HealthProbeState::Unavailable
+                } else if healthy {
+                    HealthProbeState::Healthy
+                } else {
+                    HealthProbeState::Unhealthy
+                },
+            );
+            if healthy {
+                self.set_pause_overlay(server, None, Some(false));
+                *backoff = Duration::from_secs(1);
+                *next_probe = Instant::now()
+                    + Duration::from_secs(self.settings.health_probe_interval_seconds.max(1));
+                return true;
+            }
 
-        let reason = match result {
-            Ok(_) => format!(
-                "health probe exceeded {} ms ({} ms)",
-                self.settings.health_latency_threshold_ms,
-                elapsed.as_millis()
-            ),
-            Err(error) => format!("health probe failed: {error}"),
-        };
-        tracing::warn!(server = %server, reason = %reason, "deferring namespace inventory");
-        let delay = (*backoff).min(Duration::from_secs(300));
-        *backoff = backoff
-            .checked_mul(2)
-            .unwrap_or(Duration::from_secs(300))
-            .min(Duration::from_secs(300));
-        *next_probe = Instant::now() + delay;
-        let still_running = wait_with_cancellation(control, delay).await;
-        if still_running && self.can_resume_build(control, server) {
-            control.resume();
+            let reason = match result {
+                Ok(_) => sentinel.and_then(|(_, reason)| reason).unwrap_or_else(|| {
+                    format!(
+                        "health probe exceeded {} ms ({} ms)",
+                        self.settings.health_latency_threshold_ms,
+                        elapsed.as_millis()
+                    )
+                }),
+                Err(error) => format!("health probe failed: {error}"),
+            };
+            tracing::warn!(server = %server, reason = %reason, "deferring namespace inventory");
+            let delay = (*backoff).min(Duration::from_secs(300));
+            *backoff = backoff
+                .checked_mul(2)
+                .unwrap_or(Duration::from_secs(300))
+                .min(Duration::from_secs(300));
+            *next_probe = Instant::now() + delay;
+            if !wait_with_cancellation(control, delay).await {
+                self.set_pause_overlay(server, None, Some(false));
+                return false;
+            }
         }
-        still_running
     }
 
-    fn can_resume_build(&self, control: &Arc<dyn InventoryControl>, server: &str) -> bool {
-        !control.is_cancelled()
-            && self
-                .runtime
-                .lock()
-                .ok()
-                .and_then(|runtime| {
-                    runtime
-                        .get(server)
-                        .and_then(|state| state.build.as_ref())
-                        .map(|build| self.build_can_resume(build))
+    async fn wait_for_controller_recovery(
+        &self,
+        control: &Arc<dyn InventoryControl>,
+        server: &str,
+        controller: &mut AdaptiveIndexController,
+    ) -> anyhow::Result<bool> {
+        while matches!(
+            controller.state(),
+            crate::controller::ControllerState::Paused(_)
+        ) {
+            if control.is_cancelled() {
+                return Ok(false);
+            }
+            let wait = controller
+                .recovery_at()
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|| Duration::from_millis(100));
+            if !wait_with_cancellation(control, wait).await {
+                return Ok(false);
+            }
+            let decision =
+                controller.observe(Instant::now(), self.controller_observation(server, false));
+            self.update_runtime_controller(
+                server,
+                decision.limits,
+                decision.state,
+                decision.recovery_at,
+            );
+            control
+                .set_pacing(pacing_for_limits(decision.limits))
+                .map_err(|error| {
+                    anyhow::anyhow!("unable to update inventory pacing while recovering: {error}")
+                })?;
+            if decision.transitioned {
+                tracing::info!(
+                    server,
+                    state = ?decision.state,
+                    reason = ?decision.reason,
+                    recovery_deadline = ?decision.recovery_at.map(instant_timestamp),
+                    "updated adaptive namespace inventory state while paused"
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    fn health_overlay_active(&self, server: &str) -> bool {
+        self.pause_overlays
+            .lock()
+            .ok()
+            .and_then(|overlays| overlays.get(server).copied())
+            .is_some_and(|overlay| overlay.health)
+    }
+
+    fn update_health_state(&self, server: &str, health: HealthProbeState) {
+        if let Ok(mut runtime) = self.runtime.lock()
+            && let Some(state) = runtime.get_mut(server)
+        {
+            state.health = health;
+            state.sentinel_checked_at = Some(Instant::now());
+        }
+    }
+
+    fn update_runtime_controller(
+        &self,
+        server: &str,
+        limits: InventoryLimits,
+        state: crate::controller::ControllerState,
+        recovery_deadline: Option<Instant>,
+    ) {
+        if let Ok(mut runtime) = self.runtime.lock()
+            && let Some(build) = runtime
+                .get_mut(server)
+                .and_then(|state| state.build.as_mut())
+        {
+            build.effective_limits = Some(limits);
+            build.controller_state = Some(state);
+            build.recovery_deadline = recovery_deadline;
+            drop(runtime);
+            self.reconcile_pause_state(server);
+        }
+    }
+
+    fn foreground_active(&self, server: &str) -> bool {
+        self.foreground_users
+            .lock()
+            .ok()
+            .and_then(|users| users.get(server).copied())
+            .is_some_and(|count| count > 0)
+    }
+
+    fn controller_observation(&self, server: &str, inventory_error: bool) -> ControllerObservation {
+        let now = Instant::now();
+        let foreground_failure_window =
+            Duration::from_secs(self.settings.health_probe_interval_seconds.max(1));
+        let (foreground, recent_foreground_failure, recent_foreground_bad_quality) = self
+            .foreground_metrics
+            .lock()
+            .ok()
+            .and_then(|metrics| {
+                metrics.get(server).map(|value| {
+                    let active_count = self
+                        .foreground_users
+                        .lock()
+                        .ok()
+                        .and_then(|users| users.get(server).copied())
+                        .unwrap_or(0) as u64;
+                    (
+                        value.snapshot(active_count),
+                        value.recent_health_failure(now, foreground_failure_window),
+                        value.recent_bad_quality(now, foreground_failure_window),
+                    )
                 })
-                .unwrap_or(false)
+            })
+            .unwrap_or((ForegroundMetrics::default(), false, false));
+        let host = self.host_metrics.snapshot();
+        let health = self
+            .runtime
+            .lock()
+            .ok()
+            .and_then(|runtime| runtime.get(server).map(|state| state.health))
+            .unwrap_or(HealthProbeState::Unavailable);
+        let mut storage = self.storage_diagnostics().unwrap_or_default();
+        storage.last_commit_latency_ms = self.runtime.lock().ok().and_then(|runtime| {
+            runtime
+                .get(server)
+                .and_then(|state| state.build.as_ref())
+                .and_then(|build| build.last_commit_latency_ms)
+        });
+        ControllerObservation {
+            foreground_active: self.foreground_active(server),
+            foreground_error: recent_foreground_failure,
+            foreground_bad_quality: recent_foreground_bad_quality,
+            foreground_latency_ms: foreground.latency_p95_ms,
+            baseline_latency_ms: Some(self.settings.health_latency_threshold_ms),
+            inventory_error: inventory_error || health == HealthProbeState::Unhealthy,
+            host_cpu_percent: host.cpu_percent,
+            available_memory_percent: host.available_memory_percent,
+            disk_active_percent: host.disk_active_percent,
+            disk_queue: host.disk_queue,
+            database_commit_p95_ms: storage.last_commit_latency_ms,
+            insufficient_disk_space: storage.free_bytes.is_some_and(|free| {
+                free < self
+                    .settings
+                    .minimum_free_space_bytes
+                    .saturating_add(self.settings.storage_headroom_bytes)
+            }),
+        }
     }
 
-    fn build_can_resume(&self, build: &RuntimeBuild) -> bool {
+    fn controller_observation_for_slice(
+        &self,
+        server: &str,
+        slice: &InventorySliceObservation,
+    ) -> ControllerObservation {
+        self.controller_observation(server, slice.native_operations == 0)
+    }
+
+    fn build_can_resume(build: &RuntimeBuild, overlays: PauseOverlayState) -> bool {
         build.foreground_users == 0
             && !build.operator_paused
             && build
                 .quiet_until
                 .is_none_or(|deadline| deadline <= Instant::now())
+            && !overlays.maintenance
+            && !overlays.health
+            && !matches!(
+                build.controller_state,
+                Some(crate::controller::ControllerState::Paused(_))
+            )
     }
 
     fn update_runtime_progress(&self, server: &str, progress: InventoryProgress) {
@@ -2517,11 +3771,31 @@ impl<C: OpcClient> IndexManager<C> {
             && let Some(state) = runtime.get_mut(server)
         {
             state.last_error = error.clone();
-            state.retry_after = error.map(|_| SystemTime::now() + RETRY_BACKOFF);
+            if error.is_some() {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                state.circuit_open =
+                    state.consecutive_failures >= self.settings.circuit_failure_threshold;
+                state.retry_after = Some(
+                    SystemTime::now()
+                        + retry_delay(
+                            server,
+                            state.consecutive_failures,
+                            state.circuit_open,
+                            self.settings.circuit_open_seconds,
+                        ),
+                );
+            } else {
+                state.retry_after = None;
+                state.consecutive_failures = 0;
+                state.circuit_open = false;
+            }
             state.build = None;
         }
-        self.clear_build_lock();
+        let _ = self.persist_retry_state(server);
+        self.clear_pause_overlays(server);
+        self.clear_build_lock(server);
         self.clear_active_build(server);
+        self.clear_pending_cancel(server);
     }
 
     fn finish_build_for_control(
@@ -2540,7 +3814,25 @@ impl<C: OpcClient> IndexManager<C> {
                         .is_some_and(|current| Arc::ptr_eq(current, control));
                     if is_current {
                         state.last_error = error.clone();
-                        state.retry_after = error.map(|_| SystemTime::now() + RETRY_BACKOFF);
+                        if error.is_some() {
+                            state.consecutive_failures =
+                                state.consecutive_failures.saturating_add(1);
+                            state.circuit_open = state.consecutive_failures
+                                >= self.settings.circuit_failure_threshold;
+                            state.retry_after = Some(
+                                SystemTime::now()
+                                    + retry_delay(
+                                        server,
+                                        state.consecutive_failures,
+                                        state.circuit_open,
+                                        self.settings.circuit_open_seconds,
+                                    ),
+                            );
+                        } else {
+                            state.retry_after = None;
+                            state.consecutive_failures = 0;
+                            state.circuit_open = false;
+                        }
                         let _ = state.build.take();
                     }
                     is_current
@@ -2559,7 +3851,11 @@ impl<C: OpcClient> IndexManager<C> {
             }
         };
         if owns_build {
-            self.clear_build_lock();
+            let _ = self.persist_retry_state(server);
+            self.clear_pause_overlays(server);
+        }
+        if owns_build {
+            self.clear_build_lock(server);
             self.clear_active_build(server);
         } else {
             tracing::warn!(
@@ -2569,6 +3865,7 @@ impl<C: OpcClient> IndexManager<C> {
                 "ignored completion from obsolete namespace index build"
             );
         }
+        self.clear_pending_cancel(server);
     }
 
     fn record_start_failure(&self, server: &str, error: &str) -> anyhow::Result<()> {
@@ -2578,17 +3875,47 @@ impl<C: OpcClient> IndexManager<C> {
             .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
         let state = runtime.entry(server.to_string()).or_default();
         state.last_error = Some(error.to_string());
-        state.retry_after = Some(SystemTime::now() + RETRY_BACKOFF);
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        state.circuit_open = state.consecutive_failures >= self.settings.circuit_failure_threshold;
+        state.retry_after = Some(
+            SystemTime::now()
+                + retry_delay(
+                    server,
+                    state.consecutive_failures,
+                    state.circuit_open,
+                    self.settings.circuit_open_seconds,
+                ),
+        );
         state.build = None;
         drop(runtime);
-        self.clear_build_lock();
+        self.persist_retry_state(server)?;
+        self.clear_pause_overlays(server);
+        self.clear_build_lock(server);
         self.clear_active_build(server);
+        self.clear_pending_cancel(server);
         Ok(())
     }
 
-    fn clear_build_lock(&self) {
+    fn persist_retry_state(&self, server: &str) -> anyhow::Result<()> {
+        let (retry_after, failures, circuit_open) = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?
+            .get(server)
+            .map(|state| {
+                (
+                    state.retry_after,
+                    state.consecutive_failures,
+                    state.circuit_open,
+                )
+            })
+            .unwrap_or((None, 0, false));
+        self.with_database(|db| db.set_retry_state(server, retry_after, failures, circuit_open))
+    }
+
+    fn clear_build_lock(&self, server: &str) {
         if let Ok(mut build_locks) = self.build_locks.lock() {
-            build_locks.remove(&self.settings.database_path);
+            build_locks.remove(server);
         }
     }
 
@@ -2717,10 +4044,6 @@ impl<C: OpcClient> IndexManager<C> {
         }
         result
     }
-
-    fn database_bytes(&self) -> anyhow::Result<u64> {
-        self.with_database(|db| Ok(db.database_bytes()))
-    }
 }
 
 pub struct ForegroundGuard<C: OpcClient> {
@@ -2788,6 +4111,16 @@ fn status_from_row(
         organization: row.organization,
         source: row.source,
         progress,
+        effective_limits: None,
+        controller_state: None,
+        pause_reason: None,
+        recovery_deadline: None,
+        foreground_metrics: ForegroundMetrics::default(),
+        host_metrics: HostMetrics::default(),
+        health: HealthProbeState::Unavailable,
+        sentinel_configured: false,
+        storage: StorageDiagnostics::default(),
+        scheduler: SchedulerDiagnostics::default(),
     }
 }
 
@@ -2806,6 +4139,16 @@ fn empty_status(server: &str, configured: bool, state: IndexState) -> IndexStatu
         organization: NamespaceOrganization::Unspecified,
         source: BrowseSource::Unspecified,
         progress: None,
+        effective_limits: None,
+        controller_state: None,
+        pause_reason: None,
+        recovery_deadline: None,
+        foreground_metrics: ForegroundMetrics::default(),
+        host_metrics: HostMetrics::default(),
+        health: HealthProbeState::Unavailable,
+        sentinel_configured: false,
+        storage: StorageDiagnostics::default(),
+        scheduler: SchedulerDiagnostics::default(),
     }
 }
 
@@ -2841,12 +4184,101 @@ fn timestamp_now() -> String {
         .to_string()
 }
 
+fn system_time_timestamp(value: SystemTime) -> String {
+    value
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_default()
+}
+
+fn instant_timestamp(value: Instant) -> String {
+    system_time_timestamp(SystemTime::now() + value.saturating_duration_since(Instant::now()))
+}
+
 fn parse_timestamp(value: &str) -> Option<SystemTime> {
     value.parse::<u128>().ok().and_then(|millis| {
         u64::try_from(millis)
             .ok()
             .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)))
     })
+}
+
+fn pacing_for_limits(limits: InventoryLimits) -> InventoryPacing {
+    let min_interval = if limits.item_rate_per_second == 0 {
+        Duration::ZERO
+    } else {
+        let numerator = u128::from(limits.batch_size.max(1)) * 1_000_000_000;
+        let denominator = u128::from(limits.item_rate_per_second);
+        Duration::from_nanos(numerator.div_ceil(denominator) as u64)
+    };
+    InventoryPacing {
+        min_interval,
+        item_rate_per_second: (limits.item_rate_per_second > 0)
+            .then_some(limits.item_rate_per_second),
+        batch_size: Some(limits.batch_size.clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE)),
+    }
+}
+
+fn stable_server_hash(server: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in server.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3_u64);
+    }
+    format!("{hash:016x}")
+}
+
+fn build_lock_path(database_path: &Path, server: &str) -> PathBuf {
+    let file_name = database_path
+        .file_name()
+        .map_or_else(|| "index.sqlite3".into(), |name| name.to_os_string());
+    database_path.with_file_name(format!(
+        "{}.{}.build.lock",
+        file_name.to_string_lossy(),
+        stable_server_hash(server)
+    ))
+}
+
+fn deterministic_jitter(server: &str, maximum_seconds: u64) -> Duration {
+    if maximum_seconds == 0 {
+        return Duration::ZERO;
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in server.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3_u64);
+    }
+    let range = maximum_seconds.saturating_add(1);
+    Duration::from_secs(if range == 0 {
+        maximum_seconds
+    } else {
+        hash % range
+    })
+}
+
+fn retry_delay(
+    server: &str,
+    consecutive_failures: u32,
+    circuit_open: bool,
+    circuit_open_seconds: u64,
+) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(8);
+    let multiplier = 1_u64 << exponent;
+    let base = RETRY_INITIAL_BACKOFF
+        .checked_mul(multiplier as u32)
+        .unwrap_or(RETRY_MAX_BACKOFF)
+        .min(RETRY_MAX_BACKOFF);
+    let jitter_limit = (base.as_secs() / 5).max(1);
+    let jitter = deterministic_jitter(
+        &format!("{server}:retry:{consecutive_failures}"),
+        jitter_limit,
+    );
+    let exponential = base.saturating_add(jitter).min(RETRY_MAX_BACKOFF);
+    if circuit_open {
+        exponential.max(Duration::from_secs(circuit_open_seconds).min(RETRY_MAX_BACKOFF))
+    } else {
+        exponential
+    }
 }
 
 fn namespace_string(value: NamespaceOrganization) -> &'static str {
@@ -2911,7 +4343,8 @@ mod tests {
     use super::*;
     use crate::opc::{
         BrowseCapabilities, BrowsePage, InventoryCompleted, InventoryEntry, InventoryEvent,
-        InventoryStream, OpcValue, TagValue, WriteResult,
+        InventorySliceBackend, InventorySliceObservation, InventoryStream, OpcValue, TagValue,
+        WriteResult,
     };
     use crate::test_support::MockOpcClient;
     use chrono::TimeZone;
@@ -2927,14 +4360,37 @@ mod tests {
             database_path: path,
             servers: vec!["S".into()],
             enabled: true,
-            refresh_interval_seconds: 86_400,
+            refresh_interval_seconds: 604_800,
+            initial_build_policy: InitialBuildPolicy::Immediate,
+            startup_grace_period_seconds: 0,
+            schedule_jitter_seconds: 0,
+            inventory_batch_size: 100,
+            commit_batch_size: 100,
+            commit_interval_ms: 1_000,
             batch_size: 100,
             item_rate_limit: 0,
             burst_size: 100,
             duty_cycle_percent: 100,
+            adaptive: false,
+            minimum_item_rate: 10,
+            minimum_batch_size: 1,
+            minimum_duty_cycle_percent: 1,
+            canary_item_rate: 50,
+            canary_batch_size: 25,
+            canary_duty_cycle_percent: 5,
+            adaptive_healthy_window_seconds: 30,
+            adaptive_recovery_delay_seconds: 30,
+            adaptive_max_recovery_delay_seconds: 300,
+            sentinel_tag: None,
+            sentinel_probe_interval_seconds: 30,
+            minimum_free_space_bytes: 0,
+            storage_headroom_bytes: 0,
+            circuit_failure_threshold: 3,
+            circuit_open_seconds: 300,
             quiet_period_seconds: 0,
             health_probe_interval_seconds: 30,
             health_latency_threshold_ms: 500,
+            operation_timeout_seconds: 30,
             maintenance_windows: Vec::new(),
             concurrency: 1,
             query_cache_capacity: 256,
@@ -2997,15 +4453,204 @@ mod tests {
     }
 
     #[test]
-    fn build_file_lock_is_exclusive_and_released() {
+    fn adaptive_limits_translate_to_native_operation_pacing() {
+        let pacing = pacing_for_limits(InventoryLimits {
+            item_rate_per_second: 100,
+            batch_size: 10,
+            duty_cycle_percent: 50,
+        });
+        assert_eq!(pacing.min_interval, Duration::from_millis(100));
+        assert_eq!(pacing.item_rate_per_second, Some(100));
+        assert_eq!(pacing.batch_size, Some(10));
+        assert_eq!(
+            pacing_for_limits(InventoryLimits {
+                item_rate_per_second: 3,
+                batch_size: 1,
+                duty_cycle_percent: 1,
+            })
+            .min_interval,
+            Duration::from_nanos(333_333_334)
+        );
+        assert_eq!(
+            pacing_for_limits(InventoryLimits {
+                item_rate_per_second: 0,
+                batch_size: 1,
+                duty_cycle_percent: 1,
+            })
+            .min_interval,
+            Duration::ZERO
+        );
+        assert_eq!(
+            pacing_for_limits(InventoryLimits {
+                item_rate_per_second: 0,
+                batch_size: 1,
+                duty_cycle_percent: 1,
+            })
+            .item_rate_per_second,
+            None
+        );
+        assert_eq!(
+            pacing_for_limits(InventoryLimits {
+                item_rate_per_second: 100,
+                batch_size: MAX_NATIVE_INVENTORY_BATCH_SIZE + 1,
+                duty_cycle_percent: 50,
+            })
+            .batch_size,
+            Some(MAX_NATIVE_INVENTORY_BATCH_SIZE)
+        );
+        assert_ne!(stable_server_hash("S"), stable_server_hash("T"));
+    }
+
+    #[test]
+    fn slice_observations_feed_adaptive_controller_health_state() {
+        let manager = IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(PathBuf::from(":memory:")),
+        );
+        let slice = InventorySliceObservation {
+            sequence: 1,
+            backend: InventorySliceBackend::Da2,
+            nodes_returned: 0,
+            has_more: false,
+            native_operations: 0,
+            elapsed_ms: 1,
+            entries_seen: 0,
+            unique_items: 0,
+        };
+        let observation = manager.controller_observation_for_slice("S", &slice);
+        assert!(observation.inventory_error);
+        assert!(!observation.foreground_active);
+    }
+
+    #[test]
+    fn foreground_metrics_keep_rolling_latency_percentiles() {
+        let mut metrics = ForegroundMetricState::default();
+        metrics.record_health_at(Instant::now(), 30, false, false, false);
+        metrics.record_health_at(Instant::now(), 10, true, true, true);
+        metrics.record_health_at(Instant::now(), 20, false, false, false);
+        let snapshot = metrics.snapshot(2);
+        assert_eq!(snapshot.active_count, 2);
+        assert_eq!(snapshot.operations, 3);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.bad_quality, 1);
+        assert_eq!(snapshot.latency_p50_ms, Some(20));
+        assert_eq!(snapshot.latency_p95_ms, Some(30));
+        assert_eq!(snapshot.latency_max_ms, Some(30));
+        assert!(!snapshot.last_error);
+    }
+
+    #[test]
+    fn foreground_health_failures_expire_without_a_follow_up_operation() {
+        let recorded_at = Instant::now();
+        let mut metrics = ForegroundMetricState::default();
+        metrics.record_health_at(recorded_at, 10, true, true, true);
+        assert!(
+            metrics.recent_health_failure(
+                recorded_at + Duration::from_secs(1),
+                Duration::from_secs(2)
+            )
+        );
+        assert!(
+            !metrics.recent_health_failure(
+                recorded_at + Duration::from_secs(3),
+                Duration::from_secs(2)
+            )
+        );
+    }
+
+    #[test]
+    fn foreground_bad_quality_expires_without_a_follow_up_operation() {
+        let recorded_at = Instant::now();
+        let mut metrics = ForegroundMetricState::default();
+        metrics.record_health_at(recorded_at, 10, false, true, false);
+        assert!(
+            metrics
+                .recent_bad_quality(recorded_at + Duration::from_secs(1), Duration::from_secs(2))
+        );
+        assert!(
+            !metrics
+                .recent_bad_quality(recorded_at + Duration::from_secs(3), Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn controller_observation_includes_recent_bad_quality() {
+        let manager = IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(PathBuf::from(":memory:")),
+        );
+        manager.record_foreground_operation_with_health(
+            "S",
+            Duration::from_millis(10),
+            false,
+            true,
+            false,
+        );
+
+        let observation = manager.controller_observation("S", false);
+        assert!(observation.foreground_bad_quality);
+        assert!(!observation.foreground_error);
+    }
+
+    #[test]
+    fn storage_diagnostics_include_sqlite_sidecars() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("index.sqlite3");
+        let db = IndexDb::open(&path).unwrap();
+        std::fs::write(IndexDb::sqlite_sidecar_path(&path, "-wal"), vec![0_u8; 7]).unwrap();
+        std::fs::write(IndexDb::sqlite_sidecar_path(&path, "-shm"), vec![0_u8; 11]).unwrap();
+        let storage = db.storage_diagnostics();
+        assert_eq!(storage.wal_bytes, 7);
+        assert_eq!(storage.shm_bytes, 11);
+        assert!(storage.free_bytes.is_some());
+    }
+
+    #[test]
+    fn sqlite_sidecars_append_to_custom_database_names() {
+        let path = PathBuf::from("/tmp/custom-index.db");
+        assert_eq!(
+            IndexDb::sqlite_sidecar_path(&path, "-wal"),
+            PathBuf::from("/tmp/custom-index.db-wal")
+        );
+        assert_eq!(
+            IndexDb::sqlite_sidecar_path(&path, "-shm"),
+            PathBuf::from("/tmp/custom-index.db-shm")
+        );
+    }
+
+    #[test]
+    fn retry_state_round_trips_through_index_meta() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("index.sqlite3");
+        let db = IndexDb::open(&path).unwrap();
+        let retry_after = Some(SystemTime::now() + Duration::from_secs(30));
+        db.set_retry_state("S", retry_after, 3, true).unwrap();
+        let (_, failures, circuit_open) = db.retry_state("S").unwrap();
+        assert_eq!(failures, 3);
+        assert!(circuit_open);
+    }
+
+    #[test]
+    fn build_file_lock_is_exclusive_and_reusable() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("index.sqlite3");
         let lock = BuildFileLock::acquire(&database, "S").unwrap();
-        assert!(lock.path.exists());
+        assert!(build_lock_path(&database, "S").exists());
+        assert!(BuildFileLock::is_held(&database, "S").unwrap());
+        assert!(!BuildFileLock::is_held(&database, "T").unwrap());
         let error = BuildFileLock::acquire(&database, "S").unwrap_err();
-        assert!(error.to_string().contains("build lock already exists"));
+        assert!(error.to_string().contains("build lock is already held"));
         drop(lock);
-        assert!(!database.with_file_name("index.sqlite3.build.lock").exists());
+        assert!(!BuildFileLock::is_held(&database, "S").unwrap());
+        assert!(build_lock_path(&database, "S").exists());
+        let other_server_lock = BuildFileLock::acquire(&database, "T").unwrap();
+        assert_ne!(
+            build_lock_path(&database, "T"),
+            build_lock_path(&database, "S"),
+            "different servers must not share a build lock"
+        );
+        drop(other_server_lock);
+        fs::write(build_lock_path(&database, "S"), "stale process metadata\n").unwrap();
         let replacement = BuildFileLock::acquire(&database, "S").unwrap();
         drop(replacement);
     }
@@ -3019,7 +4664,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("lock metadata write failed"));
-        assert!(!database.with_file_name("index.sqlite3.build.lock").exists());
+        assert!(build_lock_path(&database, "S").exists());
 
         #[cfg(unix)]
         {
@@ -3028,17 +4673,20 @@ mod tests {
             assert!(!error.to_string().is_empty());
         }
 
-        let lock = BuildFileLock::acquire(&database, "S").unwrap();
-        let lock_path = lock.path.clone();
-        fs::remove_file(&lock_path).unwrap();
-        fs::create_dir(&lock_path).unwrap();
-        let subscriber = tracing_subscriber::fmt()
-            .with_test_writer()
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || drop(lock));
-        assert!(lock_path.is_dir());
-        fs::remove_dir(lock_path).unwrap();
+        #[cfg(unix)]
+        {
+            let lock = BuildFileLock::acquire(&database, "S").unwrap();
+            let lock_path = build_lock_path(&database, "S");
+            fs::remove_file(&lock_path).unwrap();
+            fs::create_dir(&lock_path).unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::WARN)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || drop(lock));
+            assert!(lock_path.is_dir());
+            fs::remove_dir(lock_path).unwrap();
+        }
     }
 
     #[test]
@@ -3072,6 +4720,16 @@ mod tests {
         assert_eq!(parse_source("unknown"), BrowseSource::Unspecified);
         assert_eq!(node_kind_number(InventoryNodeKind::Item), 1);
         assert_eq!(node_kind_number(InventoryNodeKind::BranchAndItem), 2);
+    }
+
+    #[test]
+    fn scheduled_refresh_jitter_is_deterministic_and_bounded() {
+        assert_eq!(deterministic_jitter("S", 0), Duration::ZERO);
+        assert_eq!(
+            deterministic_jitter("S", 3600),
+            deterministic_jitter("S", 3600)
+        );
+        assert!(deterministic_jitter("S", 3600) <= Duration::from_secs(3600));
     }
 
     #[test]
@@ -3203,7 +4861,7 @@ mod tests {
     fn sqlite_open_quarantines_invalid_schema_and_recovers_interrupted_builds() {
         let directory = tempdir().unwrap();
         let memory = IndexDb::open(Path::new(":memory:")).unwrap();
-        assert_eq!(memory.database_bytes(), 0);
+        assert_eq!(memory.storage_diagnostics().main_bytes, 0);
         drop(memory);
 
         #[cfg(unix)]
@@ -3434,6 +5092,67 @@ mod tests {
         assert_eq!(
             initial_rows[0].last_error.as_deref(),
             Some("namespace index build interrupted by gateway restart")
+        );
+    }
+
+    #[test]
+    fn sqlite_open_preserves_staging_owned_by_a_live_build_lock() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("live-build.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let active = db
+            .start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                "1",
+            )
+            .unwrap();
+        db.insert_entries("S", active, &[inventory_entry("Active", "S.Active")])
+            .unwrap();
+        db.promote("S", active, "2", &completed_progress(1))
+            .unwrap();
+        let staging = db
+            .start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                "3",
+            )
+            .unwrap();
+        db.insert_entries("S", staging, &[inventory_entry("Staging", "S.Staging")])
+            .unwrap();
+        drop(db);
+
+        let lock = BuildFileLock::acquire(&path, "S").unwrap();
+        let reopened = IndexDb::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT state FROM generations
+                     WHERE server = 'S' AND generation = ?1",
+                    [staging as i64],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "staging"
+        );
+        drop(reopened);
+        drop(lock);
+
+        let recovered = IndexDb::open(&path).unwrap();
+        assert_eq!(
+            recovered
+                .connection
+                .query_row(
+                    "SELECT state FROM generations
+                     WHERE server = 'S' AND generation = ?1",
+                    [staging as i64],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "superseded"
         );
     }
 
@@ -4431,7 +6150,10 @@ mod tests {
             Arc::new(MockOpcClient::default()),
             settings(directory.path().join("index.sqlite3")),
         ));
-        assert_eq!(manager.background_refresh_delay("S").await, RETRY_BACKOFF);
+        assert_eq!(
+            manager.background_refresh_delay("S").await,
+            retry_delay("S", 1, false, 300)
+        );
 
         manager
             .with_database(|db| {
@@ -4458,7 +6180,7 @@ mod tests {
             })
             .unwrap();
         let ready_delay = manager.background_refresh_delay("S").await;
-        assert!(ready_delay <= Duration::from_secs(86_400));
+        assert!(ready_delay <= Duration::from_secs(604_800));
     }
 
     #[test]
@@ -4508,6 +6230,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_indexing_does_not_start_first_build_without_window() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(MockOpcClient::default());
+        let mut config = settings(directory.path().join("index.sqlite3"));
+        config.initial_build_policy = InitialBuildPolicy::MaintenanceWindow;
+        config.maintenance_windows.clear();
+        let manager = Arc::new(IndexManager::new(Arc::clone(&client), config));
+
+        manager.start_background_indexing();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
+        manager.shutdown_background_indexing().await;
+    }
+
+    #[tokio::test]
     async fn background_indexing_wakes_for_the_next_refresh_check() {
         let directory = tempdir().unwrap();
         let client = Arc::new(MockOpcClient::default());
@@ -4550,9 +6287,18 @@ mod tests {
                     foreground_users: 0,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 }),
                 retry_after: None,
                 last_error: None,
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
             },
         );
         assert_eq!(
@@ -4578,9 +6324,18 @@ mod tests {
                     foreground_users: 0,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 }),
                 retry_after: None,
                 last_error: None,
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
             },
         );
         assert_eq!(
@@ -4596,7 +6351,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(manager.background_refresh_delay("S").await, RETRY_BACKOFF);
+        assert_eq!(
+            manager.background_refresh_delay("S").await,
+            retry_delay("S", 1, false, 300)
+        );
         manager.refresh_if_due("S").await;
 
         manager.refresh_if_due("Other").await;
@@ -4605,14 +6363,16 @@ mod tests {
     #[tokio::test]
     async fn manager_status_covers_partial_stale_refreshing_and_runtime_errors() {
         let directory = tempdir().unwrap();
+        let mut index_settings = settings(directory.path().join("index.sqlite3"));
+        index_settings.sentinel_tag = Some("Health.PV".into());
         let manager = Arc::new(IndexManager::new(
             Arc::new(MockOpcClient::default()),
-            settings(directory.path().join("index.sqlite3")),
+            index_settings,
         ));
-        assert_eq!(
-            manager.status("S").await.unwrap().state,
-            IndexState::NotIndexed
-        );
+        let not_indexed = manager.status("S").await.unwrap();
+        assert_eq!(not_indexed.state, IndexState::NotIndexed);
+        assert!(not_indexed.sentinel_configured);
+        assert_eq!(not_indexed.health, HealthProbeState::Unavailable);
 
         let generation = manager
             .with_database(|db| {
@@ -4662,9 +6422,18 @@ mod tests {
                     foreground_users: 0,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 }),
                 retry_after: None,
                 last_error: Some("obsolete build failure".into()),
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
             },
         );
         let refreshing = manager.status("S").await.unwrap();
@@ -4675,6 +6444,12 @@ mod tests {
             refreshing.last_error.as_deref(),
             Some("obsolete build failure")
         );
+        manager.mark_promoting("S").unwrap();
+        assert_eq!(
+            manager.status("S").await.unwrap().state,
+            IndexState::Promoting
+        );
+        manager.clear_promoting("S");
 
         {
             let mut runtime = manager.runtime.lock().unwrap();
@@ -4706,6 +6481,11 @@ mod tests {
                 foreground_users: 0,
                 operator_paused: false,
                 quiet_until: None,
+                effective_limits: None,
+                controller_state: None,
+                pause_reason: None,
+                recovery_deadline: None,
+                last_commit_latency_ms: None,
             });
         }
         let runtime_only = manager.status("S").await.unwrap();
@@ -4735,9 +6515,18 @@ mod tests {
                     foreground_users: 0,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 }),
                 retry_after: None,
                 last_error: None,
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
             },
         );
         let failed_build = manager.status("S").await.unwrap();
@@ -4998,6 +6787,116 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_during_promotion_does_not_wait_for_database_mutex() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        manager
+            .with_database(|db| {
+                let generation = db.start_generation(
+                    "S",
+                    NamespaceOrganization::Hierarchical,
+                    BrowseSource::Da2,
+                    "1",
+                )?;
+                db.update_progress("S", generation, &zero_progress())?;
+                Ok(())
+            })
+            .unwrap();
+        manager.runtime.lock().unwrap().insert(
+            "S".into(),
+            RuntimeState {
+                build: Some(RuntimeBuild {
+                    control: None,
+                    progress: Some(zero_progress()),
+                    started_at: "runtime-start".into(),
+                    foreground_users: 0,
+                    operator_paused: false,
+                    quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
+                }),
+                retry_after: None,
+                last_error: None,
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
+            },
+        );
+        manager.mark_promoting("S").unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let lock_manager = Arc::clone(&manager);
+        let lock_thread = std::thread::spawn(move || {
+            let database_guard = lock_manager.database.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(database_guard);
+        });
+        locked_rx.recv().unwrap();
+        let status_manager = Arc::clone(&manager);
+        let status_task = tokio::spawn(async move { status_manager.status("S").await });
+        let status = tokio::time::timeout(Duration::from_secs(1), status_task)
+            .await
+            .expect("promotion status should not wait for the writer mutex")
+            .expect("status task should not panic")
+            .unwrap();
+        assert_eq!(status.state, IndexState::Promoting);
+        release_tx.send(()).unwrap();
+        lock_thread.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn indexed_search_during_promotion_does_not_wait_for_database_mutex() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        seed_active_generation(
+            &manager,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            "2",
+        );
+        insert_runtime_build(&manager, Arc::new(RecordingInventoryControl::default()));
+        manager.mark_promoting("S").unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let lock_manager = Arc::clone(&manager);
+        let lock_thread = std::thread::spawn(move || {
+            let database_guard = lock_manager.database.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(database_guard);
+        });
+        locked_rx.recv().unwrap();
+
+        let search_manager = Arc::clone(&manager);
+        let search_task =
+            tokio::spawn(async move { search_manager.search("S", "Persisted", 3, 10).await });
+        let search = tokio::time::timeout(Duration::from_secs(1), search_task)
+            .await
+            .expect("indexed search should not wait for the writer mutex")
+            .expect("search task should not panic")
+            .unwrap();
+        assert_eq!(search.status.state, IndexState::Promoting);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.matches[0].item_id, "Persisted.Tag");
+
+        release_tx.send(()).unwrap();
+        lock_thread.join().unwrap();
+    }
+
     #[tokio::test]
     async fn refresh_start_failure_backs_off_until_forced_retry() {
         let directory = tempdir().unwrap();
@@ -5106,7 +7005,7 @@ mod tests {
             settings(path.clone()),
         ));
         let lock = BuildFileLock::acquire(&path, "S").unwrap();
-        manager.build_locks.lock().unwrap().insert(path, lock);
+        manager.build_locks.lock().unwrap().insert("S".into(), lock);
 
         let error = manager.refresh("S", true).await.unwrap_err();
         assert!(
@@ -5149,7 +7048,52 @@ mod tests {
         let status = refresh.await.unwrap().unwrap();
         assert_eq!(status.state, IndexState::NotIndexed);
         assert!(control.cancelled.load(Ordering::Acquire));
-        assert!(!directory.path().join("index.sqlite3.build.lock").exists());
+        assert!(build_lock_path(&directory.path().join("index.sqlite3"), "S").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_honors_cancel_during_inventory_startup() {
+        let directory = tempdir().unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        let inventory_started = Arc::new(Notify::new());
+        let inventory_release = Arc::new(Notify::new());
+        let client = Arc::new(
+            LifecycleClient::new(
+                vec![Ok(handle_with_control(
+                    VecDeque::new(),
+                    Arc::clone(&control),
+                ))],
+                vec![Ok(default_capabilities())],
+            )
+            .with_inventory_gate(
+                Arc::clone(&inventory_started),
+                Arc::clone(&inventory_release),
+            ),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("index.sqlite3")),
+        ));
+
+        let refresh_manager = Arc::clone(&manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+        inventory_started.notified().await;
+
+        let status = manager
+            .control("S", IndexControlAction::Cancel)
+            .await
+            .unwrap();
+        assert_eq!(status.state, IndexState::Partial);
+        inventory_release.notify_one();
+
+        let status = tokio::time::timeout(Duration::from_secs(1), refresh)
+            .await
+            .expect("refresh should finish after startup cancellation")
+            .expect("refresh task should not panic")
+            .unwrap();
+        assert_eq!(status.state, IndexState::NotIndexed);
+        assert!(control.cancelled.load(Ordering::Acquire));
+        assert!(build_lock_path(&directory.path().join("index.sqlite3"), "S").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5214,7 +7158,7 @@ mod tests {
         let status = manager.refresh("S", true).await.unwrap();
         assert_eq!(status.state, IndexState::NotIndexed);
         assert!(control.cancelled.load(Ordering::Acquire));
-        assert!(!directory.path().join("index.sqlite3.build.lock").exists());
+        assert!(build_lock_path(&directory.path().join("index.sqlite3"), "S").exists());
     }
 
     #[tokio::test]
@@ -5320,7 +7264,7 @@ mod tests {
         ));
         manager.refresh("S", true).await.unwrap();
         wait_for_build(&manager, IndexState::Ready).await;
-        assert!(!directory.path().join("index.sqlite3.build.lock").exists());
+        assert!(build_lock_path(&directory.path().join("index.sqlite3"), "S").exists());
         let ready = manager.status("S").await.unwrap();
         assert_eq!(ready.active_generation, 1);
         assert_eq!(
@@ -5340,7 +7284,7 @@ mod tests {
             .push_back(Err("inventory failed".into()));
         manager.refresh("S", true).await.unwrap();
         wait_for_build(&manager, IndexState::Failed).await;
-        assert!(!directory.path().join("index.sqlite3.build.lock").exists());
+        assert!(build_lock_path(&directory.path().join("index.sqlite3"), "S").exists());
         let failed = manager.status("S").await.unwrap();
         assert_eq!(failed.active_generation, 1);
         assert_eq!(failed.state, IndexState::Failed);
@@ -5515,6 +7459,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn stalled_inventory_event_is_cancelled_and_releases_the_scheduler() {
+        let directory = tempdir().unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        let client = Arc::new(LifecycleClient::new(
+            vec![Ok(InventoryHandle {
+                stream: Box::new(BlockingInventoryStream {
+                    started: Arc::new(Notify::new()),
+                    release: Arc::new(Notify::new()),
+                    event: Some(Ok(InventoryEvent::Entry(inventory_entry(
+                        "Stalled",
+                        "S.Stalled",
+                    )))),
+                }),
+                control: Arc::clone(&control) as Arc<dyn InventoryControl>,
+            })],
+            vec![],
+        ));
+        let mut config = settings(directory.path().join("stalled-inventory.sqlite3"));
+        config.operation_timeout_seconds = 1;
+        let manager = Arc::new(IndexManager::new(client, config));
+
+        manager.refresh("S", true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        wait_for_state(&manager, "S", IndexState::Failed).await;
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("inventory event timed out after 1 seconds")
+        );
+        assert!(control.cancelled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn build_reports_batch_progress_and_promotion_database_failures() {
         let directory = tempdir().unwrap();
         let subscriber = tracing_subscriber::fmt()
@@ -5535,6 +7512,7 @@ mod tests {
 
         let mut batch_config = settings(directory.path().join("batch.sqlite3"));
         batch_config.batch_size = 1;
+        batch_config.commit_batch_size = 1;
         let batch_client = Arc::new(LifecycleClient::new(
             vec![Ok(handle_with_control(
                 VecDeque::from([Ok(InventoryEvent::Entry(InventoryEntry {
@@ -5972,9 +7950,18 @@ mod tests {
                     foreground_users: 0,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 }),
                 retry_after: None,
                 last_error: None,
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
             },
         );
 
@@ -5997,6 +7984,37 @@ mod tests {
             panic!("poison foreground users for cleanup error-path coverage");
         });
         poisoned.foreground_end("S");
+    }
+
+    #[tokio::test]
+    async fn pause_overlays_compose_and_are_visible_in_runtime_status() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, control.clone());
+
+        manager.set_pause_overlay("S", None, Some(true));
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(
+            status.pause_reason,
+            Some(crate::controller::PauseReason::OpcHealth)
+        );
+        assert!(control.paused.load(Ordering::Acquire));
+
+        manager.set_pause_overlay("S", Some(true), None);
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(
+            status.pause_reason,
+            Some(crate::controller::PauseReason::Maintenance)
+        );
+
+        manager.set_pause_overlay("S", Some(false), Some(false));
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.pause_reason, None);
+        assert!(!control.paused.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -6091,9 +8109,18 @@ mod tests {
                     foreground_users: 0,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 }),
                 retry_after: None,
                 last_error: None,
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
             },
         );
 
@@ -6112,7 +8139,7 @@ mod tests {
         assert!(control.resume_count.load(Ordering::Relaxed) > 0);
 
         manager
-            .enforce_duty_cycle(&trait_control, "S", Duration::from_millis(1))
+            .enforce_duty_cycle(&trait_control, "S", Duration::from_millis(1), 50)
             .await;
         assert!(control.pause_count.load(Ordering::Relaxed) > 0);
         assert!(!control.paused.load(Ordering::Acquire));
@@ -6204,9 +8231,18 @@ mod tests {
                     foreground_users: 0,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 }),
                 retry_after: None,
                 last_error: None,
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
             },
         );
         let mut next_probe = Instant::now();
@@ -6275,6 +8311,126 @@ mod tests {
                 .await
         );
         assert!(recovery_control.resume_count.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn adaptive_hard_pause_recovers_without_waiting_for_an_inventory_slice() {
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("recovery.sqlite3"));
+        config.adaptive = true;
+        config.adaptive_recovery_delay_seconds = 0;
+        config.adaptive_healthy_window_seconds = 1;
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config,
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, Arc::clone(&trait_control));
+        let started = Instant::now();
+        let mut controller = AdaptiveIndexController::new(manager.controller_config(), started);
+        let paused = controller.observe(
+            started,
+            ControllerObservation {
+                foreground_bad_quality: true,
+                ..ControllerObservation::default()
+            },
+        );
+        assert!(paused.paused);
+        manager.update_runtime_controller("S", paused.limits, paused.state, paused.recovery_at);
+        assert!(control.paused.load(Ordering::Acquire));
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.wait_for_controller_recovery(&trait_control, "S", &mut controller),
+        )
+        .await
+        .expect("controller did not recover")
+        .expect("controller recovery pacing update failed")
+        .then_some(())
+        .expect("controller recovery was cancelled");
+        assert!(!control.paused.load(Ordering::Acquire));
+        assert!(control.resume_count.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn initial_pacing_failure_is_returned_and_recorded() {
+        let directory = tempdir().unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.fail_pacing_on_call(1);
+        let client = Arc::new(LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::new(),
+                Arc::clone(&control),
+            ))],
+            vec![],
+        ));
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("index.sqlite3")),
+        ));
+
+        let error = manager.refresh("S", true).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unable to apply initial inventory pacing")
+        );
+        assert!(control.is_cancelled());
+        assert_eq!(
+            manager.status("S").await.unwrap().last_error.as_deref(),
+            Some("unable to apply initial inventory pacing: test pacing update failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_pacing_failure_fails_the_active_generation() {
+        let directory = tempdir().unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.fail_pacing_on_call(2);
+        let client = Arc::new(LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::from([
+                    Ok(InventoryEvent::Slice(InventorySliceObservation {
+                        sequence: 1,
+                        backend: InventorySliceBackend::Da2,
+                        nodes_returned: 1,
+                        has_more: false,
+                        native_operations: 1,
+                        elapsed_ms: 1,
+                        entries_seen: 1,
+                        unique_items: 1,
+                    })),
+                    Ok(InventoryEvent::Completed(InventoryCompleted {
+                        complete: true,
+                        cancelled: false,
+                        truncated: false,
+                        warning: None,
+                        organization: NamespaceOrganization::Hierarchical,
+                        source: BrowseSource::Da2,
+                    })),
+                ]),
+                Arc::clone(&control),
+            ))],
+            vec![],
+        ));
+        let mut config = settings(directory.path().join("index.sqlite3"));
+        config.adaptive = true;
+        let manager = Arc::new(IndexManager::new(client, config));
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Failed).await;
+
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some(
+                "unable to update adaptive inventory pacing after slice 1: \
+                 test pacing update failure"
+            )
+        );
+        assert!(control.is_cancelled());
     }
 
     #[tokio::test]
@@ -6488,7 +8644,7 @@ mod tests {
             Arc::new(MockOpcClient::default()),
             settings(directory.path().join("missing-profile.sqlite3")),
         );
-        assert!(!missing.active_profile_changed("S").await);
+        assert!(!missing.active_profile_changed("S").await.unwrap());
 
         let invalid = IndexManager::new(
             Arc::new(MockOpcClient::default()),
@@ -6502,7 +8658,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(!invalid.active_profile_changed("S").await);
+        assert!(!invalid.active_profile_changed("S").await.unwrap());
 
         let unavailable_client = Arc::new(LifecycleClient::new(
             vec![],
@@ -6518,7 +8674,44 @@ mod tests {
             BrowseSource::Da2,
             &timestamp_now(),
         );
-        assert!(!unavailable.active_profile_changed("S").await);
+        let error = unavailable
+            .active_profile_changed("S")
+            .await
+            .expect_err("capability errors must be surfaced");
+        assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_profile_check_times_out_a_stalled_capability_probe() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(
+                vec![],
+                vec![Ok(BrowseCapabilities {
+                    organization: NamespaceOrganization::Hierarchical,
+                    source: BrowseSource::Da2,
+                    supports_browse_sessions: true,
+                    supports_search: true,
+                    max_page_size: 100,
+                })],
+            )
+            .with_capability_delay(Duration::from_secs(2)),
+        );
+        let mut config = settings(directory.path().join("profile-timeout.sqlite3"));
+        config.operation_timeout_seconds = 1;
+        let manager = Arc::new(IndexManager::new(client, config));
+        seed_active_generation(
+            &manager,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            &timestamp_now(),
+        );
+
+        let error = manager
+            .active_profile_changed("S")
+            .await
+            .expect_err("stalled capability probes must be bounded");
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[tokio::test]
@@ -6907,6 +9100,8 @@ mod tests {
         cancel_on_pause: AtomicBool,
         pause_count: AtomicUsize,
         resume_count: AtomicUsize,
+        pacing_calls: AtomicUsize,
+        fail_pacing_on_call: AtomicUsize,
     }
 
     impl InventoryControl for RecordingInventoryControl {
@@ -6930,11 +9125,24 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             self.cancelled.load(Ordering::Acquire)
         }
+
+        fn set_pacing(&self, _pacing: InventoryPacing) -> anyhow::Result<()> {
+            let call = self.pacing_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            let failure_call = self.fail_pacing_on_call.load(Ordering::Acquire);
+            if call == failure_call {
+                anyhow::bail!("test pacing update failure");
+            }
+            Ok(())
+        }
     }
 
     impl RecordingInventoryControl {
         fn cancel_on_pause(&self) {
             self.cancel_on_pause.store(true, Ordering::Release);
+        }
+
+        fn fail_pacing_on_call(&self, call: usize) {
+            self.fail_pacing_on_call.store(call, Ordering::Release);
         }
     }
 
@@ -7195,9 +9403,18 @@ mod tests {
                     foreground_users: 0,
                     operator_paused: false,
                     quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: None,
                 }),
                 retry_after: None,
                 last_error: None,
+                consecutive_failures: 0,
+                circuit_open: false,
+                health: HealthProbeState::Unavailable,
+                sentinel_checked_at: None,
             },
         );
     }
@@ -7270,6 +9487,16 @@ mod tests {
                 organization: NamespaceOrganization::Hierarchical,
                 source: BrowseSource::Da2,
                 progress: None,
+                effective_limits: None,
+                controller_state: None,
+                pause_reason: None,
+                recovery_deadline: None,
+                foreground_metrics: ForegroundMetrics::default(),
+                host_metrics: HostMetrics::default(),
+                health: HealthProbeState::Unavailable,
+                sentinel_configured: false,
+                storage: StorageDiagnostics::default(),
+                scheduler: SchedulerDiagnostics::default(),
             },
         }
     }

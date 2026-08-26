@@ -39,8 +39,9 @@ Refreshes run asynchronously, and gateway shutdown cancels active indexing befor
 An inventory can complete successfully with a non-fatal warning when the OPC server rejects
 specific namespace branches; the generation remains active and usable, and the status diagnostic
 is reported as a warning unless the index state is `failed`.
-Completed active generations are durable across gateway restarts. Activation is a short atomic
-metadata transition, so search and status remain responsive while a refresh becomes active.
+Completed active generations are durable across gateway restarts. Activation is an atomic metadata
+transition, and promotion status uses a read-only SQLite connection plus filesystem diagnostics, so
+status remains responsive even while the writer is in the promotion critical section.
 Superseded and abandoned data is reclaimed in bounded background batches through a separate
 SQLite WAL connection. An interrupted refresh is superseded when a complete active generation
 remains available, so status and search continue to use that snapshot while cleanup runs.
@@ -50,7 +51,10 @@ candidate set in memory, so a broad query cannot hold the coordinator's foregrou
 mutex while it scans the FTS index. Status, discovery, reads, writes, and lazy browse therefore
 remain available while search work is in progress. Matching is case-insensitive with
 exact/prefix/contains ranking, and responses report when additional results exist beyond the
-requested limit.
+requested limit. During promotion, searches use the active generation already returned by the
+promotion-safe status path instead of waiting for the writable database mutex. Cancellation
+requests received before inventory startup returns its control handle are retained and applied
+once the handle is available.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the
@@ -63,7 +67,28 @@ server value.
 Configure the index in the gateway TOML file under `[index]`. Automatic indexing is restricted to
 the explicit `servers` allow-list and uses a service-writable SQLite database, conservative
 batch/rate/duty-cycle defaults, a two-second foreground quiet period, and one build at a time.
+Native inventory batches are bounded to 1,000 entries by the OPC DA client contract.
+Native inventory slicing and SQLite commit batching are independently bounded, and adaptive
+controller decisions update both the native slice batch size and pacing interval; the commit
+interval provides a time limit for low-volume inventories. Runtime status includes rolling
+foreground latency/error/quality metrics, host/storage availability, and persisted scheduler
+backoff diagnostics.
+If the native client rejects an initial or adaptive pacing update, the build fails visibly and
+the previous complete generation remains active; pacing errors are never logged and ignored.
+Completed generations are refreshed weekly by default. The first automatic build waits for a
+configured maintenance window; when no window is configured, use the manual refresh operation.
+Startup grace and deterministic per-server schedule jitter prevent indexing from starting
+immediately after a restart or in lockstep across targets.
 The default database path is `%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows and
 `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (falling back to
 `$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS. See the example file for all
-available settings, including maintenance windows and health thresholds.
+available settings, including maintenance windows, health thresholds, and adaptive AIMD
+rate/batch/duty-cycle floors and ceilings. Adaptive indexing starts at the canary profile and
+backs off or pauses when recent foreground OPC errors or bad-quality reads, or host/storage
+guardrails, deteriorate.
+Pre-build and health OPC operations are bounded by `operation_timeout_seconds`, so an
+unresponsive target cannot hold the scheduler indefinitely.
+An optional `sentinel_tag` is read during health probes; omitted or unavailable sentinel
+configuration is reported explicitly rather than treated as a healthy zero value. Status also
+distinguishes a configured sentinel from its probe result, so an unprobed sentinel is not reported
+as absent.

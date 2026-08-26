@@ -2,6 +2,7 @@ use opc_da_client::{
     BrowseNamespace, BrowseNodeFilter, BrowseNodeKind as ExtBrowseNodeKind, BrowseNodeToken,
     BrowsePageRequest, BrowsePageToken, BrowseSessionToken,
     InventoryControl as ExtInventoryControl, InventoryEvent as ExtInventoryEvent, InventoryOptions,
+    InventoryPacing as ExtInventoryPacing, InventorySliceBackend as ExtInventorySliceBackend,
     InventoryStream as ExtInventoryStream, OpcDaClient, OpcProvider, OpcValue as ExtOpcValue,
     TagValue as ExtTagValue, WriteResult as ExtWriteResult,
 };
@@ -11,8 +12,9 @@ use std::sync::{Arc, Mutex};
 use crate::opc::{
     BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource, InventoryCompleted,
     InventoryControl, InventoryEntry, InventoryEvent, InventoryHandle, InventoryNodeKind,
-    InventoryProgress, InventoryStream, NamespaceOrganization, OpcClient, OpcValue, TagValue,
-    WriteResult,
+    InventoryPacing, InventoryProgress, InventorySliceBackend, InventorySliceObservation,
+    InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization, OpcClient, OpcValue,
+    TagValue, WriteResult,
 };
 
 #[derive(Default)]
@@ -119,6 +121,12 @@ impl OpcClient for OpcDaAdapter {
         server: &str,
         batch_size: u32,
     ) -> anyhow::Result<InventoryHandle> {
+        if !(1..=MAX_NATIVE_INVENTORY_BATCH_SIZE).contains(&batch_size) {
+            anyhow::bail!(
+                "native inventory batch size must be between 1 and {}",
+                MAX_NATIVE_INVENTORY_BATCH_SIZE
+            );
+        }
         let stream = self
             .client
             .start_inventory(
@@ -176,8 +184,26 @@ impl InventoryControl for AdapterInventoryControl {
         self.inner.cancel();
     }
 
+    fn set_pacing(&self, pacing: InventoryPacing) -> anyhow::Result<()> {
+        self.apply_pacing(pacing)
+    }
+
     fn is_cancelled(&self) -> bool {
         self.inner.is_cancelled()
+    }
+}
+
+impl AdapterInventoryControl {
+    fn apply_pacing(&self, pacing: InventoryPacing) -> anyhow::Result<()> {
+        self.inner.set_pacing(ExtInventoryPacing {
+            min_interval: pacing.min_interval,
+        });
+        if let Some(batch_size) = pacing.batch_size {
+            self.inner.set_batch_size(batch_size).map_err(|error| {
+                anyhow::anyhow!("native inventory batch update failed: {error}")
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -215,6 +241,19 @@ fn map_inventory_event(event: ExtInventoryEvent) -> InventoryEvent {
             paused_time_ms: progress.paused_time_ms,
             items_per_second: progress.items_per_second,
             estimated_remaining_ms: progress.estimated_remaining_ms,
+        }),
+        ExtInventoryEvent::Slice(slice) => InventoryEvent::Slice(InventorySliceObservation {
+            sequence: slice.sequence,
+            backend: match slice.backend {
+                ExtInventorySliceBackend::Da3 => InventorySliceBackend::Da3,
+                ExtInventorySliceBackend::Da2 => InventorySliceBackend::Da2,
+            },
+            nodes_returned: slice.nodes_returned,
+            has_more: slice.has_more,
+            native_operations: slice.native_operations,
+            elapsed_ms: slice.elapsed_ms,
+            entries_seen: slice.entries_seen,
+            unique_items: slice.unique_items,
         }),
         ExtInventoryEvent::Completed(completed) => {
             let (organization, source) = map_capabilities(&completed.capabilities);

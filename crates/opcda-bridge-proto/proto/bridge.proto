@@ -56,6 +56,7 @@ message GetCapabilitiesResponse {
   string indexed_search_protocol_version = 9;
   uint32 max_indexed_search_results = 10;
   SearchIndexState search_index_state = 11;
+  bool search_index_promoting = 12;
 }
 
 message ListServersRequest {
@@ -201,6 +202,70 @@ message SearchIndexStatus {
   NamespaceOrganization organization = 11;
   BrowseSource source = 12;
   IndexedSearchProgress progress = 13;
+  optional IndexInventoryLimits effective_limits = 14;
+  IndexControllerState controller_state = 15;
+  optional IndexPauseReason pause_reason = 16;
+  optional string recovery_deadline = 17;
+  IndexForegroundDiagnostics foreground = 18;
+  IndexHostDiagnostics host = 19;
+  IndexStorageDiagnostics storage = 20;
+  IndexSchedulerDiagnostics scheduler = 21;
+  IndexHealthDiagnostics health = 22;
+  bool promoting = 23;
+  optional string pause_reason_detail = 24;
+}
+
+message IndexInventoryLimits {
+  uint32 item_rate_per_second = 1;
+  uint32 batch_size = 2;
+  uint32 duty_cycle_percent = 3;
+}
+
+message IndexForegroundDiagnostics {
+  uint64 active_count = 1;
+  uint64 operations = 2;
+  uint64 errors = 3;
+  uint64 bad_quality = 4;
+  optional uint64 latency_p50_ms = 5;
+  optional uint64 latency_p95_ms = 6;
+  optional uint64 latency_max_ms = 7;
+  bool last_error = 8;
+  bool last_bad_quality = 9;
+}
+
+message IndexHostDiagnostics {
+  optional double cpu_percent = 1;
+  optional double available_memory_percent = 2;
+  optional double disk_active_percent = 3;
+  optional double disk_queue = 4;
+  optional uint64 process_working_set_bytes = 5;
+  optional uint64 process_private_bytes = 6;
+  optional uint64 process_read_bytes_per_second = 7;
+  optional uint64 process_write_bytes_per_second = 8;
+  optional uint64 disk_free_bytes = 9;
+}
+
+message IndexStorageDiagnostics {
+  uint64 main_bytes = 1;
+  uint64 wal_bytes = 2;
+  uint64 shm_bytes = 3;
+  optional uint64 free_bytes = 4;
+  optional uint64 last_commit_latency_ms = 5;
+}
+
+message IndexSchedulerDiagnostics {
+  optional string next_refresh_at = 1;
+  optional string last_attempt_at = 2;
+  optional string last_success_at = 3;
+  optional uint64 last_success_duration_ms = 4;
+  optional string retry_after = 5;
+  uint32 consecutive_failures = 6;
+  bool circuit_open = 7;
+}
+
+message IndexHealthDiagnostics {
+  IndexHealthState state = 1;
+  bool sentinel_configured = 2;
 }
 
 message IndexedSearchProgress {
@@ -234,6 +299,9 @@ enum SearchIndexState {
   SEARCH_INDEX_STATE_STALE = 4;
   SEARCH_INDEX_STATE_REFRESHING = 5;
   SEARCH_INDEX_STATE_FAILED = 6;
+  // Deprecated on the wire: gateways map promotion to REFRESHING and set the
+  // additive promoting diagnostic so older clients remain compatible.
+  SEARCH_INDEX_STATE_PROMOTING = 7;
 }
 
 enum SearchIndexControlAction {
@@ -241,6 +309,33 @@ enum SearchIndexControlAction {
   SEARCH_INDEX_CONTROL_ACTION_PAUSE = 1;
   SEARCH_INDEX_CONTROL_ACTION_RESUME = 2;
   SEARCH_INDEX_CONTROL_ACTION_CANCEL = 3;
+}
+
+enum IndexControllerState {
+  INDEX_CONTROLLER_STATE_UNSPECIFIED = 0;
+  INDEX_CONTROLLER_STATE_RAMPING = 1;
+  INDEX_CONTROLLER_STATE_STEADY = 2;
+  INDEX_CONTROLLER_STATE_THROTTLED = 3;
+  INDEX_CONTROLLER_STATE_PAUSED = 4;
+}
+
+enum IndexPauseReason {
+  INDEX_PAUSE_REASON_UNSPECIFIED = 0;
+  INDEX_PAUSE_REASON_FOREGROUND = 1;
+  INDEX_PAUSE_REASON_OPC_HEALTH = 2;
+  INDEX_PAUSE_REASON_HOST_CPU = 3;
+  INDEX_PAUSE_REASON_MEMORY = 4;
+  INDEX_PAUSE_REASON_DISK = 5;
+  INDEX_PAUSE_REASON_DATABASE = 6;
+  INDEX_PAUSE_REASON_OPERATOR = 7;
+  INDEX_PAUSE_REASON_CIRCUIT = 8;
+}
+
+enum IndexHealthState {
+  INDEX_HEALTH_STATE_UNSPECIFIED = 0;
+  INDEX_HEALTH_STATE_HEALTHY = 1;
+  INDEX_HEALTH_STATE_UNHEALTHY = 2;
+  INDEX_HEALTH_STATE_UNAVAILABLE = 3;
 }
 
 message ReadRequest {

@@ -7,11 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Separate bounded native inventory slices from bounded SQLite commit batches, with a commit
+  interval and WAL checkpointing during cleanup.
+- Apply adaptive native batch-size changes at the next inventory slice boundary alongside pacing
+  interval updates.
+- Record rolling foreground operation latency, error, and quality metrics, optional sentinel
+  health reads, explicit unavailable host/storage metrics, and persisted retry/circuit state.
+- Include adaptive controller, health, storage, and scheduler diagnostics in gateway index status.
+
+### Fixed
+
+- Keep per-server build lock paths persistent so forced termination cannot create a lock-path race;
+  advisory file locking remains the source of truth for active build ownership.
+- Feed recent foreground bad-quality reads into adaptive OPC-health decisions instead of exposing
+  the diagnostic counter without affecting inventory pacing.
+- Clamp configured and adaptive native inventory batches to the upstream 1,000-entry limit before
+  they reach the COM boundary.
+- Surface native pacing-update failures so an initial or adaptive update fails the build instead
+  of being logged and ignored; the prior complete generation remains active.
+- Keep indexed searches out of the writable database mutex during promotion by reusing the active
+  generation from the promotion-safe status read.
+- Preserve cancellation requests received during inventory startup until the inventory control
+  handle becomes available.
+
 ## [0.4.8](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.7...opcda-bridge-gateway-v0.4.8) - 2026-08-25
 
 ### Fixed
 
-- *(gateway)* keep indexed search responsive ([#76](https://github.com/bytehound-labs/opcda-bridge/pull/76))
+- _(gateway)_ keep indexed search responsive ([#76](https://github.com/bytehound-labs/opcda-bridge/pull/76))
 
 ## [0.4.7](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.6...opcda-bridge-gateway-v0.4.7) - 2026-08-25
 

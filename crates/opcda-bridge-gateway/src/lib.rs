@@ -1,5 +1,6 @@
 pub mod browse;
 pub mod config;
+pub mod controller;
 pub mod index;
 pub mod logging;
 pub mod opc;

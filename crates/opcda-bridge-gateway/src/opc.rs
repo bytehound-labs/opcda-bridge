@@ -1,4 +1,16 @@
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Maximum number of entries requested from one native inventory operation.
+///
+/// On Windows this is sourced from the upstream OPC DA client contract. The
+/// non-Windows value keeps configuration and controller tests aligned with
+/// that contract without requiring the Windows-only dependency.
+#[cfg(target_os = "windows")]
+pub const MAX_NATIVE_INVENTORY_BATCH_SIZE: u32 = opc_da_client::MAX_INVENTORY_BATCH_SIZE;
+
+#[cfg(not(target_os = "windows"))]
+pub const MAX_NATIVE_INVENTORY_BATCH_SIZE: u32 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceOrganization {
@@ -75,6 +87,24 @@ pub struct InventoryProgress {
     pub estimated_remaining_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventorySliceBackend {
+    Da3,
+    Da2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventorySliceObservation {
+    pub sequence: u64,
+    pub backend: InventorySliceBackend,
+    pub nodes_returned: u64,
+    pub has_more: bool,
+    pub native_operations: u64,
+    pub elapsed_ms: u64,
+    pub entries_seen: u64,
+    pub unique_items: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryCompleted {
     pub complete: bool,
@@ -89,7 +119,28 @@ pub struct InventoryCompleted {
 pub enum InventoryEvent {
     Entry(InventoryEntry),
     Progress(InventoryProgress),
+    Slice(InventorySliceObservation),
     Completed(InventoryCompleted),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryPacing {
+    pub min_interval: Duration,
+    /// Maximum number of inventory items requested per second at the native
+    /// COM boundary.
+    pub item_rate_per_second: Option<u32>,
+    /// Native entries requested for the next inventory slice.
+    pub batch_size: Option<u32>,
+}
+
+impl Default for InventoryPacing {
+    fn default() -> Self {
+        Self {
+            min_interval: Duration::ZERO,
+            item_rate_per_second: None,
+            batch_size: None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -101,6 +152,13 @@ pub trait InventoryControl: Send + Sync {
     fn pause(&self);
     fn resume(&self);
     fn cancel(&self);
+    /// Applies limits to subsequent native inventory calls.
+    ///
+    /// A failure is terminal for the active build because continuing with stale
+    /// pacing would violate the coordinator's load-control decision.
+    fn set_pacing(&self, _pacing: InventoryPacing) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn is_cancelled(&self) -> bool {
         false
     }

@@ -11,19 +11,22 @@ use opcda_bridge_proto::bridge::{
     BrowseBreadcrumb, BrowseNode as ProtoBrowseNode, BrowsePage as ProtoBrowsePage,
     BrowseSource as ProtoBrowseSource, CloseBrowseSessionRequest, ControlSearchIndexRequest,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
-    GetSearchIndexStatusRequest, IndexedSearchMatch, IndexedSearchProgress, ListServersRequest,
-    ListServersResponse, NamespaceOrganization as ProtoNamespaceOrganization, ProtocolFeature,
-    ProtocolFeatureKind, ReadRequest, ReadResponse, RefreshSearchIndexRequest, SearchCompleted,
-    SearchEvent, SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse,
-    SearchIndexState, SearchIndexStatus, SearchMatch, SearchMatchMode, SearchProgress,
-    SearchRequest, TagValue as ProtoTagValue, WriteRequest, WriteResponse, bridge_server::Bridge,
+    GetSearchIndexStatusRequest, IndexControllerState, IndexForegroundDiagnostics,
+    IndexHealthDiagnostics, IndexHealthState, IndexHostDiagnostics, IndexInventoryLimits,
+    IndexPauseReason, IndexSchedulerDiagnostics, IndexStorageDiagnostics, IndexedSearchMatch,
+    IndexedSearchProgress, ListServersRequest, ListServersResponse,
+    NamespaceOrganization as ProtoNamespaceOrganization, ProtocolFeature, ProtocolFeatureKind,
+    ReadRequest, ReadResponse, RefreshSearchIndexRequest, SearchCompleted, SearchEvent,
+    SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse, SearchIndexState,
+    SearchIndexStatus, SearchMatch, SearchMatchMode, SearchProgress, SearchRequest,
+    TagValue as ProtoTagValue, WriteRequest, WriteResponse, bridge_server::Bridge,
     search_event::Event, write_request::TypedValue as ProtoTypedValue,
 };
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 const DEFAULT_SEARCH_RESULTS: u32 = 200;
 const MAX_SEARCH_RESULTS: u32 = 1_000;
@@ -173,6 +176,7 @@ fn map_capabilities(
         },
         max_indexed_search_results,
         search_index_state: map_index_state(index_status.state) as i32,
+        search_index_promoting: is_promoting_state(index_status.state),
     }
 }
 
@@ -208,8 +212,13 @@ fn map_index_state(state: IndexState) -> SearchIndexState {
         IndexState::Ready => SearchIndexState::Ready,
         IndexState::Stale => SearchIndexState::Stale,
         IndexState::Refreshing => SearchIndexState::Refreshing,
+        IndexState::Promoting => SearchIndexState::Refreshing,
         IndexState::Failed => SearchIndexState::Failed,
     }
+}
+
+fn is_promoting_state(state: IndexState) -> bool {
+    matches!(state, IndexState::Promoting)
 }
 
 fn map_inventory_progress(progress: InventoryProgress) -> IndexedSearchProgress {
@@ -225,6 +234,32 @@ fn map_inventory_progress(progress: InventoryProgress) -> IndexedSearchProgress 
 }
 
 fn map_index_status(status: IndexStatus) -> SearchIndexStatus {
+    let controller_state = match status.controller_state {
+        None => IndexControllerState::Unspecified,
+        Some(crate::controller::ControllerState::Ramping) => IndexControllerState::Ramping,
+        Some(crate::controller::ControllerState::Steady) => IndexControllerState::Steady,
+        Some(crate::controller::ControllerState::Throttled) => IndexControllerState::Throttled,
+        Some(crate::controller::ControllerState::Paused(_)) => IndexControllerState::Paused,
+    };
+    let pause_reason = status.pause_reason.and_then(|reason| match reason {
+        crate::controller::PauseReason::Foreground => Some(IndexPauseReason::Foreground),
+        crate::controller::PauseReason::OpcHealth => Some(IndexPauseReason::OpcHealth),
+        crate::controller::PauseReason::HostCpu => Some(IndexPauseReason::HostCpu),
+        crate::controller::PauseReason::Memory => Some(IndexPauseReason::Memory),
+        crate::controller::PauseReason::Disk => Some(IndexPauseReason::Disk),
+        crate::controller::PauseReason::Database => Some(IndexPauseReason::Database),
+        crate::controller::PauseReason::Operator => Some(IndexPauseReason::Operator),
+        crate::controller::PauseReason::Circuit => Some(IndexPauseReason::Circuit),
+        crate::controller::PauseReason::Maintenance => None,
+    });
+    let pause_reason_detail = status
+        .pause_reason
+        .map(|reason| reason.as_str().to_string());
+    let health_state = match status.health {
+        crate::index::HealthProbeState::Unavailable => IndexHealthState::Unavailable,
+        crate::index::HealthProbeState::Healthy => IndexHealthState::Healthy,
+        crate::index::HealthProbeState::Unhealthy => IndexHealthState::Unhealthy,
+    };
     SearchIndexStatus {
         server: status.server,
         state: map_index_state(status.state) as i32,
@@ -239,6 +274,58 @@ fn map_index_status(status: IndexStatus) -> SearchIndexStatus {
         organization: map_namespace_organization(status.organization) as i32,
         source: map_browse_source(status.source) as i32,
         progress: status.progress.map(map_inventory_progress),
+        effective_limits: status.effective_limits.map(|limits| IndexInventoryLimits {
+            item_rate_per_second: limits.item_rate_per_second,
+            batch_size: limits.batch_size,
+            duty_cycle_percent: u32::from(limits.duty_cycle_percent),
+        }),
+        controller_state: controller_state as i32,
+        pause_reason: pause_reason.map(|reason| reason as i32),
+        recovery_deadline: status.recovery_deadline,
+        pause_reason_detail,
+        foreground: Some(IndexForegroundDiagnostics {
+            active_count: status.foreground_metrics.active_count,
+            operations: status.foreground_metrics.operations,
+            errors: status.foreground_metrics.errors,
+            bad_quality: status.foreground_metrics.bad_quality,
+            latency_p50_ms: status.foreground_metrics.latency_p50_ms,
+            latency_p95_ms: status.foreground_metrics.latency_p95_ms,
+            latency_max_ms: status.foreground_metrics.latency_max_ms,
+            last_error: status.foreground_metrics.last_error,
+            last_bad_quality: status.foreground_metrics.last_bad_quality,
+        }),
+        host: Some(IndexHostDiagnostics {
+            cpu_percent: status.host_metrics.cpu_percent,
+            available_memory_percent: status.host_metrics.available_memory_percent,
+            disk_active_percent: status.host_metrics.disk_active_percent,
+            disk_queue: status.host_metrics.disk_queue,
+            process_working_set_bytes: status.host_metrics.process_working_set_bytes,
+            process_private_bytes: status.host_metrics.process_private_bytes,
+            process_read_bytes_per_second: status.host_metrics.process_read_bytes_per_second,
+            process_write_bytes_per_second: status.host_metrics.process_write_bytes_per_second,
+            disk_free_bytes: status.host_metrics.disk_free_bytes,
+        }),
+        storage: Some(IndexStorageDiagnostics {
+            main_bytes: status.storage.main_bytes,
+            wal_bytes: status.storage.wal_bytes,
+            shm_bytes: status.storage.shm_bytes,
+            free_bytes: status.storage.free_bytes,
+            last_commit_latency_ms: status.storage.last_commit_latency_ms,
+        }),
+        scheduler: Some(IndexSchedulerDiagnostics {
+            next_refresh_at: status.scheduler.next_refresh_at,
+            last_attempt_at: status.scheduler.last_attempt_at,
+            last_success_at: status.scheduler.last_success_at,
+            last_success_duration_ms: status.scheduler.last_success_duration_ms,
+            retry_after: status.scheduler.retry_after,
+            consecutive_failures: status.scheduler.consecutive_failures,
+            circuit_open: status.scheduler.circuit_open,
+        }),
+        health: Some(IndexHealthDiagnostics {
+            state: health_state as i32,
+            sentinel_configured: status.sentinel_configured,
+        }),
+        promoting: is_promoting_state(status.state),
     }
 }
 
@@ -535,11 +622,16 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         let req = request.into_inner();
         let _foreground = self.index.foreground_guard(&req.server);
-        let capabilities = self
-            .client
-            .get_capabilities(&req.server)
-            .await
-            .map_err(internal)?;
+        let started = std::time::Instant::now();
+        let result = self.client.get_capabilities(&req.server).await;
+        self.index.record_foreground_operation_with_health(
+            &req.server,
+            started.elapsed(),
+            result.is_err(),
+            false,
+            result.is_err(),
+        );
+        let capabilities = result.map_err(internal)?;
         let index_status = self.index.status(&req.server).await.map_err(internal)?;
         Ok(Response::new(map_capabilities(
             capabilities,
@@ -555,7 +647,8 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
     ) -> Result<Response<ProtoBrowsePage>, Status> {
         let req = request.into_inner();
         let _foreground = self.index.foreground_guard(&req.server);
-        let (session_id, page) = self
+        let started = std::time::Instant::now();
+        let result = self
             .browse
             .browse(
                 &req.server,
@@ -565,7 +658,17 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
                 req.page_size,
                 req.refresh,
             )
-            .await?;
+            .await;
+        self.index.record_foreground_operation_with_health(
+            &req.server,
+            started.elapsed(),
+            result.is_err(),
+            false,
+            result.as_ref().is_err_and(|status| {
+                matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded)
+            }),
+        );
+        let (session_id, page) = result?;
         tracing::info!(
             server = %req.server,
             session = %session_id,
@@ -729,11 +832,21 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = request.into_inner();
         let _foreground = self.index.foreground_guard(&req.server);
-        let values = self
-            .client
-            .read_tag_values(&req.server, req.tag_ids)
-            .await
-            .map_err(internal)?;
+        let started = std::time::Instant::now();
+        let result = self.client.read_tag_values(&req.server, req.tag_ids).await;
+        let bad_quality = result.as_ref().is_ok_and(|values| {
+            values
+                .iter()
+                .any(|value| !value.quality.eq_ignore_ascii_case("good"))
+        });
+        self.index.record_foreground_operation_with_health(
+            &req.server,
+            started.elapsed(),
+            result.is_err(),
+            bad_quality,
+            result.is_err(),
+        );
+        let values = result.map_err(internal)?;
         Ok(Response::new(ReadResponse {
             values: map_to_proto_tag_values(values),
         }))
@@ -747,11 +860,19 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
         let req = request.into_inner();
         let _foreground = self.index.foreground_guard(&req.server);
         let value = typed_value_to_opc_value(req.typed_value)?;
+        let started = std::time::Instant::now();
         let result = self
             .client
             .write_tag_value(&req.server, &req.tag_id, value)
-            .await
-            .map_err(internal)?;
+            .await;
+        self.index.record_foreground_operation_with_health(
+            &req.server,
+            started.elapsed(),
+            result.is_err() || result.as_ref().is_ok_and(|value| !value.success),
+            false,
+            result.is_err(),
+        );
+        let result = result.map_err(internal)?;
         Ok(Response::new(map_to_write_response(result)))
     }
 }
@@ -818,6 +939,7 @@ mod tests {
             (IndexState::Ready, SearchIndexState::Ready),
             (IndexState::Stale, SearchIndexState::Stale),
             (IndexState::Refreshing, SearchIndexState::Refreshing),
+            (IndexState::Promoting, SearchIndexState::Refreshing),
             (IndexState::Failed, SearchIndexState::Failed),
         ] {
             assert_eq!(map_index_state(state), expected);
@@ -825,7 +947,7 @@ mod tests {
 
         let mapped = map_index_status(IndexStatus {
             server: "S".into(),
-            state: IndexState::Refreshing,
+            state: IndexState::Promoting,
             configured: true,
             active_generation: 3,
             entry_count: 5,
@@ -845,9 +967,20 @@ mod tests {
                 items_per_second: 5.5,
                 estimated_remaining_ms: Some(6),
             }),
+            effective_limits: None,
+            controller_state: None,
+            pause_reason: None,
+            recovery_deadline: None,
+            foreground_metrics: crate::index::ForegroundMetrics::default(),
+            host_metrics: crate::controller::HostMetrics::default(),
+            health: crate::index::HealthProbeState::Unavailable,
+            sentinel_configured: true,
+            storage: crate::index::StorageDiagnostics::default(),
+            scheduler: crate::index::SchedulerDiagnostics::default(),
         });
         assert_eq!(mapped.server, "S");
         assert_eq!(mapped.state, SearchIndexState::Refreshing as i32);
+        assert!(mapped.promoting);
         assert_eq!(mapped.active_generation, 3);
         assert_eq!(mapped.entry_count, 5);
         assert_eq!(mapped.unique_item_count, 4);
@@ -855,6 +988,7 @@ mod tests {
         assert_eq!(mapped.completed_at.as_deref(), Some("complete"));
         assert_eq!(mapped.last_error.as_deref(), Some("warning"));
         assert_eq!(mapped.database_bytes, 1024);
+        assert!(mapped.health.unwrap().sentinel_configured);
         assert_eq!(
             mapped.organization,
             ProtoNamespaceOrganization::Hierarchical as i32
@@ -1899,6 +2033,16 @@ mod tests {
             organization: NamespaceOrganization::Unspecified,
             source: BrowseSource::Unspecified,
             progress: None,
+            effective_limits: None,
+            controller_state: None,
+            pause_reason: None,
+            recovery_deadline: None,
+            foreground_metrics: crate::index::ForegroundMetrics::default(),
+            host_metrics: crate::controller::HostMetrics::default(),
+            health: crate::index::HealthProbeState::Unavailable,
+            sentinel_configured: false,
+            storage: crate::index::StorageDiagnostics::default(),
+            scheduler: crate::index::SchedulerDiagnostics::default(),
         };
         let response = map_capabilities(
             BrowseCapabilities {

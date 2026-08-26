@@ -45,7 +45,12 @@ a working opcda-bridge, not a redesign of it.
   TOML automatically loads that file, so two direct launches can otherwise build into the same
   SQLite database. Gateway logs include the process ID, resolved database path, server,
   generation, operation, and terminal build outcome to make this class of deployment error
-  diagnosable.
+  diagnosable. Build locks use OS advisory ownership, and startup recovery preserves staging
+  generations whose server-specific lock is still held by another live process.
+- **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
+  limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
+  OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
+  start a replacement build.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
@@ -53,7 +58,10 @@ a working opcda-bridge, not a redesign of it.
 - **Indexed search is isolated from foreground database coordination.** Uncached full-text
   queries open a read-only SQLite connection outside the process-wide writable database mutex,
   retain only a bounded ranked candidate set, and fetch metadata for the final result page.
-  Search must never make status, discovery, reads, writes, or lazy browse wait on a broad query.
+  Search must never make status, discovery, reads, writes, or lazy browse wait on a broad query;
+  during promotion it must use the active generation from the promotion-safe status read rather
+  than call back through the writable database mutex. Cancellation issued while inventory startup
+  is awaiting its control handle must be queued and applied when the handle becomes available.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 - **Compatibility contract**: Client and gateway package versions are independent. Runtime
@@ -298,3 +306,8 @@ page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.sea
   package-aware `release-integrity` check rejects release PRs containing only generated metadata,
   and a crates.io rate limit bounds publishing if another guard regresses. Client/gateway runtime
   compatibility is defined by protocol and capability versions, not equal crate versions.
+- **Pre-1.0 API versioning**: adding fields to a public Rust struct is a source-breaking change
+  for downstream struct literals even when the protobuf wire change is additive. Release such
+  changes on the next minor API line (for example, `0.4.x` to `0.5.0`), not as a patch; leave
+  manifest version bumps to release-plz and use a feature-level conventional commit so its
+  release PR selects the minor increment.
