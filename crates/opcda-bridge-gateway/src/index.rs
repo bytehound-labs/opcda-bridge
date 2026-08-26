@@ -1936,10 +1936,10 @@ fn spawn_cleanup_worker_if_idle(
             let server = tasks
                 .iter()
                 .find_map(|(server, task)| task.requested.then(|| server.clone()));
-            if let Some(server) = &server {
-                if let Some(task) = tasks.get_mut(server) {
-                    task.running = true;
-                }
+            if let Some(server) = &server
+                && let Some(task) = tasks.get_mut(server)
+            {
+                task.running = true;
             }
             server
         }
