@@ -112,7 +112,10 @@ SonarQube Cloud analyzes the Rust workspace through `sonar-project.properties` a
 separate from integration tests and fuzz targets, imports the workspace LCOV report, and excludes
 build output from analysis. Relevant pull requests and pushes to `main` run a required
 `Required Sonar quality status` aggregate, with a full scan every Wednesday at 04:47 UTC and an
-available manual dispatch; fork pull requests intentionally skip the secret-bearing analysis.
+available manual dispatch; fork pull requests intentionally skip the secret-bearing analysis. A
+post-failure diagnostic step queries the Compute Engine task and the organization's visible
+project list using the analysis token, printing response metadata and server-side error fields
+without printing the token itself.
 
 The gateway crate is Windows-only (COM); the client crate is cross-platform. Tests that require
 the `OpcClient` trait use a mock implementation so they run on all platforms.

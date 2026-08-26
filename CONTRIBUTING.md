@@ -37,7 +37,9 @@ Example: `feat(gateway): add tag subscription support`.
   coverage input locally with `cargo llvm-cov --workspace --locked --lcov --output-path lcov.info`,
   then run `sonar-scanner` with `SONAR_TOKEN` exported. The workflow runs for relevant pull
   requests and pushes to `main`, plus a Wednesday 04:47 UTC weekly scan; fork pull requests
-  intentionally skip the secret-bearing analysis.
+  intentionally skip the secret-bearing analysis. A post-upload scan failure also prints the
+  Compute Engine response and the projects visible to the analysis token in the workflow log,
+  which helps distinguish project identity errors from server-side processing failures.
 
 ## Testing
 

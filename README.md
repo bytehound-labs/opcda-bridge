@@ -514,7 +514,10 @@ by the coverage workflow; integration tests, fuzz targets, the compatibility wor
 output are classified or excluded so they do not distort source coverage. Relevant pull requests
 and pushes to `main` run the analysis, with a full scan every Wednesday at 04:47 UTC and an
 available manual dispatch. Fork pull requests report an intentional skip because repository
-secrets are unavailable.
+secrets are unavailable. If a scan fails after its report is uploaded, the workflow log includes
+the Compute Engine response and the projects visible to the configured analysis token, allowing
+project-identity and server-side processing failures to be distinguished without exposing the
+token.
 
 With the SonarScanner CLI installed and `SONAR_TOKEN` exported, reproduce the analysis locally:
 
