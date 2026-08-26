@@ -4657,7 +4657,7 @@ mod tests {
     fn build_file_lock_is_exclusive_and_reusable() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("index.sqlite3");
-        let lock = BuildFileLock::acquire(&database, "S").unwrap();
+        let lock = BuildFileLock::acquire_with(&database, "S", |_file, _metadata| Ok(())).unwrap();
         assert!(build_lock_path(&database, "S").exists());
         assert!(BuildFileLock::is_held(&database, "S").unwrap());
         assert!(!BuildFileLock::is_held(&database, "T").unwrap());
@@ -4820,6 +4820,8 @@ mod tests {
     async fn rate_limiter_and_wait_helpers_honor_cancellation() {
         let control_impl = Arc::new(TestInventoryControl::default());
         let control: Arc<dyn InventoryControl> = control_impl.clone();
+        control_impl.pause();
+        control_impl.resume();
 
         let mut disabled = ItemRateLimiter::new(0, 0);
         assert!(disabled.acquire(&control).await);
@@ -6819,13 +6821,16 @@ mod tests {
         ));
         manager
             .with_database(|db| {
-                let generation = db.start_generation(
-                    "S",
-                    NamespaceOrganization::Hierarchical,
-                    BrowseSource::Da2,
-                    "1",
-                )?;
-                db.update_progress("S", generation, &zero_progress())?;
+                let generation = db
+                    .start_generation(
+                        "S",
+                        NamespaceOrganization::Hierarchical,
+                        BrowseSource::Da2,
+                        "1",
+                    )
+                    .unwrap();
+                db.update_progress("S", generation, &zero_progress())
+                    .unwrap();
                 Ok(())
             })
             .unwrap();
@@ -8685,7 +8690,7 @@ mod tests {
 
         let unavailable_client = Arc::new(LifecycleClient::new(
             vec![],
-            vec![Err("unavailable".into())],
+            vec![Err("unavailable".into()), Err("unavailable-refresh".into())],
         ));
         let unavailable = Arc::new(IndexManager::new(
             unavailable_client,
@@ -8702,6 +8707,35 @@ mod tests {
             .await
             .expect_err("capability errors must be surfaced");
         assert!(error.to_string().contains("unavailable"));
+        unavailable.refresh_if_due("S").await;
+
+        let maintenance_client = Arc::new(LifecycleClient::new(
+            vec![],
+            vec![Ok(BrowseCapabilities {
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da3,
+                supports_browse_sessions: true,
+                supports_search: true,
+                max_page_size: 100,
+            })],
+        ));
+        let mut maintenance_config = settings(directory.path().join("maintenance-profile.sqlite3"));
+        maintenance_config.maintenance_windows = vec!["invalid".into()];
+        let maintenance = Arc::new(IndexManager::new(maintenance_client, maintenance_config));
+        seed_active_generation(
+            &maintenance,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            &timestamp_now(),
+        );
+        maintenance.refresh_if_due("S").await;
+
+        let mut initial_config = settings(directory.path().join("maintenance-initial.sqlite3"));
+        initial_config.initial_build_policy = InitialBuildPolicy::MaintenanceWindow;
+        initial_config.maintenance_windows = vec!["invalid".into()];
+        let initial = IndexManager::new(Arc::new(MockOpcClient::default()), initial_config);
+        let initial_status = initial.status("S").await.unwrap();
+        assert!(!initial.automatic_refresh_allowed(&initial_status));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9056,6 +9090,1062 @@ mod tests {
         assert!(manager.cache.lock().unwrap().values.is_empty());
     }
 
+    #[test]
+    fn build_file_lock_reports_owner_and_probe_errors() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let lock = BuildFileLock::acquire(&database, "S").unwrap();
+        let error = BuildFileLock::acquire(&database, "S").unwrap_err();
+        assert!(error.to_string().contains("process_id="));
+        assert!(error.to_string().contains("server=S"));
+        drop(lock);
+
+        let lock_path = build_lock_path(&database, "S");
+        fs::write(&lock_path, "external test owner\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::io::BufRead;
+            use std::process::{Command, Stdio};
+
+            let mut child = Command::new("flock")
+                .arg("-x")
+                .arg(&lock_path)
+                .arg("sh")
+                .arg("-c")
+                .arg("echo ready; read line")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut ready = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+
+            let error = BuildFileLock::acquire(&database, "S").unwrap_err();
+            assert!(error.to_string().contains("external test owner"));
+            assert!(BuildFileLock::is_held(&database, "S").unwrap());
+            drop(child.stdin.take());
+            child.wait().unwrap();
+
+            fs::write(&lock_path, "").unwrap();
+            let mut child = Command::new("flock")
+                .arg("-x")
+                .arg(&lock_path)
+                .arg("sh")
+                .arg("-c")
+                .arg("echo ready; read line")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut ready = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            let error = BuildFileLock::acquire(&database, "S").unwrap_err();
+            assert!(error.to_string().contains("build lock is already held"));
+            drop(child.stdin.take());
+            child.wait().unwrap();
+        }
+
+        fs::remove_file(&lock_path).unwrap();
+        fs::create_dir(&lock_path).unwrap();
+        assert!(BuildFileLock::is_held(&database, "S").is_err());
+        assert!(BuildFileLock::acquire(&database, "S").is_err());
+    }
+
+    #[tokio::test]
+    async fn persisted_retry_circuit_state_blocks_restart_until_forced_refresh() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("retry.sqlite3");
+        let mut config = settings(path.clone());
+        config.circuit_failure_threshold = 1;
+        let failing = Arc::new(IndexManager::new(
+            Arc::new(LifecycleClient::new(
+                vec![Err("start failed".into())],
+                vec![],
+            )),
+            config.clone(),
+        ));
+        assert!(failing.refresh("S", true).await.is_err());
+        drop(failing);
+
+        let client = Arc::new(MockOpcClient::default());
+        let restarted = Arc::new(IndexManager::new(Arc::clone(&client), config));
+        let blocked = restarted.refresh("S", false).await.unwrap();
+        assert_eq!(blocked.state, IndexState::NotIndexed);
+        assert_eq!(blocked.scheduler.consecutive_failures, 1);
+        assert!(blocked.scheduler.circuit_open);
+        assert!(blocked.scheduler.retry_after.is_some());
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
+
+        restarted.refresh("S", true).await.unwrap();
+        wait_for_build(&restarted, IndexState::Ready).await;
+        let recovered = restarted.status("S").await.unwrap();
+        assert_eq!(recovered.scheduler.consecutive_failures, 0);
+        assert!(!recovered.scheduler.circuit_open);
+        assert!(recovered.scheduler.retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_grace_and_manual_policy_prevent_automatic_first_builds() {
+        let directory = tempdir().unwrap();
+        let grace_client = Arc::new(MockOpcClient::default());
+        let mut grace_config = settings(directory.path().join("grace.sqlite3"));
+        grace_config.startup_grace_period_seconds = 60;
+        let grace_manager = Arc::new(IndexManager::new(Arc::clone(&grace_client), grace_config));
+        grace_manager.start_background_indexing();
+        tokio::task::yield_now().await;
+        grace_manager.shutdown_background_indexing().await;
+        assert_eq!(
+            grace_client.inventory_start_count.load(Ordering::Relaxed),
+            0
+        );
+
+        let manual_client = Arc::new(MockOpcClient::default());
+        let mut manual_config = settings(directory.path().join("manual.sqlite3"));
+        manual_config.initial_build_policy = InitialBuildPolicy::Manual;
+        let manual_manager = Arc::new(IndexManager::new(Arc::clone(&manual_client), manual_config));
+        manual_manager.refresh_if_due("S").await;
+        assert_eq!(
+            manual_client.inventory_start_count.load(Ordering::Relaxed),
+            0
+        );
+        manual_manager.start_background_indexing();
+        assert_eq!(
+            manual_manager.background_refresh_delay("S").await,
+            Duration::from_secs(3600)
+        );
+        manual_manager.shutdown_background_indexing().await;
+    }
+
+    #[tokio::test]
+    async fn disk_guard_and_sentinel_health_paths_are_reported() {
+        let directory = tempdir().unwrap();
+        let mut disk_config = settings(directory.path().join("disk.sqlite3"));
+        disk_config.minimum_free_space_bytes = u64::MAX;
+        let disk_manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            disk_config,
+        ));
+        let error = disk_manager.refresh("S", true).await.unwrap_err();
+        assert!(error.to_string().contains("insufficient free space"));
+        assert!(
+            disk_manager
+                .controller_observation("S", false)
+                .insufficient_disk_space
+        );
+
+        let client = Arc::new(MockOpcClient::default());
+        *client.read_tag_values_result.lock().unwrap() = Ok(vec![TagValue {
+            tag_id: "Health.PV".into(),
+            value: "1".into(),
+            quality: "Bad".into(),
+            timestamp: "0".into(),
+        }]);
+        let mut sentinel_config = settings(directory.path().join("sentinel.sqlite3"));
+        sentinel_config.sentinel_tag = Some("Health.PV".into());
+        let sentinel_manager = Arc::new(IndexManager::new(client, sentinel_config));
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.cancel_on_pause();
+        let trait_control: Arc<dyn InventoryControl> = control;
+        insert_runtime_build(&sentinel_manager, Arc::clone(&trait_control));
+        let mut next_probe = Instant::now();
+        let mut backoff = Duration::from_secs(1);
+        assert!(
+            !sentinel_manager
+                .wait_for_health(&trait_control, "S", &mut next_probe, &mut backoff)
+                .await
+        );
+        assert_eq!(
+            sentinel_manager.status("S").await.unwrap().health,
+            HealthProbeState::Unhealthy
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_recovery_pacing_failure_is_returned() {
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("recovery-failure.sqlite3"));
+        config.adaptive = true;
+        config.adaptive_recovery_delay_seconds = 0;
+        config.adaptive_healthy_window_seconds = 1;
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config,
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.fail_pacing_on_call(1);
+        let trait_control: Arc<dyn InventoryControl> = control;
+        insert_runtime_build(&manager, Arc::clone(&trait_control));
+
+        let started = Instant::now();
+        let mut controller = AdaptiveIndexController::new(manager.controller_config(), started);
+        let paused = controller.observe(
+            started,
+            ControllerObservation {
+                foreground_bad_quality: true,
+                ..ControllerObservation::default()
+            },
+        );
+        manager.update_runtime_controller("S", paused.limits, paused.state, paused.recovery_at);
+        let error = manager
+            .wait_for_controller_recovery(&trait_control, "S", &mut controller)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unable to update inventory pacing while recovering")
+        );
+    }
+
+    #[test]
+    fn helper_edge_cases_cover_window_time_and_retry_rollback() {
+        let now = Instant::now();
+        let mut metrics = ForegroundMetricState::default();
+        for latency in 0..129 {
+            metrics.record_health_at(now, latency, false, false, false);
+        }
+        assert_eq!(metrics.latencies_ms.len(), 128);
+        assert_eq!(metrics.latencies_ms.front(), Some(&1));
+        assert_eq!(percentile(&[], 50), None);
+        assert!(!instant_timestamp(Instant::now()).is_empty());
+        assert!(deterministic_jitter("S", u64::MAX) <= Duration::from_secs(u64::MAX));
+
+        let directory = tempdir().unwrap();
+        let db = IndexDb::open(&directory.path().join("retry-rollback.sqlite3")).unwrap();
+        db.connection
+            .execute_batch(
+                "CREATE TRIGGER reject_retry_state
+                 BEFORE INSERT ON index_meta
+                 WHEN NEW.key = 'failures:S'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'retry state rejected');
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            db.set_retry_state("S", Some(SystemTime::now()), 1, false)
+                .unwrap_err()
+                .to_string()
+                .contains("retry state rejected")
+        );
+        assert_eq!(db.retry_state("S").unwrap(), (None, 0, false));
+    }
+
+    #[tokio::test]
+    async fn scheduler_delay_covers_retry_terminal_and_maintenance_states() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("scheduler.sqlite3")),
+        ));
+        manager
+            .runtime
+            .lock()
+            .unwrap()
+            .entry("S".into())
+            .or_default()
+            .retry_after = Some(SystemTime::now() + Duration::from_secs(2));
+        assert!(manager.background_refresh_delay("S").await >= Duration::from_secs(1));
+        manager.runtime.lock().unwrap().clear();
+
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, control);
+        manager.mark_promoting("S").unwrap();
+        assert_eq!(
+            manager.background_refresh_delay("S").await,
+            Duration::from_secs(1)
+        );
+        manager.clear_promoting("S");
+        manager.runtime.lock().unwrap().clear();
+        manager
+            .with_database(|db| {
+                let generation =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.fail_generation("S", generation, "failed")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            manager.background_refresh_delay("S").await,
+            retry_delay("S", 1, false, 300)
+        );
+
+        let mut maintenance = settings(directory.path().join("maintenance-delay.sqlite3"));
+        maintenance.initial_build_policy = InitialBuildPolicy::MaintenanceWindow;
+        maintenance.maintenance_windows = vec!["00:00-00:00".into()];
+        let maintenance = IndexManager::new(Arc::new(MockOpcClient::default()), maintenance);
+        assert_eq!(
+            maintenance.background_refresh_delay("S").await,
+            Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_promotion_read_failure_and_health_variants_are_safe() {
+        let directory = tempdir().unwrap();
+        let mut promotion_config = settings(directory.path().to_path_buf());
+        promotion_config.database_path = directory.path().to_path_buf();
+        let promotion = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            promotion_config,
+        ));
+        let promotion_control: Arc<dyn InventoryControl> =
+            Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&promotion, promotion_control);
+        promotion.mark_promoting("S").unwrap();
+        let status = promotion.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::Promoting);
+        assert!(status.last_error.is_some());
+
+        let client = Arc::new(MockOpcClient::default());
+        *client.read_tag_values_result.lock().unwrap() = Ok(Vec::new());
+        let mut config = settings(directory.path().join("health.sqlite3"));
+        config.sentinel_tag = Some("Health.PV".into());
+        let manager = Arc::new(IndexManager::new(client, config));
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.cancel_on_pause();
+        let control: Arc<dyn InventoryControl> = control;
+        insert_runtime_build(&manager, Arc::clone(&control));
+        let mut next_probe = Instant::now();
+        let mut backoff = Duration::from_secs(1);
+        assert!(
+            !manager
+                .wait_for_health(&control, "S", &mut next_probe, &mut backoff)
+                .await
+        );
+        assert_eq!(
+            manager.status("S").await.unwrap().health,
+            HealthProbeState::Unhealthy
+        );
+
+        let good_client = Arc::new(MockOpcClient::default());
+        *good_client.read_tag_values_result.lock().unwrap() = Ok(vec![TagValue {
+            tag_id: "Health.PV".into(),
+            value: "1".into(),
+            quality: "Good".into(),
+            timestamp: "0".into(),
+        }]);
+        let mut good_config = settings(directory.path().join("good-health.sqlite3"));
+        good_config.sentinel_tag = Some("Health.PV".into());
+        let good = Arc::new(IndexManager::new(good_client, good_config));
+        let good_control: Arc<dyn InventoryControl> =
+            Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&good, Arc::clone(&good_control));
+        let mut next_probe = Instant::now();
+        let mut backoff = Duration::from_secs(1);
+        assert!(
+            good.wait_for_health(&good_control, "S", &mut next_probe, &mut backoff)
+                .await
+        );
+        assert_eq!(
+            good.status("S").await.unwrap().health,
+            HealthProbeState::Healthy
+        );
+    }
+
+    #[test]
+    fn public_metric_and_invalid_maintenance_helpers_are_exercised() {
+        struct FixedHostMetrics;
+
+        impl HostMetricsProvider for FixedHostMetrics {
+            fn snapshot(&self) -> HostMetrics {
+                HostMetrics {
+                    cpu_percent: Some(1.0),
+                    available_memory_percent: Some(99.0),
+                    disk_active_percent: Some(2.0),
+                    disk_queue: Some(0.0),
+                    ..HostMetrics::default()
+                }
+            }
+        }
+
+        let manager = IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(PathBuf::from(":memory:")),
+        )
+        .with_host_metrics_provider(Arc::new(FixedHostMetrics));
+        manager.record_foreground_operation("S", Duration::from_millis(2), true, true);
+        let observation = manager.controller_observation("S", false);
+        assert!(observation.foreground_error);
+        assert!(observation.foreground_bad_quality);
+        assert_eq!(observation.host_cpu_percent, Some(1.0));
+
+        let mut invalid = settings(PathBuf::from(":memory:"));
+        invalid.maintenance_windows = vec!["not-a-window".into()];
+        let invalid = IndexManager::new(Arc::new(MockOpcClient::default()), invalid);
+        assert!(!invalid.maintenance_window_is_open());
+    }
+
+    #[tokio::test]
+    async fn stale_maintenance_delay_and_promotion_search_are_bounded() {
+        let directory = tempdir().unwrap();
+        let now = Local::now();
+        let minute = (now.hour() * 60 + now.minute()) as u16;
+        let window = format!(
+            "{:02}:{:02}-{:02}:{:02}",
+            ((minute + 2) % 1440) / 60,
+            ((minute + 2) % 1440) % 60,
+            ((minute + 3) % 1440) / 60,
+            ((minute + 3) % 1440) % 60
+        );
+        let mut config = settings(directory.path().join("stale-maintenance.sqlite3"));
+        config.maintenance_windows = vec![window];
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config,
+        ));
+        seed_active_generation(
+            &manager,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            "0",
+        );
+        assert_eq!(
+            manager.background_refresh_delay("S").await,
+            Duration::from_secs(60)
+        );
+
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, control);
+        manager.mark_promoting("S").unwrap();
+        let result = manager.search("S", "persisted", 3, 10).await.unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.status.state, IndexState::Promoting);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_cancellation_covers_startup_failure_boundaries() {
+        let directory = tempdir().unwrap();
+
+        let pacing_control = Arc::new(RecordingInventoryControl::default());
+        pacing_control.fail_pacing_on_call(1);
+        let pacing_started = Arc::new(Notify::new());
+        let pacing_release = Arc::new(Notify::new());
+        let pacing_manager = Arc::new(IndexManager::new(
+            Arc::new(
+                LifecycleClient::new(
+                    vec![Ok(handle_with_control(
+                        VecDeque::new(),
+                        Arc::clone(&pacing_control),
+                    ))],
+                    vec![],
+                )
+                .with_inventory_gate(Arc::clone(&pacing_started), Arc::clone(&pacing_release)),
+            ),
+            settings(directory.path().join("pacing-cancel.sqlite3")),
+        ));
+        let refresh_manager = Arc::clone(&pacing_manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+        pacing_started.notified().await;
+        pacing_manager
+            .control("S", IndexControlAction::Cancel)
+            .await
+            .unwrap();
+        pacing_release.notify_one();
+        assert_eq!(
+            refresh.await.unwrap().unwrap().state,
+            IndexState::NotIndexed
+        );
+
+        let capability_control = Arc::new(RecordingInventoryControl::default());
+        let capability_started = Arc::new(Notify::new());
+        let capability_release = Arc::new(Notify::new());
+        let capability_manager = Arc::new(IndexManager::new(
+            Arc::new(
+                LifecycleClient::new(
+                    vec![Ok(handle_with_control(
+                        VecDeque::new(),
+                        Arc::clone(&capability_control),
+                    ))],
+                    vec![Err("capability failure".into())],
+                )
+                .with_capability_gate(
+                    Arc::clone(&capability_started),
+                    Arc::clone(&capability_release),
+                ),
+            ),
+            settings(directory.path().join("capability-cancel.sqlite3")),
+        ));
+        let refresh_manager = Arc::clone(&capability_manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+        capability_started.notified().await;
+        capability_control.cancel();
+        capability_release.notify_one();
+        assert_eq!(
+            refresh.await.unwrap().unwrap().state,
+            IndexState::NotIndexed
+        );
+    }
+
+    #[tokio::test]
+    async fn health_and_recovery_cancellation_edges_are_bounded() {
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("health-wait.sqlite3"));
+        config.sentinel_tag = Some("Health.PV".into());
+        config.sentinel_probe_interval_seconds = 3_600;
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config,
+        ));
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, Arc::clone(&control));
+        manager
+            .runtime
+            .lock()
+            .unwrap()
+            .get_mut("S")
+            .unwrap()
+            .sentinel_checked_at = Some(Instant::now());
+        let mut next_probe = Instant::now() + Duration::from_secs(60);
+        let mut backoff = Duration::from_secs(1);
+        assert!(
+            manager
+                .wait_for_health(&control, "S", &mut next_probe, &mut backoff)
+                .await
+        );
+
+        struct CancelOnSecondPoll(AtomicUsize);
+
+        impl InventoryControl for CancelOnSecondPoll {
+            fn pause(&self) {}
+
+            fn resume(&self) {}
+
+            fn cancel(&self) {}
+
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, Ordering::AcqRel) > 0
+            }
+        }
+
+        let mut recovery_config = settings(directory.path().join("recovery-cancel.sqlite3"));
+        recovery_config.adaptive = true;
+        let recovery = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            recovery_config,
+        ));
+        let recovery_impl = CancelOnSecondPoll(AtomicUsize::new(0));
+        recovery_impl.pause();
+        recovery_impl.resume();
+        recovery_impl.cancel();
+        let recovery_control: Arc<dyn InventoryControl> = Arc::new(recovery_impl);
+        insert_runtime_build(&recovery, Arc::clone(&recovery_control));
+        let started = Instant::now();
+        let mut controller = AdaptiveIndexController::new(recovery.controller_config(), started);
+        controller.observe(
+            started,
+            ControllerObservation {
+                foreground_bad_quality: true,
+                ..ControllerObservation::default()
+            },
+        );
+        assert!(
+            !recovery
+                .wait_for_controller_recovery(&recovery_control, "S", &mut controller)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_guards_and_empty_promoting_search_fail_safely() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("poisoned-guards.sqlite3")),
+        ));
+        let overlays = Arc::clone(&manager.pause_overlays);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = overlays.lock().unwrap();
+            panic!("poison pause overlays");
+        });
+        manager.set_pause_overlay("S", Some(true), None);
+        manager.clear_pause_overlays("S");
+        manager.reconcile_pause_state("S");
+
+        let pending = Arc::clone(&manager.pending_cancels);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = pending.lock().unwrap();
+            panic!("poison pending cancellations");
+        });
+        assert!(manager.take_pending_cancel("S"));
+        manager.clear_pending_cancel("S");
+
+        let promotion = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(PathBuf::from(":memory:")),
+        ));
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&promotion, control);
+        promotion.mark_promoting("S").unwrap();
+        let search = promotion.search("S", "tag", 3, 10).await.unwrap();
+        assert!(search.matches.is_empty());
+        assert_eq!(search.status.state, IndexState::Promoting);
+        assert_eq!(
+            promotion
+                .commit_pending_entries("S", 1, &mut Vec::new())
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_health_wait_and_runtime_poisoning_fail_closed() {
+        struct CancelOnSecondPoll(AtomicUsize);
+
+        impl InventoryControl for CancelOnSecondPoll {
+            fn pause(&self) {}
+
+            fn resume(&self) {}
+
+            fn cancel(&self) {}
+
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, Ordering::AcqRel) > 0
+            }
+        }
+
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("health-overlay.sqlite3")),
+        ));
+        let control_impl = CancelOnSecondPoll(AtomicUsize::new(0));
+        control_impl.pause();
+        control_impl.resume();
+        control_impl.cancel();
+        let control: Arc<dyn InventoryControl> = Arc::new(control_impl);
+        insert_runtime_build(&manager, Arc::clone(&control));
+        manager.pause_overlays.lock().unwrap().insert(
+            "S".into(),
+            PauseOverlayState {
+                maintenance: false,
+                health: true,
+            },
+        );
+        let mut next_probe = Instant::now() + Duration::from_secs(60);
+        let mut backoff = Duration::from_secs(1);
+        assert!(
+            !manager
+                .wait_for_health(&control, "S", &mut next_probe, &mut backoff)
+                .await
+        );
+
+        let runtime = Arc::clone(&manager.runtime);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = runtime.lock().unwrap();
+            panic!("poison runtime");
+        });
+        manager.reconcile_pause_state("S");
+    }
+
+    #[tokio::test]
+    async fn run_build_handles_promoting_lock_and_periodic_commit_failures() {
+        struct DelayedCompletionStream {
+            phase: u8,
+        }
+
+        #[async_trait::async_trait]
+        impl InventoryStream for DelayedCompletionStream {
+            async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+                match self.phase {
+                    0 => {
+                        self.phase = 1;
+                        Some(Ok(InventoryEvent::Entry(inventory_entry(
+                            "Periodic",
+                            "S.Periodic",
+                        ))))
+                    }
+                    1 => {
+                        self.phase = 2;
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        Some(Ok(InventoryEvent::Slice(InventorySliceObservation {
+                            sequence: 1,
+                            backend: InventorySliceBackend::Da2,
+                            nodes_returned: 1,
+                            has_more: false,
+                            native_operations: 1,
+                            elapsed_ms: 1,
+                            entries_seen: 1,
+                            unique_items: 1,
+                        })))
+                    }
+                    _ => Some(Ok(InventoryEvent::Completed(InventoryCompleted {
+                        complete: true,
+                        cancelled: false,
+                        truncated: false,
+                        warning: None,
+                        organization: NamespaceOrganization::Hierarchical,
+                        source: BrowseSource::Da2,
+                    }))),
+                }
+            }
+        }
+
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("periodic-commit.sqlite3"));
+        config.commit_interval_ms = 1;
+        config.commit_batch_size = 100;
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config,
+        ));
+        let generation = manager
+            .with_database(|db| {
+                let generation = db
+                    .start_generation(
+                        "S",
+                        NamespaceOrganization::Hierarchical,
+                        BrowseSource::Da2,
+                        "1",
+                    )
+                    .unwrap();
+                db.connection
+                    .execute_batch(
+                        "CREATE TRIGGER reject_periodic_insert
+                     BEFORE INSERT ON entries
+                     BEGIN
+                       SELECT RAISE(FAIL, 'periodic insert rejected');
+                     END;",
+                    )
+                    .unwrap();
+                Ok(generation)
+            })
+            .unwrap();
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, Arc::clone(&control));
+        Arc::clone(&manager)
+            .run_build(
+                "S".into(),
+                generation,
+                InventoryHandle {
+                    stream: Box::new(DelayedCompletionStream { phase: 0 }),
+                    control,
+                },
+            )
+            .await;
+        assert_eq!(manager.status("S").await.unwrap().state, IndexState::Failed);
+
+        let mut successful_config = settings(directory.path().join("periodic-success.sqlite3"));
+        successful_config.commit_interval_ms = 1;
+        successful_config.commit_batch_size = 100;
+        let successful = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            successful_config,
+        ));
+        let generation = successful
+            .with_database(|db| {
+                db.start_generation(
+                    "S",
+                    NamespaceOrganization::Hierarchical,
+                    BrowseSource::Da2,
+                    "1",
+                )
+            })
+            .unwrap();
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&successful, Arc::clone(&control));
+        Arc::clone(&successful)
+            .run_build(
+                "S".into(),
+                generation,
+                InventoryHandle {
+                    stream: Box::new(DelayedCompletionStream { phase: 0 }),
+                    control,
+                },
+            )
+            .await;
+        assert_eq!(
+            successful.status("S").await.unwrap().state,
+            IndexState::Ready
+        );
+
+        let promotion = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("promotion-lock.sqlite3")),
+        ));
+        let generation = promotion
+            .with_database(|db| {
+                db.start_generation(
+                    "S",
+                    NamespaceOrganization::Hierarchical,
+                    BrowseSource::Da2,
+                    "1",
+                )
+            })
+            .unwrap();
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&promotion, Arc::clone(&control));
+        let promoting = Arc::clone(&promotion.promoting);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = promoting.lock().unwrap();
+            panic!("poison promotion lock");
+        });
+        Arc::clone(&promotion)
+            .run_build(
+                "S".into(),
+                generation,
+                InventoryHandle {
+                    stream: Box::new(VecInventoryStream {
+                        events: VecDeque::from([Ok(InventoryEvent::Completed(
+                            InventoryCompleted {
+                                complete: true,
+                                cancelled: false,
+                                truncated: false,
+                                warning: None,
+                                organization: NamespaceOrganization::Hierarchical,
+                                source: BrowseSource::Da2,
+                            },
+                        ))]),
+                    }),
+                    control,
+                },
+            )
+            .await;
+        assert_eq!(
+            promotion.status("S").await.unwrap().state,
+            IndexState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_and_adaptive_cancellation_scheduler_paths_are_covered() {
+        let directory = tempdir().unwrap();
+        let stale = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("stale-no-window.sqlite3")),
+        ));
+        seed_active_generation(
+            &stale,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            "0",
+        );
+        assert_eq!(
+            stale.background_refresh_delay("S").await,
+            Duration::from_secs(1)
+        );
+
+        let mut maintenance_config = settings(directory.path().join("invalid-maintenance.sqlite3"));
+        maintenance_config.initial_build_policy = InitialBuildPolicy::MaintenanceWindow;
+        maintenance_config.maintenance_windows = vec!["invalid".into()];
+        let maintenance = IndexManager::new(Arc::new(MockOpcClient::default()), maintenance_config);
+        assert!(!maintenance.automatic_refresh_allowed(&empty_status(
+            "S",
+            true,
+            IndexState::NotIndexed
+        )));
+
+        let mut adaptive_config = settings(directory.path().join("adaptive-cancel.sqlite3"));
+        adaptive_config.adaptive = true;
+        let adaptive = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            adaptive_config,
+        ));
+        adaptive.record_foreground_operation_with_health(
+            "S",
+            Duration::from_millis(1),
+            false,
+            true,
+            false,
+        );
+        let generation = adaptive
+            .with_database(|db| {
+                db.start_generation(
+                    "S",
+                    NamespaceOrganization::Hierarchical,
+                    BrowseSource::Da2,
+                    "1",
+                )
+            })
+            .unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.cancel_on_pause();
+        let control: Arc<dyn InventoryControl> = control;
+        insert_runtime_build(&adaptive, Arc::clone(&control));
+        Arc::clone(&adaptive)
+            .run_build(
+                "S".into(),
+                generation,
+                InventoryHandle {
+                    stream: Box::new(VecInventoryStream {
+                        events: VecDeque::from([Ok(InventoryEvent::Slice(
+                            InventorySliceObservation {
+                                sequence: 1,
+                                backend: InventorySliceBackend::Da2,
+                                nodes_returned: 1,
+                                has_more: false,
+                                native_operations: 1,
+                                elapsed_ms: 1,
+                                entries_seen: 1,
+                                unique_items: 1,
+                            },
+                        ))]),
+                    }),
+                    control,
+                },
+            )
+            .await;
+        assert_eq!(
+            adaptive.status("S").await.unwrap().state,
+            IndexState::Failed
+        );
+    }
+
+    #[test]
+    fn restart_recovery_surfaces_staging_update_errors() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("staging-recovery.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        drop(db);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_restart_recovery
+                 BEFORE UPDATE OF state ON generations
+                 BEGIN
+                   SELECT RAISE(FAIL, 'restart recovery rejected');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+        let error = IndexDb::open(&path)
+            .err()
+            .expect("restart recovery should fail");
+        assert!(error.to_string().contains("restart recovery rejected"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_cancellation_cleans_up_generation_start_boundaries() {
+        async fn cancel_after_capability(
+            path: PathBuf,
+            break_generations: bool,
+        ) -> anyhow::Result<IndexStatus> {
+            let control = Arc::new(RecordingInventoryControl::default());
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let manager = Arc::new(IndexManager::new(
+                Arc::new(
+                    LifecycleClient::new(
+                        vec![Ok(handle_with_control(
+                            VecDeque::new(),
+                            Arc::clone(&control),
+                        ))],
+                        vec![Ok(default_capabilities())],
+                    )
+                    .with_capability_gate(Arc::clone(&started), Arc::clone(&release)),
+                ),
+                settings(path),
+            ));
+            if break_generations {
+                manager
+                    .with_database(|db| {
+                        drop_table(db, "generations");
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let refresh_manager = Arc::clone(&manager);
+            let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+            started.notified().await;
+            control.cancel();
+            release.notify_one();
+            refresh.await.unwrap()
+        }
+
+        let directory = tempdir().unwrap();
+        assert!(
+            cancel_after_capability(directory.path().join("generation.sqlite3"), true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no such table")
+        );
+        assert_eq!(
+            cancel_after_capability(directory.path().join("attached.sqlite3"), false)
+                .await
+                .unwrap()
+                .state,
+            IndexState::NotIndexed
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_quiet_resume_and_batch_commit_complete() {
+        let directory = tempdir().unwrap();
+        let mut background_config = settings(directory.path().join("background-shutdown.sqlite3"));
+        background_config.initial_build_policy = InitialBuildPolicy::Manual;
+        let background = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            background_config,
+        ));
+        background.start_background_indexing();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        background.shutdown_background_indexing().await;
+
+        let quiet = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("quiet-resume.sqlite3")),
+        ));
+        let quiet_control = Arc::new(RecordingInventoryControl::default());
+        let control: Arc<dyn InventoryControl> = quiet_control.clone();
+        insert_runtime_build(&quiet, control);
+        let guard = quiet.foreground_guard("S");
+        let resumes = quiet_control.resume_count.load(Ordering::Relaxed);
+        drop(guard);
+        wait_for_counter(&quiet_control.resume_count, resumes + 2).await;
+
+        let mut batch_config = settings(directory.path().join("batch-success.sqlite3"));
+        batch_config.commit_batch_size = 1;
+        let batch = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            batch_config,
+        ));
+        batch.refresh("S", true).await.unwrap();
+        wait_for_build(&batch, IndexState::Ready).await;
+        assert_eq!(batch.status("S").await.unwrap().entry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn controller_recovery_returns_false_for_an_already_cancelled_control() {
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("recovery-cancelled.sqlite3"));
+        config.adaptive = true;
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config,
+        ));
+        let control = Arc::new(TestInventoryControl::default());
+        control.cancel();
+        let control: Arc<dyn InventoryControl> = control;
+        insert_runtime_build(&manager, Arc::clone(&control));
+        let started = Instant::now();
+        let mut controller = AdaptiveIndexController::new(manager.controller_config(), started);
+        controller.observe(
+            started,
+            ControllerObservation {
+                foreground_bad_quality: true,
+                ..ControllerObservation::default()
+            },
+        );
+        assert!(
+            !manager
+                .wait_for_controller_recovery(&control, "S", &mut controller)
+                .await
+                .unwrap()
+        );
+    }
+
     async fn wait_for_build(manager: &Arc<IndexManager<MockOpcClient>>, expected: IndexState) {
         wait_for_state(manager, "S", expected).await;
     }
@@ -9065,23 +10155,29 @@ mod tests {
         server: &str,
         expected: IndexState,
     ) {
-        for _ in 0..100 {
-            if manager.status(server).await.unwrap().state == expected {
-                return;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if manager.status(server).await.unwrap().state == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        panic!("index build did not reach {expected:?}");
+        })
+        .await
+        .expect("index build did not reach expected state");
     }
 
     async fn wait_for_counter(counter: &AtomicUsize, expected: usize) {
-        for _ in 0..100 {
-            if counter.load(Ordering::Relaxed) >= expected {
-                return;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if counter.load(Ordering::Relaxed) >= expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        panic!("counter did not reach {expected}");
+        })
+        .await
+        .expect("counter did not reach expected value");
     }
 
     #[test]

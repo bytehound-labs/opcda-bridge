@@ -257,5 +257,6 @@ mod tests {
         control.resume();
         control.cancel();
         assert!(!control.is_cancelled());
+        control.set_pacing(InventoryPacing::default()).unwrap();
     }
 }

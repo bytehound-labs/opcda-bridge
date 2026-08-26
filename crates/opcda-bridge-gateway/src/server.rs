@@ -967,13 +967,17 @@ mod tests {
                 items_per_second: 5.5,
                 estimated_remaining_ms: Some(6),
             }),
-            effective_limits: None,
-            controller_state: None,
-            pause_reason: None,
+            effective_limits: Some(crate::controller::InventoryLimits {
+                item_rate_per_second: 7,
+                batch_size: 8,
+                duty_cycle_percent: 9,
+            }),
+            controller_state: Some(crate::controller::ControllerState::Ramping),
+            pause_reason: Some(crate::controller::PauseReason::Foreground),
             recovery_deadline: None,
             foreground_metrics: crate::index::ForegroundMetrics::default(),
             host_metrics: crate::controller::HostMetrics::default(),
-            health: crate::index::HealthProbeState::Unavailable,
+            health: crate::index::HealthProbeState::Healthy,
             sentinel_configured: true,
             storage: crate::index::StorageDiagnostics::default(),
             scheduler: crate::index::SchedulerDiagnostics::default(),
@@ -1002,6 +1006,115 @@ mod tests {
         assert_eq!(progress.paused_time_ms, 4);
         assert_eq!(progress.items_per_second, 5.5);
         assert_eq!(progress.estimated_remaining_ms, Some(6));
+        let limits = mapped.effective_limits.unwrap();
+        assert_eq!(limits.item_rate_per_second, 7);
+        assert_eq!(limits.batch_size, 8);
+        assert_eq!(limits.duty_cycle_percent, 9);
+        assert_eq!(
+            mapped.controller_state,
+            IndexControllerState::Ramping as i32
+        );
+        assert_eq!(
+            mapped.pause_reason,
+            Some(IndexPauseReason::Foreground as i32)
+        );
+        assert_eq!(mapped.pause_reason_detail.as_deref(), Some("foreground"));
+        assert_eq!(
+            mapped.health.unwrap().state,
+            IndexHealthState::Healthy as i32
+        );
+
+        let base = IndexStatus {
+            server: "S".into(),
+            state: IndexState::Ready,
+            configured: true,
+            active_generation: 1,
+            entry_count: 0,
+            unique_item_count: 0,
+            started_at: None,
+            completed_at: None,
+            last_error: None,
+            database_bytes: 0,
+            organization: NamespaceOrganization::Unspecified,
+            source: BrowseSource::Unspecified,
+            progress: None,
+            effective_limits: None,
+            controller_state: None,
+            pause_reason: None,
+            recovery_deadline: None,
+            foreground_metrics: crate::index::ForegroundMetrics::default(),
+            host_metrics: crate::controller::HostMetrics::default(),
+            health: crate::index::HealthProbeState::Unavailable,
+            sentinel_configured: false,
+            storage: crate::index::StorageDiagnostics::default(),
+            scheduler: crate::index::SchedulerDiagnostics::default(),
+        };
+        for (state, expected) in [
+            (
+                crate::controller::ControllerState::Ramping,
+                IndexControllerState::Ramping,
+            ),
+            (
+                crate::controller::ControllerState::Steady,
+                IndexControllerState::Steady,
+            ),
+            (
+                crate::controller::ControllerState::Throttled,
+                IndexControllerState::Throttled,
+            ),
+            (
+                crate::controller::ControllerState::Paused(
+                    crate::controller::PauseReason::Operator,
+                ),
+                IndexControllerState::Paused,
+            ),
+        ] {
+            let mut status = base.clone();
+            status.controller_state = Some(state);
+            assert_eq!(map_index_status(status).controller_state, expected as i32);
+        }
+        for reason in [
+            crate::controller::PauseReason::Foreground,
+            crate::controller::PauseReason::OpcHealth,
+            crate::controller::PauseReason::HostCpu,
+            crate::controller::PauseReason::Memory,
+            crate::controller::PauseReason::Disk,
+            crate::controller::PauseReason::Database,
+            crate::controller::PauseReason::Operator,
+            crate::controller::PauseReason::Circuit,
+            crate::controller::PauseReason::Maintenance,
+        ] {
+            let mut status = base.clone();
+            status.pause_reason = Some(reason);
+            let mapped = map_index_status(status);
+            assert_eq!(mapped.pause_reason_detail.as_deref(), Some(reason.as_str()));
+            if reason == crate::controller::PauseReason::Maintenance {
+                assert_eq!(mapped.pause_reason, None);
+            } else {
+                assert!(mapped.pause_reason.is_some());
+            }
+        }
+        for (health, expected) in [
+            (
+                crate::index::HealthProbeState::Unavailable,
+                IndexHealthState::Unavailable,
+            ),
+            (
+                crate::index::HealthProbeState::Healthy,
+                IndexHealthState::Healthy,
+            ),
+            (
+                crate::index::HealthProbeState::Unhealthy,
+                IndexHealthState::Unhealthy,
+            ),
+        ] {
+            let mut status = base.clone();
+            status.health = health;
+            assert_eq!(
+                map_index_status(status).health.unwrap().state,
+                expected as i32
+            );
+        }
 
         for (kind, expected) in [
             (

@@ -863,6 +863,29 @@ mod tests {
     }
 
     #[test]
+    fn hard_pressure_remains_paused_until_recovery_deadline() {
+        let started = now();
+        let config = ControllerConfig {
+            recovery_delay: Duration::from_secs(5),
+            ..ControllerConfig::default()
+        };
+        let mut controller = AdaptiveIndexController::new(config, started);
+        let paused = controller.observe(
+            started + Duration::from_secs(1),
+            ControllerObservation {
+                foreground_bad_quality: true,
+                ..healthy()
+            },
+        );
+        assert!(paused.paused);
+
+        let held = controller.observe(started + Duration::from_secs(2), healthy());
+        assert_eq!(held.state, ControllerState::Paused(PauseReason::OpcHealth));
+        assert!(held.paused);
+        assert_eq!(held.reason, Some(PauseReason::OpcHealth));
+    }
+
+    #[test]
     fn foreground_work_pauses_without_consuming_health_backoff() {
         let started = now();
         let mut controller = AdaptiveIndexController::new(ControllerConfig::default(), started);
@@ -912,5 +935,170 @@ mod tests {
     #[test]
     fn unavailable_host_metrics_are_explicit() {
         assert_eq!(UnavailableHostMetrics.snapshot(), HostMetrics::default());
+    }
+
+    #[test]
+    fn pause_reason_names_are_stable() {
+        for (reason, expected) in [
+            (PauseReason::Foreground, "foreground"),
+            (PauseReason::OpcHealth, "opc_health"),
+            (PauseReason::HostCpu, "host_cpu"),
+            (PauseReason::Memory, "memory"),
+            (PauseReason::Disk, "disk"),
+            (PauseReason::Database, "database"),
+            (PauseReason::Operator, "operator"),
+            (PauseReason::Circuit, "circuit"),
+            (PauseReason::Maintenance, "maintenance"),
+        ] {
+            assert_eq!(reason.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn hard_and_soft_guardrails_map_to_typed_reasons() {
+        let started = now();
+        let hard_cases = [
+            (
+                ControllerObservation {
+                    foreground_error: true,
+                    ..healthy()
+                },
+                PauseReason::OpcHealth,
+            ),
+            (
+                ControllerObservation {
+                    foreground_bad_quality: true,
+                    ..healthy()
+                },
+                PauseReason::OpcHealth,
+            ),
+            (
+                ControllerObservation {
+                    inventory_error: true,
+                    ..healthy()
+                },
+                PauseReason::OpcHealth,
+            ),
+            (
+                ControllerObservation {
+                    foreground_latency_ms: Some(2_000),
+                    ..healthy()
+                },
+                PauseReason::OpcHealth,
+            ),
+            (
+                ControllerObservation {
+                    host_cpu_percent: Some(85.0),
+                    ..healthy()
+                },
+                PauseReason::HostCpu,
+            ),
+            (
+                ControllerObservation {
+                    available_memory_percent: Some(8.0),
+                    ..healthy()
+                },
+                PauseReason::Memory,
+            ),
+            (
+                ControllerObservation {
+                    disk_active_percent: Some(90.0),
+                    ..healthy()
+                },
+                PauseReason::Disk,
+            ),
+            (
+                ControllerObservation {
+                    disk_queue: Some(5.0),
+                    ..healthy()
+                },
+                PauseReason::Disk,
+            ),
+            (
+                ControllerObservation {
+                    database_commit_p95_ms: Some(1_000),
+                    ..healthy()
+                },
+                PauseReason::Database,
+            ),
+            (
+                ControllerObservation {
+                    insufficient_disk_space: true,
+                    ..healthy()
+                },
+                PauseReason::Database,
+            ),
+        ];
+        for (observation, expected) in hard_cases {
+            let mut controller = AdaptiveIndexController::new(ControllerConfig::default(), started);
+            let decision = controller.observe(started + Duration::from_secs(1), observation);
+            assert_eq!(decision.reason, Some(expected));
+            assert!(decision.paused);
+        }
+
+        let soft_cases = [
+            (
+                ControllerObservation {
+                    foreground_latency_ms: Some(200),
+                    ..healthy()
+                },
+                PauseReason::OpcHealth,
+            ),
+            (
+                ControllerObservation {
+                    host_cpu_percent: Some(70.0),
+                    ..healthy()
+                },
+                PauseReason::HostCpu,
+            ),
+            (
+                ControllerObservation {
+                    available_memory_percent: Some(15.0),
+                    ..healthy()
+                },
+                PauseReason::Memory,
+            ),
+            (
+                ControllerObservation {
+                    disk_active_percent: Some(70.0),
+                    ..healthy()
+                },
+                PauseReason::Disk,
+            ),
+            (
+                ControllerObservation {
+                    disk_queue: Some(2.0),
+                    ..healthy()
+                },
+                PauseReason::Disk,
+            ),
+            (
+                ControllerObservation {
+                    database_commit_p95_ms: Some(250),
+                    ..healthy()
+                },
+                PauseReason::Database,
+            ),
+        ];
+        for (observation, expected) in soft_cases {
+            let mut controller = AdaptiveIndexController::new(ControllerConfig::default(), started);
+            let decision = controller.observe(started + Duration::from_secs(1), observation);
+            assert_eq!(decision.reason, Some(expected));
+            assert_eq!(decision.state, ControllerState::Throttled);
+        }
+    }
+
+    #[test]
+    fn reaching_the_ceiling_enters_the_steady_state() {
+        let started = now();
+        let config = ControllerConfig {
+            canary: ControllerConfig::default().ceiling,
+            healthy_window: Duration::from_secs(1),
+            ..ControllerConfig::default()
+        };
+        let mut controller = AdaptiveIndexController::new(config, started);
+        let decision = controller.observe(started + Duration::from_secs(1), healthy());
+        assert_eq!(decision.state, ControllerState::Steady);
+        assert_eq!(decision.limits, config.ceiling);
     }
 }
