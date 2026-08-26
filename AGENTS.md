@@ -116,7 +116,10 @@ does not need prior CI evidence when its negotiated protocol ranges overlap, but
 such pairings as `unverified`. Release-plz pull requests regenerate the isolated test workspace's
 lockfile before running the same locked test command when package manifests change, because path
 package versions change in the release branch. The release workflow commits the matching lockfile
-after a release commit so the main branch remains runnable with `--locked`.
+after a release commit so the main branch remains runnable with `--locked`. Historical clients
+must keep an exact direct dependency on the protocol crate version they originally shipped with;
+otherwise Cargo can resolve their semver range to a newer generated Rust enum whose added variants
+break compilation before the compatibility test can exercise the wire boundary.
 
 An intentional Protobuf break requires the `breaking-protobuf` label, a new or changed catalog
 boundary, updated evidence, and regenerated compatibility reports. Release-integrity validation
