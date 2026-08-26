@@ -7,7 +7,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: "47 4 * * 3"
+    - cron: '47 4 * * 3'
 
 concurrency:
   group: sonar-${{ github.event.pull_request.number || github.ref }}
@@ -85,13 +85,45 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
+          set -euo pipefail
           ce_task_url="$(sed -n 's/^ceTaskUrl=//p' .scannerwork/report-task.txt)"
           if [ -z "$ce_task_url" ]; then
             echo "SonarQube did not write a compute-engine task URL."
             exit 0
           fi
-          curl --fail --silent --show-error --user "$SONAR_TOKEN:" "$ce_task_url" |
-            jq '{task: {id, status, type, analysisId, errorMessage, errorStacktrace}}'
+          case "$ce_task_url" in
+            *\?*) ce_task_url="${ce_task_url}&organization=bytehound-labs" ;;
+            *) ce_task_url="${ce_task_url}?organization=bytehound-labs" ;;
+          esac
+
+          task_response="$(mktemp)"
+          projects_response="$(mktemp)"
+          trap 'rm -f "$task_response" "$projects_response"' EXIT
+
+          task_http_status="$(
+            curl --silent --show-error --user "$SONAR_TOKEN:" \
+              --output "$task_response" --write-out '%{http_code}' "$ce_task_url"
+          )"
+          echo "SonarQube task response (HTTP ${task_http_status}):"
+          if jq empty "$task_response" >/dev/null 2>&1; then
+            jq . "$task_response"
+          else
+            cat "$task_response"
+          fi
+
+          projects_http_status="$(
+            curl --silent --show-error --user "$SONAR_TOKEN:" \
+              --get --data-urlencode 'organization=bytehound-labs' \
+              --data-urlencode 'ps=500' \
+              --output "$projects_response" --write-out '%{http_code}' \
+              'https://sonarcloud.io/api/projects/search'
+          )"
+          echo "SonarQube projects visible to the analysis token (HTTP ${projects_http_status}):"
+          if jq empty "$projects_response" >/dev/null 2>&1; then
+            jq '{components: [.components[]? | {key, name, qualifier}]}' "$projects_response"
+          else
+            cat "$projects_response"
+          fi
 
   status:
     name: Required Sonar quality status
