@@ -42,6 +42,9 @@ is reported as a warning unless the index state is `failed`.
 Completed active generations are durable across gateway restarts. Activation is an atomic metadata
 transition, and promotion status uses a read-only SQLite connection plus filesystem diagnostics, so
 status remains responsive even while the writer is in the promotion critical section.
+Only one build for a server can hold its gateway-wide file lock at a time; contention reports the
+owning process metadata. On Windows, that metadata is kept in an adjacent `.build.owner` sidecar
+because the locked file itself may be unreadable.
 Superseded and abandoned data is reclaimed in bounded background batches through a separate
 SQLite WAL connection. An interrupted refresh is superseded when a complete active generation
 remains available, so status and search continue to use that snapshot while cleanup runs.

@@ -560,8 +560,7 @@ impl BuildFileLock {
         {
             Ok(file) => file,
             Err(error) if is_lock_conflict(&error) => {
-                let owner = fs::read_to_string(&lock_path)
-                    .unwrap_or_else(|_| "owner details unavailable".to_string());
+                let owner = read_lock_owner(&lock_path, database_path, server);
                 anyhow::bail!(
                     "namespace index build lock is already held at {} ({})",
                     lock_path.display(),
@@ -575,8 +574,7 @@ impl BuildFileLock {
             Err(error) => return Err(error.into()),
         };
         if let Err(error) = file.try_lock_exclusive() {
-            let owner = fs::read_to_string(&lock_path)
-                .unwrap_or_else(|_| "owner details unavailable".to_string());
+            let owner = read_lock_owner(&lock_path, database_path, server);
             anyhow::bail!(
                 "namespace index build lock is already held at {} ({})",
                 lock_path.display(),
@@ -589,6 +587,12 @@ impl BuildFileLock {
         }
         let metadata = format!("process_id={}\nserver={server}\n", std::process::id());
         if let Err(error) = initialize(&mut file, metadata.as_bytes()) {
+            let _ = FileExt::unlock(&file);
+            return Err(error.into());
+        }
+        #[cfg(windows)]
+        if let Err(error) = fs::write(build_owner_path(database_path, server), metadata.as_bytes())
+        {
             let _ = FileExt::unlock(&file);
             return Err(error.into());
         }
@@ -4259,6 +4263,30 @@ fn build_lock_path(database_path: &Path, server: &str) -> PathBuf {
         file_name.to_string_lossy(),
         stable_server_hash(server)
     ))
+}
+
+#[cfg(windows)]
+fn build_owner_path(database_path: &Path, server: &str) -> PathBuf {
+    let file_name = database_path
+        .file_name()
+        .map_or_else(|| "index.sqlite3".into(), |name| name.to_os_string());
+    database_path.with_file_name(format!(
+        "{}.{}.build.owner",
+        file_name.to_string_lossy(),
+        stable_server_hash(server)
+    ))
+}
+
+#[cfg(windows)]
+fn read_lock_owner(lock_path: &Path, database_path: &Path, server: &str) -> String {
+    fs::read_to_string(build_owner_path(database_path, server))
+        .or_else(|_| fs::read_to_string(lock_path))
+        .unwrap_or_else(|_| "owner details unavailable".to_string())
+}
+
+#[cfg(not(windows))]
+fn read_lock_owner(lock_path: &Path, _database_path: &Path, _server: &str) -> String {
+    fs::read_to_string(lock_path).unwrap_or_else(|_| "owner details unavailable".to_string())
 }
 
 fn deterministic_jitter(server: &str, maximum_seconds: u64) -> Duration {
