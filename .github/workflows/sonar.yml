@@ -80,6 +80,19 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: https://sonarcloud.io
 
+      - name: Report SonarQube task failure
+        if: failure() && hashFiles('.scannerwork/report-task.txt') != ''
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          ce_task_url="$(sed -n 's/^ceTaskUrl=//p' .scannerwork/report-task.txt)"
+          if [ -z "$ce_task_url" ]; then
+            echo "SonarQube did not write a compute-engine task URL."
+            exit 0
+          fi
+          curl --fail --silent --show-error --user "$SONAR_TOKEN:" "$ce_task_url" |
+            jq '{task: {id, status, type, analysisId, errorMessage, errorStacktrace}}'
+
   status:
     name: Required Sonar quality status
     if: always()
