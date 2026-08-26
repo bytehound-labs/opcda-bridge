@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.8...opcda-bridge-gateway-v0.4.9) - 2026-08-26
+
+### Added
+
+- harden production namespace indexing ([#78](https://github.com/bytehound-labs/opcda-bridge/pull/78))
+
 ### Added
 
 - Separate bounded native inventory slices from bounded SQLite commit batches, with a commit
