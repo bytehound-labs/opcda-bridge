@@ -6610,13 +6610,19 @@ mod tests {
         let cleanup_writer_gate = Arc::clone(&writer_gate);
         let cleanup_active_builds = Arc::clone(&active_builds);
         let cleanup = std::thread::spawn(move || {
-            cleanup_obsolete_generations_coordinated(
-                &cleanup_path,
-                "S",
-                cleanup_tasks.as_ref(),
-                cleanup_writer_gate,
-                cleanup_active_builds,
-            )
+            let subscriber = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                cleanup_obsolete_generations_coordinated(
+                    &cleanup_path,
+                    "S",
+                    cleanup_tasks.as_ref(),
+                    cleanup_writer_gate,
+                    cleanup_active_builds,
+                )
+            })
         });
 
         started.recv().unwrap();
@@ -6765,6 +6771,68 @@ mod tests {
         release.send(()).unwrap();
         wait.join().unwrap();
         manager.wait_for_build_reservation_hook();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_rejects_a_build_owner_registered_during_reservation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("build-owner-race.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        let (started, release) = manager.install_build_reservation_hook();
+        let hook_manager = Arc::clone(&manager);
+        let hook = std::thread::spawn(move || {
+            started.recv().unwrap();
+            hook_manager
+                .coordination
+                .build_owners
+                .lock()
+                .unwrap()
+                .insert("S".into(), Arc::new(()));
+            release.send(()).unwrap();
+        });
+
+        let error = manager.refresh("S", true).await.unwrap_err();
+        hook.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("build owner is already registered in this process")
+        );
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+        assert!(manager.build_locks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_rechecks_the_concurrency_limit_after_reservation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("build-concurrency-race.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        let (started, release) = manager.install_build_reservation_hook();
+        let hook_manager = Arc::clone(&manager);
+        let hook = std::thread::spawn(move || {
+            started.recv().unwrap();
+            hook_manager
+                .active_builds
+                .lock()
+                .unwrap()
+                .insert("T".into());
+            release.send(()).unwrap();
+        });
+
+        let error = manager.refresh("S", true).await.unwrap_err();
+        hook.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("namespace index build concurrency limit reached")
+        );
+        assert!(manager.build_locks.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -9141,11 +9209,23 @@ mod tests {
         manager.abandon_generation("S", 1, "abandoned");
 
         let cleanup_tasks = Arc::clone(&manager.cleanup_tasks);
+        let poisoned_cleanup_tasks = Arc::clone(&cleanup_tasks);
         let _ = std::panic::catch_unwind(move || {
             let _guard = cleanup_tasks.lock().unwrap();
             panic!("poison cleanup registry for error-path coverage");
         });
         manager.schedule_cleanup("S");
+
+        let cleanup_worker_active = Arc::new(AtomicBool::new(false));
+        spawn_cleanup_worker_if_idle(
+            Arc::clone(&cleanup_worker_active),
+            manager.settings.database_path.clone(),
+            Arc::new(BackgroundTasks::new()),
+            poisoned_cleanup_tasks,
+            Arc::clone(&manager.coordination),
+            false,
+        );
+        assert!(!cleanup_worker_active.load(Ordering::Acquire));
     }
 
     #[test]
@@ -9243,6 +9323,71 @@ mod tests {
         ));
         manager.foreground_end("Missing");
         tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[test]
+    fn finish_build_checks_control_identity_without_an_ownership_token() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("defensive-finalization.sqlite3")),
+        ));
+        let current: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, Arc::clone(&current));
+        manager.coordination.build_owners.lock().unwrap().clear();
+        let obsolete: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            manager.finish_build_inner("S", Some(&obsolete), None, None);
+            manager.finish_build_inner("S", None, None, None);
+        });
+        assert!(
+            manager
+                .runtime
+                .lock()
+                .unwrap()
+                .get("S")
+                .unwrap()
+                .build
+                .is_none()
+        );
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn finish_build_handles_a_poisoned_build_owner_registry() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("poisoned-finalization.sqlite3")),
+        ));
+        insert_runtime_build(&manager, Arc::new(RecordingInventoryControl::default()));
+        let owners = Arc::clone(&manager.coordination.build_owners);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = owners.lock().unwrap();
+            panic!("poison build-owner registry for finalization error-path coverage");
+        });
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let ownership = Arc::new(());
+        tracing::subscriber::with_default(subscriber, || {
+            manager.finish_build_owned("S", &ownership, None);
+        });
+        assert!(
+            manager
+                .runtime
+                .lock()
+                .unwrap()
+                .get("S")
+                .unwrap()
+                .build
+                .is_some()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11153,6 +11298,11 @@ mod tests {
             Arc::new(MockOpcClient::default()),
             settings(directory.path().join("unwind.sqlite3")),
         ));
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
         let generation = manager
             .with_database(|db| {
                 db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
