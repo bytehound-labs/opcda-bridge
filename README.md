@@ -209,8 +209,14 @@ config file — see [Configuration](#configuration) below.
   Active generations remain durable across restarts. Activation is an atomic metadata transition;
   promotion status uses a read-only SQLite connection and filesystem diagnostics, so status remains
   responsive even while the writer is in the promotion critical section. Superseded and abandoned
-  data is reclaimed in bounded background batches, so indexing maintenance does not interrupt indexed
-  search requests. Transient cleanup failures
+  data is reclaimed in bounded background batches through a database-wide writer gate shared with
+  every build mutation, including builds for other servers using the same database file. Cleanup
+  defers while a build is active, yields between batches so a build can proceed, and resumes pending
+  requests after the last active build finishes, even when the cleanup request was scheduled by a
+  different manager instance sharing the same database file, so indexing maintenance does not
+  interrupt indexed search requests or compete with progress/failure writes. Deferred cleanup also
+  exits cleanly if gateway shutdown begins before it starts waiting for build completion. Transient
+  cleanup failures
   are retried with bounded backoff. A refresh interrupted by restart is superseded when a complete
   active generation remains available, so the durable snapshot stays ready while cleanup runs;
   interrupted initial builds and genuine refresh failures remain visible as failed. Older failed

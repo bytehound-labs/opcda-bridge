@@ -46,7 +46,12 @@ Only one build for a server can hold its gateway-wide file lock at a time; conte
 owning process metadata. On Windows, that metadata is kept in an adjacent `.build.owner` sidecar
 because the locked file itself may be unreadable.
 Superseded and abandoned data is reclaimed in bounded background batches through a separate
-SQLite WAL connection. An interrupted refresh is superseded when a complete active generation
+SQLite WAL connection, coordinated by a database-wide writer gate shared with every build mutation
+for the same database file, including builds for other servers. Cleanup defers while any build is
+active, keeps its request registered while waiting, yields between batches so a build can make
+progress, and resumes pending requests after the last build finishes even when the request came
+from another manager instance sharing the database. Shutdown is also observed when it races with
+that deferred wait. An interrupted refresh is superseded when a complete active generation
 remains available, so status and search continue to use that snapshot while cleanup runs.
 An interrupted initial build remains failed and visible because no complete snapshot can replace it.
 Uncached indexed searches use a separate read-only SQLite connection and rank only a bounded

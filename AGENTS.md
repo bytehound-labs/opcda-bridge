@@ -62,6 +62,16 @@ a working opcda-bridge, not a redesign of it.
   during promotion it must use the active generation from the promotion-safe status read rather
   than call back through the writable database mutex. Cancellation issued while inventory startup
   is awaiting its control handle must be queued and applied when the handle becomes available.
+- **SQLite writer coordination is database-wide and cleanup is build-aware.** Every mutation on
+  an index database file, including primary build progress/failure writes and cleanup batches on
+  the separate WAL connection, must pass through the same internal writer gate; per-server build
+  locks are not sufficient because SQLite permits only one writer per file. Cleanup checks for
+  active builds before and after acquiring the gate, yields it between bounded batches, and keeps
+  deferred requests pending until the final active build has completed, including when the request
+  and build belong to different manager instances sharing that file. Deferred workers must observe
+  shutdown even if it races with notification subscription. Build finalization must release
+  ownership before publishing build capacity and resume pending cleanup on every terminal path,
+  including startup failure, cancellation, spawn rejection, shutdown, and unexpected unwinding.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 - **Compatibility contract**: Client and gateway package versions are independent. Runtime
