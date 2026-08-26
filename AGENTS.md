@@ -107,6 +107,13 @@ Protobuf compatibility checks, and bounded cargo-fuzz smoke tests. Tagged binary
 publish SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures, and GitHub artifact
 provenance attestations; `workflow_dispatch` builds package artifacts without publishing.
 
+SonarQube Cloud analyzes the Rust workspace through `sonar-project.properties` and
+`.github/workflows/sonar.yml`. The configuration keeps crate and compatibility source roots
+separate from integration tests and fuzz targets, imports the workspace LCOV report, and excludes
+build output from analysis. Relevant pull requests and pushes to `main` run a required
+`Required Sonar quality status` aggregate, with a full scan every Wednesday at 04:47 UTC and an
+available manual dispatch; fork pull requests intentionally skip the secret-bearing analysis.
+
 The gateway crate is Windows-only (COM); the client crate is cross-platform. Tests that require
 the `OpcClient` trait use a mock implementation so they run on all platforms.
 
