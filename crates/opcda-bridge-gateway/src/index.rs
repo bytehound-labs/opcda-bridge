@@ -241,6 +241,8 @@ struct BackgroundTasks {
     #[cfg(test)]
     cleanup_batch_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
     #[cfg(test)]
+    cleanup_writer_gate_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
+    #[cfg(test)]
     cleanup_notification_hook: Mutex<Option<Arc<CleanupNotificationHook>>>,
 }
 
@@ -272,14 +274,21 @@ struct DatabaseCoordination {
 static DATABASE_COORDINATIONS: OnceLock<Mutex<HashMap<PathBuf, Weak<DatabaseCoordination>>>> =
     OnceLock::new();
 
-fn database_coordination(path: &Path) -> Arc<DatabaseCoordination> {
-    let key = if path == Path::new(":memory:") || path.is_absolute() {
+fn database_coordination_key<F>(path: &Path, current_dir: F) -> PathBuf
+where
+    F: FnOnce() -> std::io::Result<PathBuf>,
+{
+    if path == Path::new(":memory:") || path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
+        current_dir()
             .map(|directory| directory.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
-    };
+    }
+}
+
+fn database_coordination(path: &Path) -> Arc<DatabaseCoordination> {
+    let key = database_coordination_key(path, std::env::current_dir);
     let registry = DATABASE_COORDINATIONS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry
         .lock()
@@ -299,6 +308,13 @@ fn database_coordination(path: &Path) -> Arc<DatabaseCoordination> {
 
 #[cfg(test)]
 struct CleanupBatchHook {
+    started: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    fired: AtomicBool,
+}
+
+#[cfg(test)]
+struct BuildReservationHook {
     started: std::sync::mpsc::SyncSender<()>,
     release: Mutex<std::sync::mpsc::Receiver<()>>,
     fired: AtomicBool,
@@ -328,6 +344,8 @@ impl BackgroundTasks {
             panic_next_cleanup_worker: AtomicBool::new(false),
             #[cfg(test)]
             cleanup_batch_hook: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_writer_gate_hook: Mutex::new(None),
             #[cfg(test)]
             cleanup_notification_hook: Mutex::new(None),
         }
@@ -419,6 +437,41 @@ impl BackgroundTasks {
     fn wait_for_cleanup_batch_hook(&self) {
         let hook = self
             .cleanup_batch_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            let _ = hook.started.send(());
+            if let Ok(release) = hook.release.lock() {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn install_cleanup_writer_gate_hook(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.cleanup_writer_gate_hook.lock().unwrap() = Some(Arc::new(CleanupBatchHook {
+            started,
+            release: Mutex::new(release_rx),
+            fired: AtomicBool::new(false),
+        }));
+        (started_rx, release)
+    }
+
+    #[cfg(test)]
+    fn wait_for_cleanup_writer_gate_hook(&self) {
+        let hook = self
+            .cleanup_writer_gate_hook
             .lock()
             .ok()
             .and_then(|hook| hook.clone());
@@ -1591,6 +1644,37 @@ fn cleanup_obsolete_generations(
     )
 }
 
+fn cleanup_checkpoint(
+    connection: &Connection,
+    writer_gate: &Mutex<()>,
+    active_builds: &Mutex<HashSet<String>>,
+    path: &Path,
+    server: &str,
+) -> rusqlite::Result<(i64, i64)> {
+    let writer_guard = writer_gate
+        .lock()
+        .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+    let active = active_builds
+        .lock()
+        .map(|builds| !builds.is_empty())
+        .unwrap_or(true);
+    let result = if active {
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %path.display(),
+            server,
+            "skipping namespace index cleanup checkpoint while a build is active"
+        );
+        Err(rusqlite::Error::ExecuteReturnedResults)
+    } else {
+        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+    };
+    drop(writer_guard);
+    result
+}
+
 fn cleanup_obsolete_generations_coordinated(
     path: &Path,
     server: &str,
@@ -1635,6 +1719,8 @@ fn cleanup_obsolete_generations_coordinated(
         if !read_only.has_obsolete_generations(server)? {
             break;
         }
+        #[cfg(test)]
+        background_tasks.wait_for_cleanup_writer_gate_hook();
         let writer_guard = writer_gate
             .lock()
             .map_err(|_| anyhow::anyhow!("index writer gate poisoned"))?;
@@ -1720,32 +1806,15 @@ fn cleanup_obsolete_generations_coordinated(
         }
         std::thread::sleep(CLEANUP_BATCH_PAUSE);
     }
-    let checkpoint = connection
-        .as_ref()
-        .map(|connection| match writer_gate.lock() {
-            Ok(writer_guard) => {
-                let active = active_builds
-                    .lock()
-                    .map(|builds| !builds.is_empty())
-                    .unwrap_or(true);
-                let result = if active {
-                    tracing::debug!(
-                        process_id = std::process::id(),
-                        database = %path.display(),
-                        server,
-                        "skipping namespace index cleanup checkpoint while a build is active"
-                    );
-                    Err(rusqlite::Error::ExecuteReturnedResults)
-                } else {
-                    connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                    })
-                };
-                drop(writer_guard);
-                result
-            }
-            Err(_) => Err(rusqlite::Error::ExecuteReturnedResults),
-        });
+    let checkpoint = connection.as_ref().map(|connection| {
+        cleanup_checkpoint(
+            connection,
+            writer_gate.as_ref(),
+            active_builds.as_ref(),
+            path,
+            server,
+        )
+    });
     tracing::info!(
         process_id = std::process::id(),
         database = %path.display(),
@@ -2025,6 +2094,8 @@ pub struct IndexManager<C: OpcClient> {
     #[cfg(test)]
     reject_next_cleanup_spawn: AtomicBool,
     #[cfg(test)]
+    build_reservation_hook: Mutex<Option<Arc<BuildReservationHook>>>,
+    #[cfg(test)]
     search_gate: Arc<Mutex<SearchGate>>,
 }
 
@@ -2150,6 +2221,8 @@ impl<C: OpcClient> IndexManager<C> {
             #[cfg(test)]
             reject_next_cleanup_spawn: AtomicBool::new(false),
             #[cfg(test)]
+            build_reservation_hook: Mutex::new(None),
+            #[cfg(test)]
             search_gate: Arc::new(Mutex::new(None)),
         }
     }
@@ -2206,6 +2279,41 @@ impl<C: OpcClient> IndexManager<C> {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.search_gate.lock().unwrap() = Some((started_tx, release_rx));
         (started_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    fn install_build_reservation_hook(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.build_reservation_hook.lock().unwrap() = Some(Arc::new(BuildReservationHook {
+            started,
+            release: Mutex::new(release_rx),
+            fired: AtomicBool::new(false),
+        }));
+        (started_rx, release)
+    }
+
+    #[cfg(test)]
+    fn wait_for_build_reservation_hook(&self) {
+        let hook = self
+            .build_reservation_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            let _ = hook.started.send(());
+            if let Ok(release) = hook.release.lock() {
+                let _ = release.recv();
+            }
+        }
     }
 
     pub fn start_background_indexing(self: &Arc<Self>) {
@@ -2961,6 +3069,8 @@ impl<C: OpcClient> IndexManager<C> {
                     );
                 }
                 let lock = BuildFileLock::acquire(&self.settings.database_path, server)?;
+                #[cfg(test)]
+                self.wait_for_build_reservation_hook();
                 let ownership = Arc::new(());
                 let mut build_owners = self
                     .coordination
@@ -5047,6 +5157,32 @@ mod tests {
     }
 
     #[test]
+    fn database_coordination_key_handles_relative_and_unresolvable_paths() {
+        let directory = tempdir().unwrap();
+        let absolute = directory.path().join("index.sqlite3");
+        assert_eq!(
+            database_coordination_key(Path::new(":memory:"), std::env::current_dir),
+            PathBuf::from(":memory:")
+        );
+        assert_eq!(
+            database_coordination_key(&absolute, std::env::current_dir),
+            absolute
+        );
+        assert_eq!(
+            database_coordination_key(Path::new("index.sqlite3"), || {
+                Ok(PathBuf::from("/database"))
+            }),
+            PathBuf::from("/database/index.sqlite3")
+        );
+        assert_eq!(
+            database_coordination_key(Path::new("index.sqlite3"), || {
+                Err(std::io::Error::other("current directory unavailable"))
+            }),
+            PathBuf::from("index.sqlite3")
+        );
+    }
+
+    #[test]
     fn adaptive_limits_translate_to_native_operation_pacing() {
         let pacing = pacing_for_limits(InventoryLimits {
             item_rate_per_second: 100,
@@ -6393,6 +6529,162 @@ mod tests {
         drop(blocker);
     }
 
+    #[test]
+    fn cleanup_checkpoint_defers_for_builds_and_tolerates_poisoned_locks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-checkpoint.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        let writer_gate = Mutex::new(());
+        let active_builds = Mutex::new(HashSet::new());
+
+        assert!(cleanup_checkpoint(&connection, &writer_gate, &active_builds, &path, "S",).is_ok());
+
+        active_builds.lock().unwrap().insert("S".into());
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                cleanup_checkpoint(&connection, &writer_gate, &active_builds, &path, "S",).is_err()
+            );
+        });
+        active_builds.lock().unwrap().clear();
+
+        let poisoned_builds = Arc::new(Mutex::new(HashSet::new()));
+        let poison_builds = Arc::clone(&poisoned_builds);
+        std::thread::spawn(move || {
+            let _guard = poison_builds.lock().unwrap();
+            panic!("poison cleanup checkpoint active-build lock");
+        })
+        .join()
+        .unwrap_err();
+        assert!(
+            cleanup_checkpoint(
+                &connection,
+                &writer_gate,
+                poisoned_builds.as_ref(),
+                &path,
+                "S",
+            )
+            .is_err()
+        );
+
+        let poisoned_gate = Arc::new(Mutex::new(()));
+        let poison_gate = Arc::clone(&poisoned_gate);
+        std::thread::spawn(move || {
+            let _guard = poison_gate.lock().unwrap();
+            panic!("poison cleanup checkpoint writer lock");
+        })
+        .join()
+        .unwrap_err();
+        assert!(
+            cleanup_checkpoint(
+                &connection,
+                poisoned_gate.as_ref(),
+                &active_builds,
+                &path,
+                "S",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_rechecks_build_state_after_waiting_for_the_writer_gate() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-gate-recheck.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.fail_generation("S", generation, "obsolete").unwrap();
+        drop(db);
+
+        let background_tasks = Arc::new(BackgroundTasks::new());
+        let (started, release) = background_tasks.install_cleanup_writer_gate_hook();
+        let writer_gate = Arc::new(Mutex::new(()));
+        let active_builds = Arc::new(Mutex::new(HashSet::new()));
+        let cleanup_path = path.clone();
+        let cleanup_tasks = Arc::clone(&background_tasks);
+        let cleanup_writer_gate = Arc::clone(&writer_gate);
+        let cleanup_active_builds = Arc::clone(&active_builds);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_obsolete_generations_coordinated(
+                &cleanup_path,
+                "S",
+                cleanup_tasks.as_ref(),
+                cleanup_writer_gate,
+                cleanup_active_builds,
+            )
+        });
+
+        started.recv().unwrap();
+        active_builds.lock().unwrap().insert("T".into());
+        release.send(()).unwrap();
+        let stats = cleanup.join().unwrap().unwrap();
+        assert_eq!(stats.batches, 0);
+        assert!(stats.deferred_for_build);
+        assert_eq!(
+            IndexDb::open(&path)
+                .unwrap()
+                .status_rows("S")
+                .unwrap()
+                .len(),
+            1
+        );
+        background_tasks.wait_for_cleanup_writer_gate_hook();
+    }
+
+    #[test]
+    fn cleanup_rechecks_obsolete_data_after_waiting_for_the_writer_gate() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-obsolete-recheck.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.fail_generation("S", generation, "obsolete").unwrap();
+        drop(db);
+
+        let background_tasks = Arc::new(BackgroundTasks::new());
+        let (started, release) = background_tasks.install_cleanup_writer_gate_hook();
+        let writer_gate = Arc::new(Mutex::new(()));
+        let active_builds = Arc::new(Mutex::new(HashSet::new()));
+        let cleanup_path = path.clone();
+        let cleanup_tasks = Arc::clone(&background_tasks);
+        let cleanup_writer_gate = Arc::clone(&writer_gate);
+        let cleanup_active_builds = Arc::clone(&active_builds);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_obsolete_generations_coordinated(
+                &cleanup_path,
+                "S",
+                cleanup_tasks.as_ref(),
+                cleanup_writer_gate,
+                cleanup_active_builds,
+            )
+        });
+
+        started.recv().unwrap();
+        let remover = Connection::open(&path).unwrap();
+        remover
+            .execute("DELETE FROM generations WHERE server = 'S'", [])
+            .unwrap();
+        drop(remover);
+        release.send(()).unwrap();
+        let stats = cleanup.join().unwrap().unwrap();
+        assert_eq!(stats.batches, 0);
+        assert!(!stats.deferred_for_build);
+        assert!(
+            IndexDb::open(&path)
+                .unwrap()
+                .status_rows("S")
+                .unwrap()
+                .is_empty()
+        );
+        background_tasks.wait_for_cleanup_writer_gate_hook();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cleanup_first_build_waits_for_the_shared_writer_gate() {
         let directory = tempdir().unwrap();
@@ -6455,6 +6747,23 @@ mod tests {
         cleanup_release.send(()).unwrap();
         refresh.await.unwrap().unwrap();
         wait_for_state(&manager, "T", IndexState::Ready).await;
+    }
+
+    #[test]
+    fn build_reservation_hook_blocks_once_and_then_becomes_inert() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("build-reservation-hook.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        let (started, release) = manager.install_build_reservation_hook();
+        let waiter = Arc::clone(&manager);
+        let wait = std::thread::spawn(move || waiter.wait_for_build_reservation_hook());
+        started.recv().unwrap();
+        release.send(()).unwrap();
+        wait.join().unwrap();
+        manager.wait_for_build_reservation_hook();
     }
 
     #[tokio::test]
