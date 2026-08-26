@@ -1,13 +1,17 @@
 use crate::output::{self, OutputFormat};
 use opcda_bridge::{
     BrowseNode, BrowsePage, BrowsePageRequest, Capabilities, Client, CompatibilityFeature,
-    CompatibilityReport, FeatureCompatibilityStatus, IndexedSearchProgress, SearchEvent,
-    SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse, SearchIndexStatus,
-    SearchMatchMode, SearchRequest, parse_value,
+    CompatibilityReport, FeatureCompatibilityStatus, IndexForegroundDiagnostics,
+    IndexHealthDiagnostics, IndexHostDiagnostics, IndexInventoryLimits, IndexSchedulerDiagnostics,
+    IndexStorageDiagnostics, IndexedSearchProgress, SearchEvent, SearchIndexControlAction,
+    SearchIndexRequest, SearchIndexResponse, SearchIndexStatus, SearchMatchMode, SearchRequest,
+    parse_value,
 };
 use serde::Serialize;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::Write;
+use std::pin::Pin;
 use tabled::Tabled;
 use tabled::derive::display;
 
@@ -176,6 +180,8 @@ struct CapabilitiesRow {
     max_indexed_search_results: u32,
     #[tabled(rename = "Index State")]
     search_index_state: String,
+    #[tabled(rename = "Index Promoting")]
+    search_index_promoting: bool,
 }
 
 impl From<Capabilities> for CapabilitiesRow {
@@ -192,6 +198,7 @@ impl From<Capabilities> for CapabilitiesRow {
             indexed_search_protocol_version: value.indexed_search_protocol_version,
             max_indexed_search_results: value.max_indexed_search_results,
             search_index_state: value.search_index_state.to_string(),
+            search_index_promoting: value.search_index_promoting,
         }
     }
 }
@@ -569,7 +576,143 @@ impl From<IndexedSearchProgress> for IndexProgressOutput {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
+struct IndexLimitsOutput {
+    item_rate_per_second: u32,
+    batch_size: u32,
+    duty_cycle_percent: u32,
+}
+
+impl From<IndexInventoryLimits> for IndexLimitsOutput {
+    fn from(value: IndexInventoryLimits) -> Self {
+        Self {
+            item_rate_per_second: value.item_rate_per_second,
+            batch_size: value.batch_size,
+            duty_cycle_percent: value.duty_cycle_percent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct IndexForegroundOutput {
+    active_count: u64,
+    operations: u64,
+    errors: u64,
+    bad_quality: u64,
+    latency_p50_ms: Option<u64>,
+    latency_p95_ms: Option<u64>,
+    latency_max_ms: Option<u64>,
+    last_error: bool,
+    last_bad_quality: bool,
+}
+
+impl From<IndexForegroundDiagnostics> for IndexForegroundOutput {
+    fn from(value: IndexForegroundDiagnostics) -> Self {
+        Self {
+            active_count: value.active_count,
+            operations: value.operations,
+            errors: value.errors,
+            bad_quality: value.bad_quality,
+            latency_p50_ms: value.latency_p50_ms,
+            latency_p95_ms: value.latency_p95_ms,
+            latency_max_ms: value.latency_max_ms,
+            last_error: value.last_error,
+            last_bad_quality: value.last_bad_quality,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct IndexHostOutput {
+    cpu_percent: Option<f64>,
+    available_memory_percent: Option<f64>,
+    disk_active_percent: Option<f64>,
+    disk_queue: Option<f64>,
+    process_working_set_bytes: Option<u64>,
+    process_private_bytes: Option<u64>,
+    process_read_bytes_per_second: Option<u64>,
+    process_write_bytes_per_second: Option<u64>,
+    disk_free_bytes: Option<u64>,
+}
+
+impl From<IndexHostDiagnostics> for IndexHostOutput {
+    fn from(value: IndexHostDiagnostics) -> Self {
+        Self {
+            cpu_percent: value.cpu_percent,
+            available_memory_percent: value.available_memory_percent,
+            disk_active_percent: value.disk_active_percent,
+            disk_queue: value.disk_queue,
+            process_working_set_bytes: value.process_working_set_bytes,
+            process_private_bytes: value.process_private_bytes,
+            process_read_bytes_per_second: value.process_read_bytes_per_second,
+            process_write_bytes_per_second: value.process_write_bytes_per_second,
+            disk_free_bytes: value.disk_free_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct IndexStorageOutput {
+    main_bytes: u64,
+    wal_bytes: u64,
+    shm_bytes: u64,
+    free_bytes: Option<u64>,
+    last_commit_latency_ms: Option<u64>,
+}
+
+impl From<IndexStorageDiagnostics> for IndexStorageOutput {
+    fn from(value: IndexStorageDiagnostics) -> Self {
+        Self {
+            main_bytes: value.main_bytes,
+            wal_bytes: value.wal_bytes,
+            shm_bytes: value.shm_bytes,
+            free_bytes: value.free_bytes,
+            last_commit_latency_ms: value.last_commit_latency_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct IndexSchedulerOutput {
+    next_refresh_at: Option<String>,
+    last_attempt_at: Option<String>,
+    last_success_at: Option<String>,
+    last_success_duration_ms: Option<u64>,
+    retry_after: Option<String>,
+    consecutive_failures: u32,
+    circuit_open: bool,
+}
+
+impl From<IndexSchedulerDiagnostics> for IndexSchedulerOutput {
+    fn from(value: IndexSchedulerDiagnostics) -> Self {
+        Self {
+            next_refresh_at: value.next_refresh_at,
+            last_attempt_at: value.last_attempt_at,
+            last_success_at: value.last_success_at,
+            last_success_duration_ms: value.last_success_duration_ms,
+            retry_after: value.retry_after,
+            consecutive_failures: value.consecutive_failures,
+            circuit_open: value.circuit_open,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct IndexHealthOutput {
+    state: String,
+    sentinel_configured: bool,
+}
+
+impl From<IndexHealthDiagnostics> for IndexHealthOutput {
+    fn from(value: IndexHealthDiagnostics) -> Self {
+        Self {
+            state: value.state.to_string(),
+            sentinel_configured: value.sentinel_configured,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 struct IndexStatusOutput {
     server: String,
     state: String,
@@ -584,6 +727,17 @@ struct IndexStatusOutput {
     organization: String,
     source: String,
     progress: Option<IndexProgressOutput>,
+    effective_limits: Option<IndexLimitsOutput>,
+    controller_state: String,
+    pause_reason: Option<String>,
+    pause_reason_detail: Option<String>,
+    recovery_deadline: Option<String>,
+    foreground: IndexForegroundOutput,
+    host: IndexHostOutput,
+    storage: IndexStorageOutput,
+    scheduler: IndexSchedulerOutput,
+    health: IndexHealthOutput,
+    promoting: bool,
 }
 
 impl From<SearchIndexStatus> for IndexStatusOutput {
@@ -602,6 +756,17 @@ impl From<SearchIndexStatus> for IndexStatusOutput {
             organization: value.organization.to_string(),
             source: value.source.to_string(),
             progress: value.progress.map(Into::into),
+            effective_limits: value.effective_limits.map(Into::into),
+            controller_state: value.controller_state.to_string(),
+            pause_reason: value.pause_reason.map(|reason| reason.to_string()),
+            pause_reason_detail: value.pause_reason_detail,
+            recovery_deadline: value.recovery_deadline,
+            foreground: value.foreground.into(),
+            host: value.host.into(),
+            storage: value.storage.into(),
+            scheduler: value.scheduler.into(),
+            health: value.health.into(),
+            promoting: value.promoting,
         }
     }
 }
@@ -623,6 +788,7 @@ fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
     let mut rows = vec![
         ("Server", status.server.clone()),
         ("State", status.state.clone()),
+        ("Promoting", status.promoting.to_string()),
         ("Configured", status.configured.to_string()),
         ("Active generation", status.active_generation.to_string()),
         ("Entries", status.entry_count.to_string()),
@@ -630,6 +796,25 @@ fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
         ("Database bytes", status.database_bytes.to_string()),
         ("Organization", status.organization.clone()),
         ("Source", status.source.clone()),
+        ("Controller state", status.controller_state.clone()),
+        (
+            "Pause reason",
+            status.pause_reason.clone().unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "Pause detail",
+            status
+                .pause_reason_detail
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "Recovery deadline",
+            status
+                .recovery_deadline
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        ),
         (
             "Started",
             status.started_at.clone().unwrap_or_else(|| "-".into()),
@@ -643,6 +828,19 @@ fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
             status.last_error.clone().unwrap_or_else(|| "-".into()),
         ),
     ];
+    if let Some(limits) = &status.effective_limits {
+        rows.extend([
+            (
+                "Effective item rate/s",
+                limits.item_rate_per_second.to_string(),
+            ),
+            ("Effective batch size", limits.batch_size.to_string()),
+            (
+                "Effective duty cycle %",
+                limits.duty_cycle_percent.to_string(),
+            ),
+        ]);
+    }
     if let Some(progress) = &status.progress {
         rows.extend([
             ("Branches visited", progress.branches_visited.to_string()),
@@ -659,6 +857,171 @@ fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
             ),
         ]);
     }
+    rows.extend([
+        (
+            "Foreground active",
+            status.foreground.active_count.to_string(),
+        ),
+        (
+            "Foreground operations",
+            status.foreground.operations.to_string(),
+        ),
+        ("Foreground errors", status.foreground.errors.to_string()),
+        (
+            "Foreground bad quality",
+            status.foreground.bad_quality.to_string(),
+        ),
+        (
+            "Foreground p50 ms",
+            status
+                .foreground
+                .latency_p50_ms
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Foreground p95 ms",
+            status
+                .foreground
+                .latency_p95_ms
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Foreground max ms",
+            status
+                .foreground
+                .latency_max_ms
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        ("Health", status.health.state.clone()),
+        (
+            "Sentinel configured",
+            status.health.sentinel_configured.to_string(),
+        ),
+        (
+            "Host CPU %",
+            status
+                .host
+                .cpu_percent
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Available memory %",
+            status
+                .host
+                .available_memory_percent
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Disk active %",
+            status
+                .host
+                .disk_active_percent
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Disk queue",
+            status
+                .host
+                .disk_queue
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Process working set bytes",
+            status
+                .host
+                .process_working_set_bytes
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Process private bytes",
+            status
+                .host
+                .process_private_bytes
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Process read bytes/s",
+            status
+                .host
+                .process_read_bytes_per_second
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Process write bytes/s",
+            status
+                .host
+                .process_write_bytes_per_second
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Index free bytes",
+            status
+                .host
+                .disk_free_bytes
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        ("SQLite main bytes", status.storage.main_bytes.to_string()),
+        ("SQLite WAL bytes", status.storage.wal_bytes.to_string()),
+        ("SQLite SHM bytes", status.storage.shm_bytes.to_string()),
+        (
+            "SQLite free bytes",
+            status
+                .storage
+                .free_bytes
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "SQLite last commit ms",
+            status
+                .storage
+                .last_commit_latency_ms
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Next refresh",
+            status
+                .scheduler
+                .next_refresh_at
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "Last attempt",
+            status
+                .scheduler
+                .last_attempt_at
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "Last success",
+            status
+                .scheduler
+                .last_success_at
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "Last success duration ms",
+            status
+                .scheduler
+                .last_success_duration_ms
+                .map_or_else(|| "-".into(), |value| value.to_string()),
+        ),
+        (
+            "Retry after",
+            status
+                .scheduler
+                .retry_after
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        ),
+        (
+            "Consecutive failures",
+            status.scheduler.consecutive_failures.to_string(),
+        ),
+        ("Circuit open", status.scheduler.circuit_open.to_string()),
+    ]);
     rows.into_iter()
         .map(|(metric, value)| IndexStatusRow {
             metric: metric.into(),
@@ -679,10 +1042,51 @@ pub async fn cmd_index_status(
     host: String,
     server: String,
     format: OutputFormat,
+    watch_seconds: Option<u64>,
 ) -> anyhow::Result<()> {
     let mut client = Client::connect(&host).await?;
-    let status = client.search_index_status(server).await?;
-    println!("{}", render_index_status(status, format)?);
+    let Some(watch_seconds) = watch_seconds else {
+        let status = client.search_index_status(server).await?;
+        println!("{}", render_index_status(status, format)?);
+        return Ok(());
+    };
+    let ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    watch_index_status(&mut client, server, format, watch_seconds, ctrl_c).await
+}
+
+async fn watch_index_status(
+    client: &mut Client,
+    server: String,
+    format: OutputFormat,
+    watch_seconds: u64,
+    mut ctrl_c: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>,
+) -> anyhow::Result<()> {
+    loop {
+        let status = tokio::select! {
+            result = client.search_index_status(server.clone()) => result?,
+            result = &mut ctrl_c => {
+                result?;
+                break;
+            }
+        };
+        if format == OutputFormat::Table {
+            print!("\x1b[2J\x1b[H");
+            println!("{}", render_index_status(status, format)?);
+            std::io::stdout().flush()?;
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string(&IndexStatusOutput::from(status))?
+            );
+        }
+        tokio::select! {
+            result = &mut ctrl_c => {
+                result?;
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(watch_seconds.max(1))) => {}
+        }
+    }
     Ok(())
 }
 
@@ -885,8 +1289,9 @@ mod tests {
     use super::*;
     use crate::test_support::{MockBridgeService, start_mock_server};
     use opcda_bridge::{
-        BrowseNodeKind, BrowseSource, NamespaceOrganization, SearchIndexControlAction,
-        SearchIndexState,
+        BrowseNodeKind, BrowseSource, CompatibilityEvidence, CompatibilitySource,
+        CompatibilityStatus, FeatureCompatibility, NamespaceOrganization, ProtocolVersionRange,
+        SearchIndexControlAction, SearchIndexState,
     };
     use opcda_bridge_proto::bridge::search_event;
     use opcda_bridge_proto::bridge::{
@@ -932,6 +1337,7 @@ mod tests {
                 indexed_search_protocol_version: "1".into(),
                 max_indexed_search_results: 50,
                 search_index_state: ProtoSearchIndexState::Ready as i32,
+                search_index_promoting: false,
             },
             list_servers_response: ListServersResponse {
                 servers: vec!["S".into()],
@@ -1070,6 +1476,57 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("indexed-search"));
+    }
+
+    #[test]
+    fn compatibility_rendering_handles_empty_features_and_version_ranges() {
+        let empty = CompatibilityReport {
+            client_version: "client".into(),
+            library_version: "library".into(),
+            gateway_version: None,
+            source: CompatibilitySource::Unknown,
+            status: CompatibilityStatus::Unknown,
+            evidence: CompatibilityEvidence::Unverified,
+            features: Vec::new(),
+        };
+        let rendered = render_compatibility(&empty, OutputFormat::Table).unwrap();
+        assert!(rendered.contains("none"));
+        assert!(rendered.contains("gateway did not provide"));
+
+        let ranged = CompatibilityReport {
+            gateway_version: Some("gateway".into()),
+            source: CompatibilitySource::GatewayInfo,
+            status: CompatibilityStatus::Partial,
+            evidence: CompatibilityEvidence::ContractBoundaryTested,
+            features: vec![FeatureCompatibility {
+                feature: CompatibilityFeature::Namespace,
+                status: FeatureCompatibilityStatus::Incompatible,
+                client_versions: ProtocolVersionRange { min: 1, max: 2 },
+                gateway_versions: Some(ProtocolVersionRange { min: 3, max: 4 }),
+                negotiated_version: None,
+                reason: "ranges do not overlap".into(),
+            }],
+            ..empty
+        };
+        let rendered = render_compatibility(&ranged, OutputFormat::Table).unwrap();
+        assert!(rendered.contains("1-2"));
+        assert!(rendered.contains("3-4"));
+        assert!(rendered.contains("none"));
+
+        let exact = CompatibilityReport {
+            features: vec![FeatureCompatibility {
+                feature: CompatibilityFeature::Core,
+                status: FeatureCompatibilityStatus::Compatible,
+                client_versions: ProtocolVersionRange::exact(1),
+                gateway_versions: None,
+                negotiated_version: Some(1),
+                reason: "exact".into(),
+            }],
+            ..ranged
+        };
+        let rendered = render_compatibility(&exact, OutputFormat::Table).unwrap();
+        assert!(rendered.contains("unknown"));
+        assert!(rendered.contains('1'));
     }
 
     #[tokio::test]
@@ -1335,10 +1792,62 @@ mod tests {
             unique_item_count: 100,
             started_at: Some("start".into()),
             completed_at: Some("complete".into()),
-            last_error: None,
+            last_error: Some("warning".into()),
             database_bytes: 2048,
             organization: ProtoOrganization::Hierarchical as i32,
             source: ProtoBrowseSource::Da2 as i32,
+            effective_limits: Some(opcda_bridge_proto::bridge::IndexInventoryLimits {
+                item_rate_per_second: 100,
+                batch_size: 25,
+                duty_cycle_percent: 5,
+            }),
+            controller_state: opcda_bridge_proto::bridge::IndexControllerState::Throttled as i32,
+            pause_reason: Some(opcda_bridge_proto::bridge::IndexPauseReason::Database as i32),
+            recovery_deadline: Some("recover".into()),
+            pause_reason_detail: Some("commit latency".into()),
+            foreground: Some(opcda_bridge_proto::bridge::IndexForegroundDiagnostics {
+                active_count: 1,
+                operations: 2,
+                errors: 3,
+                bad_quality: 4,
+                latency_p50_ms: Some(5),
+                latency_p95_ms: Some(6),
+                latency_max_ms: Some(7),
+                last_error: true,
+                last_bad_quality: true,
+            }),
+            host: Some(opcda_bridge_proto::bridge::IndexHostDiagnostics {
+                cpu_percent: Some(8.0),
+                available_memory_percent: Some(9.0),
+                disk_active_percent: Some(10.0),
+                disk_queue: Some(11.0),
+                process_working_set_bytes: Some(12),
+                process_private_bytes: Some(13),
+                process_read_bytes_per_second: Some(14),
+                process_write_bytes_per_second: Some(15),
+                disk_free_bytes: Some(16),
+            }),
+            storage: Some(opcda_bridge_proto::bridge::IndexStorageDiagnostics {
+                main_bytes: 17,
+                wal_bytes: 18,
+                shm_bytes: 19,
+                free_bytes: Some(20),
+                last_commit_latency_ms: Some(21),
+            }),
+            scheduler: Some(opcda_bridge_proto::bridge::IndexSchedulerDiagnostics {
+                next_refresh_at: Some("next".into()),
+                last_attempt_at: Some("attempt".into()),
+                last_success_at: Some("success".into()),
+                last_success_duration_ms: Some(22),
+                retry_after: Some("retry".into()),
+                consecutive_failures: 23,
+                circuit_open: true,
+            }),
+            health: Some(opcda_bridge_proto::bridge::IndexHealthDiagnostics {
+                state: opcda_bridge_proto::bridge::IndexHealthState::Healthy as i32,
+                sentinel_configured: true,
+            }),
+            promoting: true,
             progress: Some(IndexedSearchProgress {
                 branches_visited: 4,
                 entries_seen: 5,
@@ -1375,7 +1884,7 @@ mod tests {
         let search_requests = Arc::clone(&service.search_index_requests);
         let host = start_mock_server(service).await;
 
-        cmd_index_status(host.clone(), "S".into(), OutputFormat::Table)
+        cmd_index_status(host.clone(), "S".into(), OutputFormat::Table, None)
             .await
             .unwrap();
         cmd_index_refresh(host.clone(), "S".into(), true, OutputFormat::Json)
@@ -1390,12 +1899,22 @@ mod tests {
         .await
         .unwrap();
         cmd_index_search(
-            host,
+            host.clone(),
             "S".into(),
             "PV1".into(),
             SearchMatchMode::Contains,
             25,
             OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        cmd_index_search(
+            host,
+            "S".into(),
+            "PV1".into(),
+            SearchMatchMode::Contains,
+            25,
+            OutputFormat::Table,
         )
         .await
         .unwrap();
@@ -1409,6 +1928,77 @@ mod tests {
         let search_requests = search_requests.lock().unwrap();
         assert_eq!(search_requests[0].query, "PV1");
         assert_eq!(search_requests[0].max_results, 25);
+    }
+
+    #[test]
+    fn indexed_status_rendering_includes_diagnostics_and_failure_labels() {
+        let status = opcda_bridge::SearchIndexStatus::try_from(proto_index_status(
+            ProtoSearchIndexState::Ready,
+        ))
+        .unwrap();
+        let table = render_index_status(status.clone(), OutputFormat::Table).unwrap();
+        for value in [
+            "Effective item rate/s",
+            "Foreground p95 ms",
+            "Host CPU %",
+            "SQLite WAL bytes",
+            "Next refresh",
+            "Health",
+            "warning",
+        ] {
+            assert!(table.contains(value), "missing {value} in {table}");
+        }
+        let json = render_index_status(status, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["effective_limits"]["batch_size"], 25);
+        assert_eq!(value["foreground"]["latency_p95_ms"], 6);
+        assert_eq!(value["host"]["disk_free_bytes"], 16);
+        assert_eq!(value["storage"]["last_commit_latency_ms"], 21);
+        assert_eq!(value["scheduler"]["consecutive_failures"], 23);
+        assert_eq!(value["health"]["state"], "healthy");
+        assert_eq!(value["promoting"], true);
+
+        let mut failed = proto_index_status(ProtoSearchIndexState::Failed);
+        failed.last_error = Some("failure".into());
+        let table = render_index_status(failed.try_into().unwrap(), OutputFormat::Table).unwrap();
+        assert!(table.contains("Last error"));
+        assert!(table.contains("failure"));
+    }
+
+    #[tokio::test]
+    async fn index_status_watch_renders_and_stops_on_ctrl_c() {
+        let service = MockBridgeService {
+            search_index_status_response: proto_index_status(ProtoSearchIndexState::Ready),
+            ..Default::default()
+        };
+        let requests = Arc::clone(&service.search_index_status_requests);
+        let host = start_mock_server(service).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        let ctrl_c: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(())
+        });
+        watch_index_status(&mut client, "S".into(), OutputFormat::Table, 60, ctrl_c)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        let ctrl_c: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(())
+        });
+        watch_index_status(&mut client, "S".into(), OutputFormat::Json, 60, ctrl_c)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        let host = start_mock_server(MockBridgeService::default()).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        let ctrl_c: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> =
+            Box::pin(async { Ok(()) });
+        watch_index_status(&mut client, "S".into(), OutputFormat::Json, 60, ctrl_c)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1532,6 +2122,17 @@ mod tests {
             organization: NamespaceOrganization::Flat,
             source: BrowseSource::Flat,
             progress: None,
+            effective_limits: None,
+            controller_state: opcda_bridge::IndexControllerState::Unspecified,
+            pause_reason: None,
+            pause_reason_detail: None,
+            recovery_deadline: None,
+            foreground: Default::default(),
+            host: Default::default(),
+            storage: Default::default(),
+            scheduler: Default::default(),
+            health: Default::default(),
+            promoting: false,
         };
         let response = opcda_bridge::SearchIndexResponse {
             matches: vec![opcda_bridge::IndexedSearchMatch {
@@ -1578,6 +2179,7 @@ mod tests {
             organization: "hierarchical".into(),
             source: "da2".into(),
             progress: None,
+            ..Default::default()
         };
 
         let table = output::render(index_status_rows(&status), OutputFormat::Table).unwrap();

@@ -38,6 +38,9 @@ pub(crate) struct MockOpcClient {
     pub(crate) inventory_start_count: Arc<AtomicUsize>,
     pub(crate) inventory_paused: Arc<AtomicBool>,
     pub(crate) inventory_cancelled: Arc<AtomicBool>,
+    pub(crate) inventory_pacing_ns: Arc<AtomicUsize>,
+    pub(crate) inventory_item_rate: Arc<AtomicUsize>,
+    pub(crate) inventory_batch_size: Arc<AtomicUsize>,
 }
 
 impl Default for MockOpcClient {
@@ -98,6 +101,9 @@ impl Default for MockOpcClient {
             inventory_start_count: Arc::new(AtomicUsize::new(0)),
             inventory_paused: Arc::new(AtomicBool::new(false)),
             inventory_cancelled: Arc::new(AtomicBool::new(false)),
+            inventory_pacing_ns: Arc::new(AtomicUsize::new(0)),
+            inventory_item_rate: Arc::new(AtomicUsize::new(0)),
+            inventory_batch_size: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -177,6 +183,9 @@ impl OpcClient for MockOpcClient {
             control: Arc::new(MockInventoryControl {
                 paused: Arc::clone(&self.inventory_paused),
                 cancelled: Arc::clone(&self.inventory_cancelled),
+                pacing_ns: Arc::clone(&self.inventory_pacing_ns),
+                item_rate: Arc::clone(&self.inventory_item_rate),
+                batch_size: Arc::clone(&self.inventory_batch_size),
             }),
         })
     }
@@ -210,6 +219,9 @@ impl OpcClient for MockOpcClient {
 struct MockInventoryControl {
     paused: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    pacing_ns: Arc<AtomicUsize>,
+    item_rate: Arc<AtomicUsize>,
+    batch_size: Arc<AtomicUsize>,
 }
 
 impl InventoryControl for MockInventoryControl {
@@ -223,6 +235,22 @@ impl InventoryControl for MockInventoryControl {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn set_pacing(&self, pacing: crate::opc::InventoryPacing) -> anyhow::Result<()> {
+        self.pacing_ns.store(
+            pacing.min_interval.as_nanos().min(usize::MAX as u128) as usize,
+            Ordering::Release,
+        );
+        self.item_rate.store(
+            pacing.item_rate_per_second.unwrap_or(0) as usize,
+            Ordering::Release,
+        );
+        if let Some(batch_size) = pacing.batch_size {
+            self.batch_size
+                .store(batch_size as usize, Ordering::Release);
+        }
+        Ok(())
     }
 
     fn is_cancelled(&self) -> bool {
@@ -259,5 +287,19 @@ async fn test_mock_inventory_stream_and_control() {
     assert!(!mock.inventory_paused.load(Ordering::Acquire));
     handle.control.cancel();
     assert!(handle.control.is_cancelled());
+    handle
+        .control
+        .set_pacing(crate::opc::InventoryPacing {
+            min_interval: Duration::from_millis(25),
+            item_rate_per_second: Some(40),
+            batch_size: Some(7),
+        })
+        .unwrap();
+    assert_eq!(
+        mock.inventory_pacing_ns.load(Ordering::Acquire),
+        Duration::from_millis(25).as_nanos() as usize
+    );
+    assert_eq!(mock.inventory_item_rate.load(Ordering::Acquire), 40);
+    assert_eq!(mock.inventory_batch_size.load(Ordering::Acquire), 7);
     assert!(handle.stream.next().await.is_some());
 }

@@ -62,6 +62,7 @@ For interactive discovery, query the gateway-owned persistent index:
 
 ```sh
 opcda-bridge-client index-status --server Kepware.KepServerEX.V5
+opcda-bridge-client index-status --server Kepware.KepServerEX.V5 --watch 5
 opcda-bridge-client index-search Device1 --server Kepware.KepServerEX.V5
 opcda-bridge-client index-refresh --server Kepware.KepServerEX.V5
 opcda-bridge-client index-pause --server Kepware.KepServerEX.V5

@@ -382,6 +382,7 @@ mod tests {
                 indexed_search_protocol_version: "1".into(),
                 max_indexed_search_results: 50,
                 search_index_state: ProtoSearchIndexState::Ready as i32,
+                search_index_promoting: true,
             },
             ..Default::default()
         };
@@ -398,6 +399,7 @@ mod tests {
         assert_eq!(capabilities.indexed_search_protocol_version, "1");
         assert_eq!(capabilities.max_indexed_search_results, 50);
         assert_eq!(capabilities.search_index_state, SearchIndexState::Ready);
+        assert!(capabilities.search_index_promoting);
         assert_eq!(requests.lock().unwrap()[0].server, "S");
     }
 
@@ -780,6 +782,7 @@ mod tests {
                 items_per_second: 6.0,
                 estimated_remaining_ms: Some(7),
             }),
+            ..Default::default()
         }
     }
 

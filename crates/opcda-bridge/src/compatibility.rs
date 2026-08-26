@@ -522,6 +522,7 @@ mod tests {
             indexed_search_protocol_version: if indexed { "1" } else { "" }.into(),
             max_indexed_search_results: 50,
             search_index_state: crate::SearchIndexState::Ready,
+            search_index_promoting: false,
         }
     }
 

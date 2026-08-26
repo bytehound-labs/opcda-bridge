@@ -17,10 +17,13 @@ definitions, cross-platform CLI, and Windows gateway as separate crates. Each cr
 independently, and release-plz publishes only packages with releasable changes after the generated
 metadata passes the required release integrity check.
 
-The 0.4 API line introduces indexed namespace search and extends the gRPC capabilities contract.
+The indexed API line introduces indexed namespace search and extends the gRPC capabilities contract.
 The additive wire protocol remains compatible with older gateways and clients. Indexed-search
 availability is determined by the advertised protocol and capability versions, not by matching
 crate or binary version numbers.
+Public Rust struct additions in the pre-1.0 API are source-breaking for downstream struct
+literals, so releases containing those additions use the next minor API version rather than a
+patch version. The protobuf wire additions remain backward-compatible.
 
 ### Versions and compatibility
 
@@ -199,9 +202,11 @@ config file — see [Configuration](#configuration) below.
   warning while remaining `ready`; clients display that diagnostic as a warning rather than
   treating the active generation as failed. A no-match response is authoritative only for a
   complete index.
-  Active generations remain durable across restarts. Activation is an atomic metadata transition,
-  while superseded and abandoned data is reclaimed in bounded background batches, so indexing
-  maintenance does not interrupt indexed search or status requests. Transient cleanup failures
+  Active generations remain durable across restarts. Activation is an atomic metadata transition;
+  promotion status uses a read-only SQLite connection and filesystem diagnostics, so status remains
+  responsive even while the writer is in the promotion critical section. Superseded and abandoned
+  data is reclaimed in bounded background batches, so indexing maintenance does not interrupt indexed
+  search requests. Transient cleanup failures
   are retried with bounded backoff. A refresh interrupted by restart is superseded when a complete
   active generation remains available, so the durable snapshot stays ready while cleanup runs;
   interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
@@ -210,9 +215,15 @@ config file — see [Configuration](#configuration) below.
   is quarantined rather than serving silently incomplete substring results.
   Indexed queries use a dedicated read-only SQLite connection and a bounded in-memory ranking
   pass for full-text candidates, keeping broad searches out of the foreground database mutex.
+  During promotion, searches reuse the active generation reported by promotion-safe status rather
+  than reacquiring the writable database mutex. Cancellation requests received while inventory
+  startup is still acquiring its control handle are retained and applied as soon as that handle
+  becomes available.
   Matching is case-insensitive with exact/prefix/contains ranking, and responses report
   `has_more` when the requested result window is exceeded. This preserves status, discovery,
   reads, writes, and lazy browse responsiveness during search.
+  If the native client rejects an initial or adaptive pacing update, the active build fails
+  visibly and the prior complete generation is preserved; pacing errors are not ignored.
   DA3 root ItemIDs and unused filters are marshalled as required non-null empty strings. If the
   first DA3 root browse still returns `RPC_X_NULL_REF_POINTER` or `E_NOTIMPL`, a server that also
   supports DA2 continues through DA2 with an explicit compatibility warning. The persisted
@@ -342,38 +353,56 @@ in `index.servers`, and automatic indexing never scans any other server. A valid
 generation remains available while a refresh runs, and failed or cancelled refreshes never replace
 it.
 
-| Index setting             | Config key                            | Default                 |
-| ------------------------- | ------------------------------------- | ----------------------- |
-| Database path             | `index.database_path`                 | Platform data directory |
-| Automatic indexing        | `index.enabled`                       | `true`                  |
-| Indexed server allow-list | `index.servers`                       | Empty                   |
-| Refresh interval          | `index.refresh_interval_seconds`      | `86400`                 |
-| Native batch size         | `index.batch_size`                    | `100`                   |
-| Average item rate         | `index.item_rate_limit`               | `250` items/second      |
-| Burst allowance           | `index.burst_size`                    | `100` items             |
-| Active duty cycle         | `index.duty_cycle_percent`            | `20`%                   |
-| Foreground quiet period   | `index.quiet_period_seconds`          | `2` seconds             |
-| Health probe interval     | `index.health_probe_interval_seconds` | `30` seconds            |
-| Health latency threshold  | `index.health_latency_threshold_ms`   | `500` ms                |
-| Maintenance windows       | `index.maintenance_windows`           | Empty                   |
-| Concurrent builds         | `index.concurrency`                   | `1`                     |
-| Query-cache capacity      | `index.query_cache_capacity`          | `256` entries           |
-| Start paused              | `index.paused`                        | `false`                 |
-| Maximum indexed results   | `index.max_results`                   | `50`                    |
+| Index setting              | Config key                            | Default                        |
+| -------------------------- | ------------------------------------- | ------------------------------ |
+| Database path              | `index.database_path`                 | Platform data directory        |
+| Automatic indexing         | `index.enabled`                       | `true`                         |
+| Indexed server allow-list  | `index.servers`                       | Empty                          |
+| Refresh interval           | `index.refresh_interval_seconds`      | `604800` (7 days)              |
+| First automatic build      | `index.initial_build_policy`          | `maintenance_window`           |
+| Startup grace period       | `index.startup_grace_period_seconds`  | `30` seconds                   |
+| Schedule jitter            | `index.schedule_jitter_seconds`       | `21600` seconds                |
+| Inventory slice batch      | `index.inventory_batch_size`          | `100` entries (max `1000`)     |
+| SQLite commit batch        | `index.commit_batch_size`             | `100` entries                  |
+| SQLite commit interval     | `index.commit_interval_ms`            | `1000` ms                      |
+| Legacy batch size fallback | `index.batch_size`                    | `100` (max `1000`)             |
+| Average item rate          | `index.item_rate_limit`               | `250` items/second             |
+| Burst allowance            | `index.burst_size`                    | `100` items                    |
+| Active duty cycle          | `index.duty_cycle_percent`            | `20`%                          |
+| Adaptive pacing            | `index.adaptive`                      | `true`                         |
+| Adaptive canary profile    | `index.canary_*`                      | `50` items/s, batch `25`, `5`% |
+| Adaptive floor profile     | `index.minimum_*`                     | `10` items/s, batch `1`, `1`%  |
+| Foreground quiet period    | `index.quiet_period_seconds`          | `2` seconds                    |
+| Health probe interval      | `index.health_probe_interval_seconds` | `30` seconds                   |
+| Health latency threshold   | `index.health_latency_threshold_ms`   | `500` ms                       |
+| OPC operation timeout      | `index.operation_timeout_seconds`     | `30` seconds                   |
+| Sentinel health tag        | `index.sentinel_tag`                  | Unavailable when omitted       |
+| Minimum free space         | `index.minimum_free_space_bytes`      | `100 MiB`                      |
+| Storage headroom           | `index.storage_headroom_bytes`        | `10 MiB`                       |
+| Maintenance windows        | `index.maintenance_windows`           | Empty                          |
+| Concurrent builds          | `index.concurrency`                   | `1`                            |
+| Query-cache capacity       | `index.query_cache_capacity`          | `256` entries                  |
+| Start paused               | `index.paused`                        | `false`                        |
+| Maximum indexed results    | `index.max_results`                   | `50`                           |
 
 The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (falling back to
 `$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS and
 `%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows. Maintenance-window entries are local
 24-hour ranges such as `22:00-06:00`; when configured, indexing is deferred outside those ranges.
+Adaptive indexing uses recent foreground OPC errors and bad-quality reads as health signals in
+addition to latency and host/storage guardrails.
+The status reports whether a sentinel tag is configured separately from whether its latest probe
+is healthy or unavailable.
 
 Run only one gateway process with a given index database path. A gateway automatically loads
 `opcda-bridge-gateway.toml` next to its executable, so launching a second copy from the same
 directory can otherwise start a second inventory against the same SQLite file. When multiple
 gateway instances are intentional, give each instance an explicit, different
 `index.database_path` and configure indexing on only the instance that should build that
-server's index. An active build also creates a sibling `.build.lock` file; it is removed when
-the build exits cleanly. If a process was terminated forcibly, inspect the lock contents and
-remove the stale lock only after confirming that no gateway is still using that database.
+server's index. Each server's build uses a persistent sibling `.build.lock` file. The operating
+system's advisory lock, not the file's existence, determines whether a build is active; metadata
+from a forcibly terminated process is overwritten by the next successful acquisition. Do not
+delete the lock path while a gateway may still be running.
 
 ### Client
 

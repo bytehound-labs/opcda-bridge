@@ -21,6 +21,7 @@ opcda-bridge-proto.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 chrono.workspace = true
+fs2.workspace = true
 tokio = { workspace = true, features = [
   "macros",
   "rt-multi-thread",
@@ -43,6 +44,7 @@ rusqlite.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 opc-da-client.workspace = true
 windows-service.workspace = true
+windows-sys.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -78,8 +78,10 @@ pub use opcda_bridge_proto::DEFAULT_BRIDGE_PORT;
 pub use types::{
     BrowseBreadcrumb, BrowseNode, BrowseNodeKind, BrowsePage, BrowsePageRequest, BrowseSource,
     Capabilities, DEFAULT_INDEX_SEARCH_MAX_RESULTS, DEFAULT_PAGE_SIZE, DEFAULT_SEARCH_MAX_RESULTS,
-    IndexedSearchMatch, IndexedSearchProgress, NamespaceOrganization, SearchCompleted, SearchEvent,
-    SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse, SearchIndexState,
-    SearchIndexStatus, SearchMatch, SearchMatchMode, SearchProgress, SearchRequest, TagValue,
-    Value, WriteResult, parse_value,
+    IndexControllerState, IndexForegroundDiagnostics, IndexHealthDiagnostics, IndexHealthState,
+    IndexHostDiagnostics, IndexInventoryLimits, IndexPauseReason, IndexSchedulerDiagnostics,
+    IndexStorageDiagnostics, IndexedSearchMatch, IndexedSearchProgress, NamespaceOrganization,
+    SearchCompleted, SearchEvent, SearchIndexControlAction, SearchIndexRequest,
+    SearchIndexResponse, SearchIndexState, SearchIndexStatus, SearchMatch, SearchMatchMode,
+    SearchProgress, SearchRequest, TagValue, Value, WriteResult, parse_value,
 };

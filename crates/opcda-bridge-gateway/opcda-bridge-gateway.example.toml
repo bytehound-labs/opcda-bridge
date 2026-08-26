@@ -45,7 +45,8 @@ rotation = "daily"
 #                (falls back to $HOME/.local/share/opcda-bridge/index.sqlite3)
 #   Windows:     %PROGRAMDATA%\opcda-bridge\index.sqlite3
 # Use a different path for every gateway process that may run on this host.
-# Each active build also creates a sibling ".build.lock" file.
+# Each server uses a persistent sibling ".build.lock" file while coordinating builds.
+# File existence alone does not indicate an active build; the OS advisory lock does.
 # database_path = "C:\\ProgramData\\opcda-bridge\\index.sqlite3"
 
 # Only these OPC DA server ProgIDs are eligible for automatic indexing.
@@ -57,8 +58,26 @@ servers = ["Kepware.KepServerEX.V5"]
 # scheduled refreshes without removing the server allow-list.
 enabled = true
 
-# A successful generation is refreshed once per day by default.
-refresh_interval_seconds = 86400
+# A successful generation is refreshed once per week by default.
+refresh_interval_seconds = 604800
+
+# The first automatic generation starts only inside a configured maintenance
+# window. Without a window, use the manual refresh operation. Set this to
+# "immediate" only when an automatic first crawl is explicitly acceptable.
+initial_build_policy = "maintenance_window"
+
+# Let the gateway become responsive before automatic indexing starts.
+startup_grace_period_seconds = 30
+
+# Add a deterministic per-server delay to scheduled refreshes so multiple
+# targets do not all begin at the same instant.
+schedule_jitter_seconds = 21600
+
+# Native inventory slices and SQLite commits are independently bounded. Native
+# slices must not exceed the OPC DA client's 1,000-entry limit.
+inventory_batch_size = 100
+commit_batch_size = 100
+commit_interval_ms = 1000
 
 # Maximum native inventory entries requested per bounded operation.
 batch_size = 100
@@ -71,12 +90,42 @@ burst_size = 100
 # operations. Lower values reduce OPC server load.
 duty_cycle_percent = 20
 
+# Adaptive AIMD control is enabled by default. It starts each build at a
+# conservative canary profile and ramps toward the limits above only while
+# foreground and host health remain good.
+adaptive = true
+minimum_item_rate = 10
+minimum_batch_size = 1
+minimum_duty_cycle_percent = 1
+canary_item_rate = 50
+canary_batch_size = 25
+canary_duty_cycle_percent = 5
+adaptive_healthy_window_seconds = 30
+adaptive_recovery_delay_seconds = 30
+adaptive_max_recovery_delay_seconds = 300
+
+# Optional tag read during health probes. Omit to report sentinel health as
+# unavailable without changing the existing capability probe.
+# sentinel_tag = "Channel.Device.Health"
+sentinel_probe_interval_seconds = 30
+
+# Refuse a build when the database volume lacks this free-space headroom.
+minimum_free_space_bytes = 104857600
+storage_headroom_bytes = 10485760
+
+# Persist failures across restarts and open a circuit after repeated failures.
+circuit_failure_threshold = 3
+circuit_open_seconds = 300
+
 # Keep indexing paused for this many seconds after foreground traffic ends.
 quiet_period_seconds = 2
 
 # Health-probe cadence and latency threshold used to defer inventory work.
 health_probe_interval_seconds = 30
 health_latency_threshold_ms = 500
+# Bound each pre-build and health OPC operation so one unresponsive server
+# cannot hold the scheduler indefinitely.
+operation_timeout_seconds = 30
 
 # Optional local-time windows in which indexing is permitted. Entries use
 # 24-hour ranges such as "22:00-06:00"; an empty list permits indexing at any time.

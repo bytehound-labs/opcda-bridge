@@ -2,6 +2,8 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::opc::MAX_NATIVE_INVENTORY_BATCH_SIZE;
+
 /// Windows service management subcommands. Give flags such as `--port` or
 /// `--log-dir` *before* the subcommand (e.g. `--log-dir C:\logs install`) —
 /// they are only meaningful on `install`, where they're baked into the
@@ -98,13 +100,47 @@ pub struct IndexConfig {
     /// Set false to disable automatic indexing while retaining manual APIs.
     pub enabled: Option<bool>,
     pub refresh_interval_seconds: Option<u64>,
+    /// Policy for creating the first generation when no complete index exists.
+    #[serde(default)]
+    pub initial_build_policy: Option<InitialBuildPolicy>,
+    /// Delay after gateway startup before automatic indexing is considered.
+    pub startup_grace_period_seconds: Option<u64>,
+    /// Deterministic per-server delay added to scheduled refreshes.
+    pub schedule_jitter_seconds: Option<u64>,
+    /// Maximum entries requested from one native inventory slice.
+    pub inventory_batch_size: Option<u32>,
+    /// Maximum entries committed to SQLite in one transaction.
+    pub commit_batch_size: Option<u32>,
+    /// Maximum time pending entries may wait before an SQLite commit.
+    pub commit_interval_ms: Option<u64>,
     pub batch_size: Option<u32>,
     pub item_rate_limit: Option<u32>,
     pub burst_size: Option<u32>,
     pub duty_cycle_percent: Option<u8>,
+    /// Enable adaptive AIMD control for inventory pacing.
+    pub adaptive: Option<bool>,
+    /// Lower bound used after a health/resource backoff.
+    pub minimum_item_rate: Option<u32>,
+    pub minimum_batch_size: Option<u32>,
+    pub minimum_duty_cycle_percent: Option<u8>,
+    /// Conservative starting profile for each inventory build.
+    pub canary_item_rate: Option<u32>,
+    pub canary_batch_size: Option<u32>,
+    pub canary_duty_cycle_percent: Option<u8>,
+    pub adaptive_healthy_window_seconds: Option<u64>,
+    pub adaptive_recovery_delay_seconds: Option<u64>,
+    pub adaptive_max_recovery_delay_seconds: Option<u64>,
+    pub sentinel_tag: Option<String>,
+    pub sentinel_probe_interval_seconds: Option<u64>,
+    pub minimum_free_space_bytes: Option<u64>,
+    pub storage_headroom_bytes: Option<u64>,
+    pub circuit_failure_threshold: Option<u32>,
+    pub circuit_open_seconds: Option<u64>,
     pub quiet_period_seconds: Option<u64>,
     pub health_probe_interval_seconds: Option<u64>,
     pub health_latency_threshold_ms: Option<u64>,
+    /// Maximum time allowed for one pre-build or health OPC operation.
+    pub operation_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub maintenance_windows: Vec<String>,
     pub concurrency: Option<u32>,
@@ -120,13 +156,36 @@ pub struct ResolvedIndexConfig {
     pub servers: Vec<String>,
     pub enabled: bool,
     pub refresh_interval_seconds: u64,
+    pub initial_build_policy: InitialBuildPolicy,
+    pub startup_grace_period_seconds: u64,
+    pub schedule_jitter_seconds: u64,
+    pub inventory_batch_size: u32,
+    pub commit_batch_size: u32,
+    pub commit_interval_ms: u64,
     pub batch_size: u32,
     pub item_rate_limit: u32,
     pub burst_size: u32,
     pub duty_cycle_percent: u8,
+    pub adaptive: bool,
+    pub minimum_item_rate: u32,
+    pub minimum_batch_size: u32,
+    pub minimum_duty_cycle_percent: u8,
+    pub canary_item_rate: u32,
+    pub canary_batch_size: u32,
+    pub canary_duty_cycle_percent: u8,
+    pub adaptive_healthy_window_seconds: u64,
+    pub adaptive_recovery_delay_seconds: u64,
+    pub adaptive_max_recovery_delay_seconds: u64,
+    pub sentinel_tag: Option<String>,
+    pub sentinel_probe_interval_seconds: u64,
+    pub minimum_free_space_bytes: u64,
+    pub storage_headroom_bytes: u64,
+    pub circuit_failure_threshold: u32,
+    pub circuit_open_seconds: u64,
     pub quiet_period_seconds: u64,
     pub health_probe_interval_seconds: u64,
     pub health_latency_threshold_ms: u64,
+    pub operation_timeout_seconds: u64,
     pub maintenance_windows: Vec<String>,
     pub concurrency: u32,
     pub query_cache_capacity: usize,
@@ -134,17 +193,52 @@ pub struct ResolvedIndexConfig {
     pub max_results: u32,
 }
 
-pub const DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS: u64 = 86_400;
+pub const DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS: u64 = 604_800;
+pub const DEFAULT_INDEX_STARTUP_GRACE_PERIOD_SECONDS: u64 = 30;
+pub const DEFAULT_INDEX_SCHEDULE_JITTER_SECONDS: u64 = 21_600;
+pub const DEFAULT_INDEX_INVENTORY_BATCH_SIZE: u32 = 100;
+pub const DEFAULT_INDEX_COMMIT_BATCH_SIZE: u32 = 100;
+pub const DEFAULT_INDEX_COMMIT_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_INDEX_BATCH_SIZE: u32 = 100;
 pub const DEFAULT_INDEX_ITEM_RATE: u32 = 250;
 pub const DEFAULT_INDEX_BURST_SIZE: u32 = 100;
 pub const DEFAULT_INDEX_DUTY_CYCLE_PERCENT: u8 = 20;
+pub const DEFAULT_INDEX_ADAPTIVE: bool = true;
+pub const DEFAULT_INDEX_MINIMUM_ITEM_RATE: u32 = 10;
+pub const DEFAULT_INDEX_MINIMUM_BATCH_SIZE: u32 = 1;
+pub const DEFAULT_INDEX_MINIMUM_DUTY_CYCLE_PERCENT: u8 = 1;
+pub const DEFAULT_INDEX_CANARY_ITEM_RATE: u32 = 50;
+pub const DEFAULT_INDEX_CANARY_BATCH_SIZE: u32 = 25;
+pub const DEFAULT_INDEX_CANARY_DUTY_CYCLE_PERCENT: u8 = 5;
+pub const DEFAULT_INDEX_ADAPTIVE_HEALTHY_WINDOW_SECONDS: u64 = 30;
+pub const DEFAULT_INDEX_ADAPTIVE_RECOVERY_DELAY_SECONDS: u64 = 30;
+pub const DEFAULT_INDEX_ADAPTIVE_MAX_RECOVERY_DELAY_SECONDS: u64 = 300;
+pub const DEFAULT_INDEX_SENTINEL_PROBE_INTERVAL_SECONDS: u64 = 30;
+pub const DEFAULT_INDEX_MINIMUM_FREE_SPACE_BYTES: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_INDEX_STORAGE_HEADROOM_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_INDEX_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+pub const DEFAULT_INDEX_CIRCUIT_OPEN_SECONDS: u64 = 300;
 pub const DEFAULT_INDEX_QUIET_PERIOD_SECONDS: u64 = 2;
 pub const DEFAULT_INDEX_HEALTH_PROBE_INTERVAL_SECONDS: u64 = 30;
 pub const DEFAULT_INDEX_HEALTH_LATENCY_THRESHOLD_MS: u64 = 500;
+pub const DEFAULT_INDEX_OPERATION_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_INDEX_CONCURRENCY: u32 = 1;
 pub const DEFAULT_INDEX_QUERY_CACHE_CAPACITY: usize = 256;
 pub const DEFAULT_INDEX_MAX_RESULTS: u32 = 50;
+
+/// Controls whether the first automatic generation may start without a
+/// maintenance window.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialBuildPolicy {
+    /// Start automatically only while a configured maintenance window is open.
+    #[default]
+    MaintenanceWindow,
+    /// Start automatically after startup grace, even without a window.
+    Immediate,
+    /// Never start the first generation automatically.
+    Manual,
+}
 
 /// Return the platform data path used for the gateway-owned index.
 pub fn index_path_from(
@@ -190,13 +284,93 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
         refresh_interval_seconds: config
             .refresh_interval_seconds
             .unwrap_or(DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS),
-        batch_size: config.batch_size.unwrap_or(DEFAULT_INDEX_BATCH_SIZE).max(1),
+        initial_build_policy: config.initial_build_policy.unwrap_or_default(),
+        startup_grace_period_seconds: config
+            .startup_grace_period_seconds
+            .unwrap_or(DEFAULT_INDEX_STARTUP_GRACE_PERIOD_SECONDS),
+        schedule_jitter_seconds: config
+            .schedule_jitter_seconds
+            .unwrap_or(DEFAULT_INDEX_SCHEDULE_JITTER_SECONDS),
+        inventory_batch_size: config
+            .inventory_batch_size
+            .or(config.batch_size)
+            .unwrap_or(DEFAULT_INDEX_INVENTORY_BATCH_SIZE)
+            .clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE),
+        commit_batch_size: config
+            .commit_batch_size
+            .or(config.batch_size)
+            .unwrap_or(DEFAULT_INDEX_COMMIT_BATCH_SIZE)
+            .max(1),
+        commit_interval_ms: config
+            .commit_interval_ms
+            .unwrap_or(DEFAULT_INDEX_COMMIT_INTERVAL_MS)
+            .max(1),
+        batch_size: config
+            .batch_size
+            .unwrap_or(DEFAULT_INDEX_BATCH_SIZE)
+            .clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE),
         item_rate_limit: config.item_rate_limit.unwrap_or(DEFAULT_INDEX_ITEM_RATE),
         burst_size: config.burst_size.unwrap_or(DEFAULT_INDEX_BURST_SIZE).max(1),
         duty_cycle_percent: config
             .duty_cycle_percent
             .unwrap_or(DEFAULT_INDEX_DUTY_CYCLE_PERCENT)
             .clamp(1, 100),
+        adaptive: config.adaptive.unwrap_or(DEFAULT_INDEX_ADAPTIVE),
+        minimum_item_rate: config
+            .minimum_item_rate
+            .unwrap_or(DEFAULT_INDEX_MINIMUM_ITEM_RATE)
+            .max(1),
+        minimum_batch_size: config
+            .minimum_batch_size
+            .unwrap_or(DEFAULT_INDEX_MINIMUM_BATCH_SIZE)
+            .clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE),
+        minimum_duty_cycle_percent: config
+            .minimum_duty_cycle_percent
+            .unwrap_or(DEFAULT_INDEX_MINIMUM_DUTY_CYCLE_PERCENT)
+            .clamp(1, 100),
+        canary_item_rate: config
+            .canary_item_rate
+            .unwrap_or(DEFAULT_INDEX_CANARY_ITEM_RATE)
+            .max(1),
+        canary_batch_size: config
+            .canary_batch_size
+            .unwrap_or(DEFAULT_INDEX_CANARY_BATCH_SIZE)
+            .clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE),
+        canary_duty_cycle_percent: config
+            .canary_duty_cycle_percent
+            .unwrap_or(DEFAULT_INDEX_CANARY_DUTY_CYCLE_PERCENT)
+            .clamp(1, 100),
+        adaptive_healthy_window_seconds: config
+            .adaptive_healthy_window_seconds
+            .unwrap_or(DEFAULT_INDEX_ADAPTIVE_HEALTHY_WINDOW_SECONDS)
+            .max(1),
+        adaptive_recovery_delay_seconds: config
+            .adaptive_recovery_delay_seconds
+            .unwrap_or(DEFAULT_INDEX_ADAPTIVE_RECOVERY_DELAY_SECONDS)
+            .max(1),
+        adaptive_max_recovery_delay_seconds: config
+            .adaptive_max_recovery_delay_seconds
+            .unwrap_or(DEFAULT_INDEX_ADAPTIVE_MAX_RECOVERY_DELAY_SECONDS)
+            .max(1),
+        sentinel_tag: config.sentinel_tag.clone(),
+        sentinel_probe_interval_seconds: config
+            .sentinel_probe_interval_seconds
+            .unwrap_or(DEFAULT_INDEX_SENTINEL_PROBE_INTERVAL_SECONDS)
+            .max(1),
+        minimum_free_space_bytes: config
+            .minimum_free_space_bytes
+            .unwrap_or(DEFAULT_INDEX_MINIMUM_FREE_SPACE_BYTES),
+        storage_headroom_bytes: config
+            .storage_headroom_bytes
+            .unwrap_or(DEFAULT_INDEX_STORAGE_HEADROOM_BYTES),
+        circuit_failure_threshold: config
+            .circuit_failure_threshold
+            .unwrap_or(DEFAULT_INDEX_CIRCUIT_FAILURE_THRESHOLD)
+            .max(1),
+        circuit_open_seconds: config
+            .circuit_open_seconds
+            .unwrap_or(DEFAULT_INDEX_CIRCUIT_OPEN_SECONDS)
+            .max(1),
         quiet_period_seconds: config
             .quiet_period_seconds
             .unwrap_or(DEFAULT_INDEX_QUIET_PERIOD_SECONDS),
@@ -207,6 +381,10 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
         health_latency_threshold_ms: config
             .health_latency_threshold_ms
             .unwrap_or(DEFAULT_INDEX_HEALTH_LATENCY_THRESHOLD_MS)
+            .max(1),
+        operation_timeout_seconds: config
+            .operation_timeout_seconds
+            .unwrap_or(DEFAULT_INDEX_OPERATION_TIMEOUT_SECONDS)
             .max(1),
         maintenance_windows: config.maintenance_windows.clone(),
         concurrency: config
@@ -446,13 +624,36 @@ mod tests {
             servers: vec!["S".into()],
             enabled: Some(false),
             refresh_interval_seconds: Some(12),
+            initial_build_policy: Some(InitialBuildPolicy::Immediate),
+            startup_grace_period_seconds: Some(9),
+            schedule_jitter_seconds: Some(8),
+            inventory_batch_size: Some(11),
+            commit_batch_size: Some(12),
+            commit_interval_ms: Some(13),
             batch_size: Some(0),
             item_rate_limit: Some(0),
             burst_size: Some(0),
             duty_cycle_percent: Some(0),
+            adaptive: Some(false),
+            minimum_item_rate: Some(3),
+            minimum_batch_size: Some(2),
+            minimum_duty_cycle_percent: Some(4),
+            canary_item_rate: Some(5),
+            canary_batch_size: Some(6),
+            canary_duty_cycle_percent: Some(7),
+            adaptive_healthy_window_seconds: Some(8),
+            adaptive_recovery_delay_seconds: Some(9),
+            adaptive_max_recovery_delay_seconds: Some(10),
+            sentinel_tag: Some("S.Health".into()),
+            sentinel_probe_interval_seconds: Some(14),
+            minimum_free_space_bytes: Some(15),
+            storage_headroom_bytes: Some(16),
+            circuit_failure_threshold: Some(17),
+            circuit_open_seconds: Some(18),
             quiet_period_seconds: Some(3),
             health_probe_interval_seconds: Some(0),
             health_latency_threshold_ms: Some(4),
+            operation_timeout_seconds: Some(0),
             maintenance_windows: vec!["22:00-06:00".into()],
             concurrency: Some(0),
             query_cache_capacity: Some(0),
@@ -464,18 +665,79 @@ mod tests {
         assert_eq!(resolved.servers, vec!["S".to_string()]);
         assert!(!resolved.enabled);
         assert_eq!(resolved.refresh_interval_seconds, 12);
+        assert_eq!(resolved.initial_build_policy, InitialBuildPolicy::Immediate);
+        assert_eq!(resolved.startup_grace_period_seconds, 9);
+        assert_eq!(resolved.schedule_jitter_seconds, 8);
+        assert_eq!(resolved.inventory_batch_size, 11);
+        assert_eq!(resolved.commit_batch_size, 12);
+        assert_eq!(resolved.commit_interval_ms, 13);
         assert_eq!(resolved.batch_size, 1);
         assert_eq!(resolved.item_rate_limit, 0);
         assert_eq!(resolved.burst_size, 1);
         assert_eq!(resolved.duty_cycle_percent, 1);
+        assert!(!resolved.adaptive);
+        assert_eq!(resolved.minimum_item_rate, 3);
+        assert_eq!(resolved.minimum_batch_size, 2);
+        assert_eq!(resolved.minimum_duty_cycle_percent, 4);
+        assert_eq!(resolved.canary_item_rate, 5);
+        assert_eq!(resolved.canary_batch_size, 6);
+        assert_eq!(resolved.canary_duty_cycle_percent, 7);
+        assert_eq!(resolved.adaptive_healthy_window_seconds, 8);
+        assert_eq!(resolved.adaptive_recovery_delay_seconds, 9);
+        assert_eq!(resolved.adaptive_max_recovery_delay_seconds, 10);
+        assert_eq!(resolved.sentinel_tag.as_deref(), Some("S.Health"));
+        assert_eq!(resolved.sentinel_probe_interval_seconds, 14);
+        assert_eq!(resolved.minimum_free_space_bytes, 15);
+        assert_eq!(resolved.storage_headroom_bytes, 16);
+        assert_eq!(resolved.circuit_failure_threshold, 17);
+        assert_eq!(resolved.circuit_open_seconds, 18);
         assert_eq!(resolved.quiet_period_seconds, 3);
         assert_eq!(resolved.health_probe_interval_seconds, 1);
         assert_eq!(resolved.health_latency_threshold_ms, 4);
+        assert_eq!(resolved.operation_timeout_seconds, 1);
         assert_eq!(resolved.maintenance_windows, vec!["22:00-06:00"]);
         assert_eq!(resolved.concurrency, 1);
         assert_eq!(resolved.query_cache_capacity, 1);
         assert!(resolved.paused);
         assert_eq!(resolved.max_results, 1);
+    }
+
+    #[test]
+    fn test_resolve_index_config_uses_weekly_safe_scheduler_defaults() {
+        let resolved = resolve_index_config(&IndexConfig::default());
+        assert_eq!(resolved.refresh_interval_seconds, 604_800);
+        assert_eq!(
+            resolved.initial_build_policy,
+            InitialBuildPolicy::MaintenanceWindow
+        );
+        assert_eq!(resolved.startup_grace_period_seconds, 30);
+        assert_eq!(resolved.schedule_jitter_seconds, 21_600);
+        assert_eq!(resolved.inventory_batch_size, 100);
+        assert_eq!(resolved.commit_batch_size, 100);
+        assert_eq!(resolved.commit_interval_ms, 1_000);
+        assert_eq!(resolved.sentinel_tag, None);
+        assert_eq!(resolved.operation_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_resolve_index_config_clamps_native_batch_sizes() {
+        let oversized = MAX_NATIVE_INVENTORY_BATCH_SIZE + 1;
+        let resolved = resolve_index_config(&IndexConfig {
+            inventory_batch_size: Some(oversized),
+            batch_size: Some(oversized),
+            minimum_batch_size: Some(oversized),
+            canary_batch_size: Some(oversized),
+            ..IndexConfig::default()
+        });
+
+        assert_eq!(
+            resolved.inventory_batch_size,
+            MAX_NATIVE_INVENTORY_BATCH_SIZE
+        );
+        assert_eq!(resolved.batch_size, MAX_NATIVE_INVENTORY_BATCH_SIZE);
+        assert_eq!(resolved.minimum_batch_size, MAX_NATIVE_INVENTORY_BATCH_SIZE);
+        assert_eq!(resolved.canary_batch_size, MAX_NATIVE_INVENTORY_BATCH_SIZE);
+        assert_eq!(resolved.commit_batch_size, oversized);
     }
 
     #[test]
@@ -485,13 +747,36 @@ mod tests {
             servers: vec!["S1".into(), "S2".into()],
             enabled: Some(true),
             refresh_interval_seconds: Some(60),
+            initial_build_policy: Some(InitialBuildPolicy::Manual),
+            startup_grace_period_seconds: Some(45),
+            schedule_jitter_seconds: Some(120),
+            inventory_batch_size: Some(20),
+            commit_batch_size: Some(7),
+            commit_interval_ms: Some(250),
             batch_size: Some(10),
             item_rate_limit: Some(20),
             burst_size: Some(5),
             duty_cycle_percent: Some(50),
+            adaptive: Some(true),
+            minimum_item_rate: Some(10),
+            minimum_batch_size: Some(2),
+            minimum_duty_cycle_percent: Some(3),
+            canary_item_rate: Some(20),
+            canary_batch_size: Some(5),
+            canary_duty_cycle_percent: Some(8),
+            adaptive_healthy_window_seconds: Some(30),
+            adaptive_recovery_delay_seconds: Some(60),
+            adaptive_max_recovery_delay_seconds: Some(300),
+            sentinel_tag: Some("S.Health".into()),
+            sentinel_probe_interval_seconds: Some(45),
+            minimum_free_space_bytes: Some(100),
+            storage_headroom_bytes: Some(200),
+            circuit_failure_threshold: Some(4),
+            circuit_open_seconds: Some(600),
             quiet_period_seconds: Some(2),
             health_probe_interval_seconds: Some(30),
             health_latency_threshold_ms: Some(500),
+            operation_timeout_seconds: Some(45),
             maintenance_windows: vec!["00:00-06:00".into()],
             concurrency: Some(1),
             query_cache_capacity: Some(10),
