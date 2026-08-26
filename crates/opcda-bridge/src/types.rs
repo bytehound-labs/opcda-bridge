@@ -1049,7 +1049,26 @@ mod tests {
         assert_eq!(SearchIndexState::Ready.to_string(), "ready");
         assert_eq!(SearchIndexState::Stale.to_string(), "stale");
         assert_eq!(SearchIndexState::Refreshing.to_string(), "refreshing");
+        assert_eq!(SearchIndexState::Promoting.to_string(), "promoting");
         assert_eq!(SearchIndexState::Failed.to_string(), "failed");
+        assert_eq!(IndexControllerState::Unspecified.to_string(), "unspecified");
+        assert_eq!(IndexControllerState::Ramping.to_string(), "ramping");
+        assert_eq!(IndexControllerState::Steady.to_string(), "steady");
+        assert_eq!(IndexControllerState::Throttled.to_string(), "throttled");
+        assert_eq!(IndexControllerState::Paused.to_string(), "paused");
+        assert_eq!(IndexPauseReason::Unspecified.to_string(), "unspecified");
+        assert_eq!(IndexPauseReason::Foreground.to_string(), "foreground");
+        assert_eq!(IndexPauseReason::OpcHealth.to_string(), "opc-health");
+        assert_eq!(IndexPauseReason::HostCpu.to_string(), "host-cpu");
+        assert_eq!(IndexPauseReason::Memory.to_string(), "memory");
+        assert_eq!(IndexPauseReason::Disk.to_string(), "disk");
+        assert_eq!(IndexPauseReason::Database.to_string(), "database");
+        assert_eq!(IndexPauseReason::Operator.to_string(), "operator");
+        assert_eq!(IndexPauseReason::Circuit.to_string(), "circuit");
+        assert_eq!(IndexHealthState::Unspecified.to_string(), "unspecified");
+        assert_eq!(IndexHealthState::Healthy.to_string(), "healthy");
+        assert_eq!(IndexHealthState::Unhealthy.to_string(), "unhealthy");
+        assert_eq!(IndexHealthState::Unavailable.to_string(), "unavailable");
         assert!(BrowseNodeKind::Branch.is_branch());
         assert!(!BrowseNodeKind::Branch.is_item());
         assert!(BrowseNodeKind::Item.is_item());
@@ -1190,11 +1209,90 @@ mod tests {
                 proto::SearchIndexState::Refreshing,
                 SearchIndexState::Refreshing,
             ),
+            (
+                proto::SearchIndexState::Promoting,
+                SearchIndexState::Promoting,
+            ),
             (proto::SearchIndexState::Failed, SearchIndexState::Failed),
         ] {
             assert_eq!(search_index_state(proto_state as i32).unwrap(), state);
         }
         assert!(matches!(search_index_state(99), Err(Error::Protocol(_))));
+        for (proto_state, state) in [
+            (
+                proto::IndexControllerState::Unspecified,
+                IndexControllerState::Unspecified,
+            ),
+            (
+                proto::IndexControllerState::Ramping,
+                IndexControllerState::Ramping,
+            ),
+            (
+                proto::IndexControllerState::Steady,
+                IndexControllerState::Steady,
+            ),
+            (
+                proto::IndexControllerState::Throttled,
+                IndexControllerState::Throttled,
+            ),
+            (
+                proto::IndexControllerState::Paused,
+                IndexControllerState::Paused,
+            ),
+        ] {
+            assert_eq!(index_controller_state(proto_state as i32).unwrap(), state);
+        }
+        assert!(matches!(
+            index_controller_state(99),
+            Err(Error::Protocol(_))
+        ));
+        for (proto_reason, reason) in [
+            (
+                proto::IndexPauseReason::Unspecified,
+                IndexPauseReason::Unspecified,
+            ),
+            (
+                proto::IndexPauseReason::Foreground,
+                IndexPauseReason::Foreground,
+            ),
+            (
+                proto::IndexPauseReason::OpcHealth,
+                IndexPauseReason::OpcHealth,
+            ),
+            (proto::IndexPauseReason::HostCpu, IndexPauseReason::HostCpu),
+            (proto::IndexPauseReason::Memory, IndexPauseReason::Memory),
+            (proto::IndexPauseReason::Disk, IndexPauseReason::Disk),
+            (
+                proto::IndexPauseReason::Database,
+                IndexPauseReason::Database,
+            ),
+            (
+                proto::IndexPauseReason::Operator,
+                IndexPauseReason::Operator,
+            ),
+            (proto::IndexPauseReason::Circuit, IndexPauseReason::Circuit),
+        ] {
+            assert_eq!(index_pause_reason(proto_reason as i32).unwrap(), reason);
+        }
+        assert!(matches!(index_pause_reason(99), Err(Error::Protocol(_))));
+        for (proto_state, state) in [
+            (
+                proto::IndexHealthState::Unspecified,
+                IndexHealthState::Unspecified,
+            ),
+            (proto::IndexHealthState::Healthy, IndexHealthState::Healthy),
+            (
+                proto::IndexHealthState::Unhealthy,
+                IndexHealthState::Unhealthy,
+            ),
+            (
+                proto::IndexHealthState::Unavailable,
+                IndexHealthState::Unavailable,
+            ),
+        ] {
+            assert_eq!(index_health_state(proto_state as i32).unwrap(), state);
+        }
+        assert!(matches!(index_health_state(99), Err(Error::Protocol(_))));
 
         let missing_item_id = proto::BrowseNode {
             kind: proto::BrowseNodeKind::Item as i32,
@@ -1328,7 +1426,58 @@ mod tests {
                     items_per_second: 12.5,
                     estimated_remaining_ms: Some(50),
                 }),
-                ..Default::default()
+                effective_limits: Some(proto::IndexInventoryLimits {
+                    item_rate_per_second: 100,
+                    batch_size: 25,
+                    duty_cycle_percent: 5,
+                }),
+                controller_state: proto::IndexControllerState::Throttled as i32,
+                pause_reason: Some(proto::IndexPauseReason::Database as i32),
+                recovery_deadline: Some("recover".into()),
+                pause_reason_detail: Some("commit latency".into()),
+                foreground: Some(proto::IndexForegroundDiagnostics {
+                    active_count: 1,
+                    operations: 2,
+                    errors: 3,
+                    bad_quality: 4,
+                    latency_p50_ms: Some(5),
+                    latency_p95_ms: Some(6),
+                    latency_max_ms: Some(7),
+                    last_error: true,
+                    last_bad_quality: true,
+                }),
+                host: Some(proto::IndexHostDiagnostics {
+                    cpu_percent: Some(8.0),
+                    available_memory_percent: Some(9.0),
+                    disk_active_percent: Some(10.0),
+                    disk_queue: Some(11.0),
+                    process_working_set_bytes: Some(12),
+                    process_private_bytes: Some(13),
+                    process_read_bytes_per_second: Some(14),
+                    process_write_bytes_per_second: Some(15),
+                    disk_free_bytes: Some(16),
+                }),
+                storage: Some(proto::IndexStorageDiagnostics {
+                    main_bytes: 17,
+                    wal_bytes: 18,
+                    shm_bytes: 19,
+                    free_bytes: Some(20),
+                    last_commit_latency_ms: Some(21),
+                }),
+                scheduler: Some(proto::IndexSchedulerDiagnostics {
+                    next_refresh_at: Some("next".into()),
+                    last_attempt_at: Some("attempt".into()),
+                    last_success_at: Some("success".into()),
+                    last_success_duration_ms: Some(22),
+                    retry_after: Some("retry".into()),
+                    consecutive_failures: 23,
+                    circuit_open: true,
+                }),
+                health: Some(proto::IndexHealthDiagnostics {
+                    state: proto::IndexHealthState::Healthy as i32,
+                    sentinel_configured: true,
+                }),
+                promoting: true,
             }),
         };
         let typed = SearchIndexResponse::try_from(response).unwrap();
@@ -1344,7 +1493,90 @@ mod tests {
                 .estimated_remaining_ms,
             Some(50)
         );
+        assert_eq!(
+            typed.status.effective_limits,
+            Some(IndexInventoryLimits {
+                item_rate_per_second: 100,
+                batch_size: 25,
+                duty_cycle_percent: 5,
+            })
+        );
+        assert_eq!(
+            typed.status.controller_state,
+            IndexControllerState::Throttled
+        );
+        assert_eq!(typed.status.pause_reason, Some(IndexPauseReason::Database));
+        assert_eq!(typed.status.recovery_deadline.as_deref(), Some("recover"));
+        assert_eq!(
+            typed.status.pause_reason_detail.as_deref(),
+            Some("commit latency")
+        );
+        assert_eq!(
+            typed.status.foreground,
+            IndexForegroundDiagnostics {
+                active_count: 1,
+                operations: 2,
+                errors: 3,
+                bad_quality: 4,
+                latency_p50_ms: Some(5),
+                latency_p95_ms: Some(6),
+                latency_max_ms: Some(7),
+                last_error: true,
+                last_bad_quality: true,
+            }
+        );
+        assert_eq!(
+            typed.status.host,
+            IndexHostDiagnostics {
+                cpu_percent: Some(8.0),
+                available_memory_percent: Some(9.0),
+                disk_active_percent: Some(10.0),
+                disk_queue: Some(11.0),
+                process_working_set_bytes: Some(12),
+                process_private_bytes: Some(13),
+                process_read_bytes_per_second: Some(14),
+                process_write_bytes_per_second: Some(15),
+                disk_free_bytes: Some(16),
+            }
+        );
+        assert_eq!(
+            typed.status.storage,
+            IndexStorageDiagnostics {
+                main_bytes: 17,
+                wal_bytes: 18,
+                shm_bytes: 19,
+                free_bytes: Some(20),
+                last_commit_latency_ms: Some(21),
+            }
+        );
+        assert_eq!(
+            typed.status.scheduler,
+            IndexSchedulerDiagnostics {
+                next_refresh_at: Some("next".into()),
+                last_attempt_at: Some("attempt".into()),
+                last_success_at: Some("success".into()),
+                last_success_duration_ms: Some(22),
+                retry_after: Some("retry".into()),
+                consecutive_failures: 23,
+                circuit_open: true,
+            }
+        );
+        assert_eq!(
+            typed.status.health,
+            IndexHealthDiagnostics {
+                state: IndexHealthState::Healthy,
+                sentinel_configured: true,
+            }
+        );
+        assert!(typed.status.promoting);
         assert!(typed.has_more);
+
+        let defaults = SearchIndexStatus::try_from(proto::SearchIndexStatus::default()).unwrap();
+        assert_eq!(defaults.foreground, IndexForegroundDiagnostics::default());
+        assert_eq!(defaults.host, IndexHostDiagnostics::default());
+        assert_eq!(defaults.storage, IndexStorageDiagnostics::default());
+        assert_eq!(defaults.scheduler, IndexSchedulerDiagnostics::default());
+        assert_eq!(defaults.health, IndexHealthDiagnostics::default());
 
         let item = IndexedSearchMatch::try_from(proto::IndexedSearchMatch {
             kind: proto::BrowseNodeKind::Item as i32,

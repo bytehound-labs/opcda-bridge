@@ -9,7 +9,9 @@ use opcda_bridge::{
 };
 use serde::Serialize;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::Write;
+use std::pin::Pin;
 use tabled::Tabled;
 use tabled::derive::display;
 
@@ -1048,7 +1050,17 @@ pub async fn cmd_index_status(
         println!("{}", render_index_status(status, format)?);
         return Ok(());
     };
-    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    let ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    watch_index_status(&mut client, server, format, watch_seconds, ctrl_c).await
+}
+
+async fn watch_index_status(
+    client: &mut Client,
+    server: String,
+    format: OutputFormat,
+    watch_seconds: u64,
+    mut ctrl_c: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>,
+) -> anyhow::Result<()> {
     loop {
         let status = tokio::select! {
             result = client.search_index_status(server.clone()) => result?,
@@ -1277,8 +1289,9 @@ mod tests {
     use super::*;
     use crate::test_support::{MockBridgeService, start_mock_server};
     use opcda_bridge::{
-        BrowseNodeKind, BrowseSource, NamespaceOrganization, SearchIndexControlAction,
-        SearchIndexState,
+        BrowseNodeKind, BrowseSource, CompatibilityEvidence, CompatibilitySource,
+        CompatibilityStatus, FeatureCompatibility, NamespaceOrganization, ProtocolVersionRange,
+        SearchIndexControlAction, SearchIndexState,
     };
     use opcda_bridge_proto::bridge::search_event;
     use opcda_bridge_proto::bridge::{
@@ -1463,6 +1476,57 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("indexed-search"));
+    }
+
+    #[test]
+    fn compatibility_rendering_handles_empty_features_and_version_ranges() {
+        let empty = CompatibilityReport {
+            client_version: "client".into(),
+            library_version: "library".into(),
+            gateway_version: None,
+            source: CompatibilitySource::Unknown,
+            status: CompatibilityStatus::Unknown,
+            evidence: CompatibilityEvidence::Unverified,
+            features: Vec::new(),
+        };
+        let rendered = render_compatibility(&empty, OutputFormat::Table).unwrap();
+        assert!(rendered.contains("none"));
+        assert!(rendered.contains("gateway did not provide"));
+
+        let ranged = CompatibilityReport {
+            gateway_version: Some("gateway".into()),
+            source: CompatibilitySource::GatewayInfo,
+            status: CompatibilityStatus::Partial,
+            evidence: CompatibilityEvidence::ContractBoundaryTested,
+            features: vec![FeatureCompatibility {
+                feature: CompatibilityFeature::Namespace,
+                status: FeatureCompatibilityStatus::Incompatible,
+                client_versions: ProtocolVersionRange { min: 1, max: 2 },
+                gateway_versions: Some(ProtocolVersionRange { min: 3, max: 4 }),
+                negotiated_version: None,
+                reason: "ranges do not overlap".into(),
+            }],
+            ..empty
+        };
+        let rendered = render_compatibility(&ranged, OutputFormat::Table).unwrap();
+        assert!(rendered.contains("1-2"));
+        assert!(rendered.contains("3-4"));
+        assert!(rendered.contains("none"));
+
+        let exact = CompatibilityReport {
+            features: vec![FeatureCompatibility {
+                feature: CompatibilityFeature::Core,
+                status: FeatureCompatibilityStatus::Compatible,
+                client_versions: ProtocolVersionRange::exact(1),
+                gateway_versions: None,
+                negotiated_version: Some(1),
+                reason: "exact".into(),
+            }],
+            ..ranged
+        };
+        let rendered = render_compatibility(&exact, OutputFormat::Table).unwrap();
+        assert!(rendered.contains("unknown"));
+        assert!(rendered.contains('1'));
     }
 
     #[tokio::test]
@@ -1728,10 +1792,62 @@ mod tests {
             unique_item_count: 100,
             started_at: Some("start".into()),
             completed_at: Some("complete".into()),
-            last_error: None,
+            last_error: Some("warning".into()),
             database_bytes: 2048,
             organization: ProtoOrganization::Hierarchical as i32,
             source: ProtoBrowseSource::Da2 as i32,
+            effective_limits: Some(opcda_bridge_proto::bridge::IndexInventoryLimits {
+                item_rate_per_second: 100,
+                batch_size: 25,
+                duty_cycle_percent: 5,
+            }),
+            controller_state: opcda_bridge_proto::bridge::IndexControllerState::Throttled as i32,
+            pause_reason: Some(opcda_bridge_proto::bridge::IndexPauseReason::Database as i32),
+            recovery_deadline: Some("recover".into()),
+            pause_reason_detail: Some("commit latency".into()),
+            foreground: Some(opcda_bridge_proto::bridge::IndexForegroundDiagnostics {
+                active_count: 1,
+                operations: 2,
+                errors: 3,
+                bad_quality: 4,
+                latency_p50_ms: Some(5),
+                latency_p95_ms: Some(6),
+                latency_max_ms: Some(7),
+                last_error: true,
+                last_bad_quality: true,
+            }),
+            host: Some(opcda_bridge_proto::bridge::IndexHostDiagnostics {
+                cpu_percent: Some(8.0),
+                available_memory_percent: Some(9.0),
+                disk_active_percent: Some(10.0),
+                disk_queue: Some(11.0),
+                process_working_set_bytes: Some(12),
+                process_private_bytes: Some(13),
+                process_read_bytes_per_second: Some(14),
+                process_write_bytes_per_second: Some(15),
+                disk_free_bytes: Some(16),
+            }),
+            storage: Some(opcda_bridge_proto::bridge::IndexStorageDiagnostics {
+                main_bytes: 17,
+                wal_bytes: 18,
+                shm_bytes: 19,
+                free_bytes: Some(20),
+                last_commit_latency_ms: Some(21),
+            }),
+            scheduler: Some(opcda_bridge_proto::bridge::IndexSchedulerDiagnostics {
+                next_refresh_at: Some("next".into()),
+                last_attempt_at: Some("attempt".into()),
+                last_success_at: Some("success".into()),
+                last_success_duration_ms: Some(22),
+                retry_after: Some("retry".into()),
+                consecutive_failures: 23,
+                circuit_open: true,
+            }),
+            health: Some(opcda_bridge_proto::bridge::IndexHealthDiagnostics {
+                state: opcda_bridge_proto::bridge::IndexHealthState::Healthy as i32,
+                sentinel_configured: true,
+            }),
+            promoting: true,
             progress: Some(IndexedSearchProgress {
                 branches_visited: 4,
                 entries_seen: 5,
@@ -1741,7 +1857,6 @@ mod tests {
                 items_per_second: 8.5,
                 estimated_remaining_ms: Some(9),
             }),
-            ..Default::default()
         }
     }
 
@@ -1784,12 +1899,22 @@ mod tests {
         .await
         .unwrap();
         cmd_index_search(
-            host,
+            host.clone(),
             "S".into(),
             "PV1".into(),
             SearchMatchMode::Contains,
             25,
             OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        cmd_index_search(
+            host,
+            "S".into(),
+            "PV1".into(),
+            SearchMatchMode::Contains,
+            25,
+            OutputFormat::Table,
         )
         .await
         .unwrap();
@@ -1803,6 +1928,77 @@ mod tests {
         let search_requests = search_requests.lock().unwrap();
         assert_eq!(search_requests[0].query, "PV1");
         assert_eq!(search_requests[0].max_results, 25);
+    }
+
+    #[test]
+    fn indexed_status_rendering_includes_diagnostics_and_failure_labels() {
+        let status = opcda_bridge::SearchIndexStatus::try_from(proto_index_status(
+            ProtoSearchIndexState::Ready,
+        ))
+        .unwrap();
+        let table = render_index_status(status.clone(), OutputFormat::Table).unwrap();
+        for value in [
+            "Effective item rate/s",
+            "Foreground p95 ms",
+            "Host CPU %",
+            "SQLite WAL bytes",
+            "Next refresh",
+            "Health",
+            "warning",
+        ] {
+            assert!(table.contains(value), "missing {value} in {table}");
+        }
+        let json = render_index_status(status, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["effective_limits"]["batch_size"], 25);
+        assert_eq!(value["foreground"]["latency_p95_ms"], 6);
+        assert_eq!(value["host"]["disk_free_bytes"], 16);
+        assert_eq!(value["storage"]["last_commit_latency_ms"], 21);
+        assert_eq!(value["scheduler"]["consecutive_failures"], 23);
+        assert_eq!(value["health"]["state"], "healthy");
+        assert_eq!(value["promoting"], true);
+
+        let mut failed = proto_index_status(ProtoSearchIndexState::Failed);
+        failed.last_error = Some("failure".into());
+        let table = render_index_status(failed.try_into().unwrap(), OutputFormat::Table).unwrap();
+        assert!(table.contains("Last error"));
+        assert!(table.contains("failure"));
+    }
+
+    #[tokio::test]
+    async fn index_status_watch_renders_and_stops_on_ctrl_c() {
+        let service = MockBridgeService {
+            search_index_status_response: proto_index_status(ProtoSearchIndexState::Ready),
+            ..Default::default()
+        };
+        let requests = Arc::clone(&service.search_index_status_requests);
+        let host = start_mock_server(service).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        let ctrl_c: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(())
+        });
+        watch_index_status(&mut client, "S".into(), OutputFormat::Table, 60, ctrl_c)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        let ctrl_c: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(())
+        });
+        watch_index_status(&mut client, "S".into(), OutputFormat::Json, 60, ctrl_c)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        let host = start_mock_server(MockBridgeService::default()).await;
+        let mut client = Client::connect(&host).await.unwrap();
+        let ctrl_c: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> =
+            Box::pin(async { Ok(()) });
+        watch_index_status(&mut client, "S".into(), OutputFormat::Json, 60, ctrl_c)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
