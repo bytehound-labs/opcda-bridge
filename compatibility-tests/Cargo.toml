@@ -18,7 +18,13 @@ historical-client-032 = { package = "opcda-bridge", version = "=0.3.2" }
 historical-client-040 = { package = "opcda-bridge", version = "=0.4.0" }
 historical-gateway-032 = { package = "opcda-bridge-gateway", version = "=0.3.2" }
 historical-proto-032 = { package = "opcda-bridge-proto", version = "=0.3.2" }
+historical-proto-040 = { package = "opcda-bridge-proto", version = "=0.4.0" }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"

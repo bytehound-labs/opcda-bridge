@@ -41,6 +41,10 @@ is defined by the wire protocol, `protocol_version`, indexed-search protocol and
 and the compatibility checks in CI. Changes to a reusable dependency can also produce a dependent
 package release when the dependent binary or API needs to be rebuilt.
 
+The cross-version compatibility workspace pins each historical client to its original protocol
+crate version. This keeps older Rust clients compiling against the schema they were released
+with while the tests exercise their wire compatibility with current gateways.
+
 ## Why
 
 OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based industrial protocol still running on countless PLCs, DCSs, and SCADA systems that predate its successor, OPC UA.
