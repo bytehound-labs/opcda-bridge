@@ -6714,6 +6714,7 @@ mod tests {
         cleanup_release.send(()).unwrap();
         refresh.await.unwrap().unwrap();
         wait_for_build(&manager, IndexState::Ready).await;
+        manager.background_tasks.wait_for_cleanup_batch_hook();
         assert_eq!(manager.status("S").await.unwrap().active_generation, 1);
     }
 
