@@ -551,12 +551,29 @@ impl BuildFileLock {
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(fs::create_dir_all)
             .transpose()?;
-        let mut file = OpenOptions::new()
+        let mut file = match OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&lock_path)?;
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if is_lock_conflict(&error) => {
+                let owner = fs::read_to_string(&lock_path)
+                    .unwrap_or_else(|_| "owner details unavailable".to_string());
+                anyhow::bail!(
+                    "namespace index build lock is already held at {} ({})",
+                    lock_path.display(),
+                    if owner.trim().is_empty() {
+                        error.to_string()
+                    } else {
+                        owner.trim().to_string()
+                    }
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
         if let Err(error) = file.try_lock_exclusive() {
             let owner = fs::read_to_string(&lock_path)
                 .unwrap_or_else(|_| "owner details unavailable".to_string());
@@ -583,6 +600,7 @@ impl BuildFileLock {
         let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if is_lock_conflict(&error) => return Ok(true),
             Err(error) => return Err(error.into()),
         };
         match file.try_lock_exclusive() {
@@ -590,10 +608,14 @@ impl BuildFileLock {
                 FileExt::unlock(&file)?;
                 Ok(false)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) if is_lock_conflict(&error) => Ok(true),
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn is_lock_conflict(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock || matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 impl Drop for BuildFileLock {
@@ -4597,9 +4619,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("index.sqlite3");
         let db = IndexDb::open(&path).unwrap();
+        drop(db);
         std::fs::write(IndexDb::sqlite_sidecar_path(&path, "-wal"), vec![0_u8; 7]).unwrap();
         std::fs::write(IndexDb::sqlite_sidecar_path(&path, "-shm"), vec![0_u8; 11]).unwrap();
-        let storage = db.storage_diagnostics();
+        let storage = storage_diagnostics_for_path(&path);
         assert_eq!(storage.wal_bytes, 7);
         assert_eq!(storage.shm_bytes, 11);
         assert!(storage.free_bytes.is_some());

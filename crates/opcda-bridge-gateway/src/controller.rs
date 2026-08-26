@@ -265,6 +265,8 @@ impl WindowsHostMetrics {
         let mut idle = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
+        // The Windows metrics API has no safe Rust binding.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let success = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
         if success == 0 {
             return None;
@@ -288,11 +290,15 @@ impl WindowsHostMetrics {
             GetCurrentProcess, GetProcessIoCounters, IO_COUNTERS,
         };
 
+        // The Windows metrics API has no safe Rust binding.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let process = unsafe { GetCurrentProcess() };
         let mut memory = PROCESS_MEMORY_COUNTERS_EX {
             cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
             ..PROCESS_MEMORY_COUNTERS_EX::default()
         };
+        // The Windows metrics API has no safe Rust binding.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let memory_ok = unsafe {
             GetProcessMemoryInfo(
                 process,
@@ -302,6 +308,8 @@ impl WindowsHostMetrics {
         };
 
         let mut io = IO_COUNTERS::default();
+        // The Windows metrics API has no safe Rust binding.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let io_ok = unsafe { GetProcessIoCounters(process, &mut io) != 0 };
         (
             memory_ok.then_some(memory.WorkingSetSize as u64),
@@ -321,6 +329,8 @@ impl WindowsHostMetrics {
             dwLength: size_of::<MEMORYSTATUSEX>() as u32,
             ..MEMORYSTATUSEX::default()
         };
+        // The Windows metrics API has no safe Rust binding.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let success = unsafe { GlobalMemoryStatusEx(&mut memory) };
         if success == 0 || memory.ullTotalPhys == 0 {
             return None;
@@ -340,6 +350,8 @@ impl WindowsHostMetrics {
         let mut wide = directory.as_os_str().encode_wide().collect::<Vec<_>>();
         wide.push(0);
         let mut available = 0_u64;
+        // The Windows metrics API has no safe Rust binding.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let success = unsafe {
             GetDiskFreeSpaceExW(
                 wide.as_ptr(),
