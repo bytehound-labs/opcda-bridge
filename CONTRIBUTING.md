@@ -14,8 +14,8 @@ opcda-bridge is under active development. The practices below apply to all contr
   `main` (`<component>-vX.Y.Z`, [SemVer](https://semver.org/)).
 - Incomplete or experimental work that must land before it's fully ready goes behind a Cargo
   feature flag rather than sitting unmerged on a branch.
-- Trivial fixes (typos, doc tweaks) may be pushed directly to `main`; everything else goes
-  through a PR so CI runs.
+- Every change, including documentation-only fixes, goes through a feature branch and pull
+  request so the repository's checks run before it reaches `main`.
 
 ## Commit messages
 
@@ -50,6 +50,19 @@ Example: `feat(gateway): add tag subscription support`.
   on any OS: tests exercise a hand-written `MockOpcClient` instead of a live COM connection.
 - Hardware-in-the-loop tests (against a real Windows host + OPC DA server) aren't part of CI;
   note manual verification steps in the PR description when a change needs them.
+- Mutation testing uses `cargo-mutants` to check whether the test suite detects behavioral
+  changes that ordinary coverage can miss. Run one package locally with:
+
+  ```sh
+  cargo mutants --package opcda-bridge --in-place --no-shuffle --timeout 180
+  ```
+
+  Use `--in-diff <diff-file>` for a focused diagnostic run. The weekly/manual workflow covers
+  `opcda-bridge`, `opcda-bridge-client`, and `opcda-bridge-proto` on Ubuntu, and
+  `opcda-bridge-gateway` on Windows so its COM-specific code is compiled and tested on the
+  platform where it exists. Full mutation testing is intentionally not a required PR check
+  because the gateway shard is long-running; reports are retained as workflow artifacts.
+
 - Cross-version protocol checks run from the isolated `compatibility-tests/` workspace:
   `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`.
   The workflow regenerates that workspace's lockfile when package manifests change because path
@@ -76,6 +89,10 @@ keyless signatures, and provenance; use the release workflow's manual dispatch f
 validation without publishing. Intentional Protobuf wire-contract breaks must carry the
 `breaking-protobuf` label; without that explicit approval, the Buf compatibility check blocks the
 pull request.
+
+The weekly cargo-mutants workflow runs on Saturdays at 03:17 UTC and supports manual package
+selection. It is advisory rather than merge-blocking, while every mutation shard fails when a
+mutant survives or times out.
 
 The generated compatibility files must remain synchronized with
 `crates/opcda-bridge-proto/compatibility.toml`:
