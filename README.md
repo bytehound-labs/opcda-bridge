@@ -551,7 +551,9 @@ Use `--in-diff <diff-file>` for a focused local run. The workflow runs every Sat
 03:17 UTC, accepts a package selector through `workflow_dispatch`, and retains each
 `mutants.out/` report for 14 days. A shard fails when a behavioral mutation survives or times out;
 the Windows gateway is kept on a Windows runner so its platform-specific implementation is
-actually compiled and exercised.
+actually compiled and exercised. The shared mutation configuration excludes only two
+catalog-specific equivalent mutations whose output cannot differ with the current compatibility
+metadata; all other surviving mutations fail the shard.
 
 Tagged binary releases include SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures,
 and GitHub artifact provenance attestations. Running the release workflow manually builds and

@@ -533,6 +533,9 @@ mod tests {
         let right = ProtocolVersionRange::new(3, 4).unwrap();
         assert!(left.overlaps(right));
         assert_eq!(left.negotiated_version(right), Some(3));
+        let higher_left = ProtocolVersionRange::new(4, 6).unwrap();
+        let lower_right = ProtocolVersionRange::new(1, 5).unwrap();
+        assert_eq!(higher_left.negotiated_version(lower_right), Some(4));
         assert!(!ProtocolVersionRange::exact(1).overlaps(ProtocolVersionRange::exact(2)));
     }
 
@@ -551,6 +554,12 @@ mod tests {
             CompatibilityEvidence::ContractBoundaryTested.to_string(),
             "contract-boundary-tested"
         );
+        assert_eq!(CompatibilitySource::GatewayInfo.to_string(), "gateway-info");
+        assert_eq!(
+            CompatibilitySource::LegacyCapabilities.to_string(),
+            "legacy-capabilities"
+        );
+        assert_eq!(CompatibilitySource::Unknown.to_string(), "unknown");
     }
 
     #[test]
@@ -661,6 +670,13 @@ mod tests {
             },
         );
         assert_eq!(partial.status, CompatibilityStatus::Partial);
+        assert_eq!(
+            partial
+                .feature(CompatibilityFeature::IndexedSearch)
+                .unwrap()
+                .status,
+            FeatureCompatibilityStatus::Unsupported
+        );
         assert_eq!(
             partial.evidence,
             CompatibilityEvidence::ContractBoundaryTested
@@ -783,6 +799,10 @@ mod tests {
         assert_eq!(
             catalog_evidence(None, Some("0.4.3")),
             CompatibilityEvidence::Unverified
+        );
+        assert_eq!(
+            evidence_status("unverified"),
+            Some(CompatibilityEvidence::Unverified)
         );
         assert!(catalog_line("0.4").is_none());
         assert!(catalog_line("0.x.3").is_none());

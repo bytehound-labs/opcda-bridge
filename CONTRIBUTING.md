@@ -92,7 +92,9 @@ pull request.
 
 The weekly cargo-mutants workflow runs on Saturdays at 03:17 UTC and supports manual package
 selection. It is advisory rather than merge-blocking, while every mutation shard fails when a
-mutant survives or times out.
+mutant survives or times out. The shared configuration has only two narrowly documented
+compatibility-catalog equivalence exclusions; add no broader exclusions without first proving
+that a mutation is unobservable.
 
 The generated compatibility files must remain synchronized with
 `crates/opcda-bridge-proto/compatibility.toml`:
