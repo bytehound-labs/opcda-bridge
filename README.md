@@ -224,6 +224,11 @@ config file — see [Configuration](#configuration) below.
   generations do not make a newer active generation appear failed. If relational index rows and
   the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache
   is quarantined rather than serving silently incomplete substring results.
+  Database coordination and persistent build-lock paths use the canonical identity of the database
+  file, so existing-file aliases such as relative paths and symlinks cannot bypass coordination.
+  If the file and its parent cannot be canonicalized, the original path spelling is retained.
+  Independent in-memory databases are not shared through the registry and do not create filesystem
+  build-lock sidecars.
   Indexed queries use a dedicated read-only SQLite connection and a bounded in-memory ranking
   pass for full-text candidates, keeping broad searches out of the foreground database mutex.
   During promotion, searches reuse the active generation reported by promotion-safe status rather

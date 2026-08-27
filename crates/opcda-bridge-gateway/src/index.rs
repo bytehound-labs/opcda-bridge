@@ -278,16 +278,44 @@ fn database_coordination_key<F>(path: &Path, current_dir: F) -> PathBuf
 where
     F: FnOnce() -> std::io::Result<PathBuf>,
 {
-    if path == Path::new(":memory:") || path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
+    } else if path == Path::new(":memory:") {
+        return path.to_path_buf();
     } else {
         current_dir()
             .map(|directory| directory.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
+    };
+    canonical_database_path(&absolute)
+}
+
+fn canonical_database_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
     }
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    path.parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
+        .map(|canonical_parent| canonical_parent.join(file_name))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn new_database_coordination() -> Arc<DatabaseCoordination> {
+    Arc::new(DatabaseCoordination {
+        writer_gate: Arc::new(Mutex::new(())),
+        active_builds: Arc::new(Mutex::new(HashSet::new())),
+        build_owners: Arc::new(Mutex::new(HashMap::new())),
+        build_changed: Arc::new(tokio::sync::Notify::new()),
+    })
 }
 
 fn database_coordination(path: &Path) -> Arc<DatabaseCoordination> {
+    if path == Path::new(":memory:") {
+        return new_database_coordination();
+    }
     let key = database_coordination_key(path, std::env::current_dir);
     let registry = DATABASE_COORDINATIONS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry
@@ -296,12 +324,7 @@ fn database_coordination(path: &Path) -> Arc<DatabaseCoordination> {
     if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
         return existing;
     }
-    let coordination = Arc::new(DatabaseCoordination {
-        writer_gate: Arc::new(Mutex::new(())),
-        active_builds: Arc::new(Mutex::new(HashSet::new())),
-        build_owners: Arc::new(Mutex::new(HashMap::new())),
-        build_changed: Arc::new(tokio::sync::Notify::new()),
-    });
+    let coordination = new_database_coordination();
     registry.insert(key, Arc::downgrade(&coordination));
     coordination
 }
@@ -708,6 +731,9 @@ struct BuildFileLock {
 
 impl BuildFileLock {
     fn acquire(database_path: &Path, server: &str) -> anyhow::Result<Self> {
+        if database_path == Path::new(":memory:") {
+            return Ok(Self { file: None });
+        }
         Self::acquire_with(database_path, server, |file, metadata| {
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
@@ -775,6 +801,9 @@ impl BuildFileLock {
     }
 
     fn is_held(database_path: &Path, server: &str) -> anyhow::Result<bool> {
+        if database_path == Path::new(":memory:") {
+            return Ok(false);
+        }
         let lock_path = build_lock_path(database_path, server);
         let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
             Ok(file) => file,
@@ -4909,6 +4938,7 @@ fn stable_server_hash(server: &str) -> String {
 }
 
 fn build_lock_path(database_path: &Path, server: &str) -> PathBuf {
+    let database_path = canonical_database_path(database_path);
     let file_name = database_path
         .file_name()
         .map_or_else(|| "index.sqlite3".into(), |name| name.to_os_string());
@@ -4921,6 +4951,7 @@ fn build_lock_path(database_path: &Path, server: &str) -> PathBuf {
 
 #[cfg(windows)]
 fn build_owner_path(database_path: &Path, server: &str) -> PathBuf {
+    let database_path = canonical_database_path(database_path);
     let file_name = database_path
         .file_name()
         .map_or_else(|| "index.sqlite3".into(), |name| name.to_os_string());
@@ -5164,9 +5195,10 @@ mod tests {
             database_coordination_key(Path::new(":memory:"), std::env::current_dir),
             PathBuf::from(":memory:")
         );
+        assert_eq!(canonical_database_path(Path::new("")), PathBuf::from(""));
         assert_eq!(
             database_coordination_key(&absolute, std::env::current_dir),
-            absolute
+            canonical_database_path(&absolute)
         );
         assert_eq!(
             database_coordination_key(Path::new("index.sqlite3"), || {
@@ -5180,6 +5212,41 @@ mod tests {
             }),
             PathBuf::from("index.sqlite3")
         );
+    }
+
+    #[test]
+    fn database_coordination_reuses_the_same_identity_for_path_aliases() {
+        let directory = tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        fs::write(&database, []).unwrap();
+        let alias = nested.join("..").join("index.sqlite3");
+
+        let canonical_coordination = database_coordination(&database);
+        let aliased_coordination = database_coordination(&alias);
+
+        assert!(Arc::ptr_eq(&canonical_coordination, &aliased_coordination));
+        assert_eq!(
+            build_lock_path(&database, "S"),
+            build_lock_path(&alias, "S")
+        );
+    }
+
+    #[test]
+    fn in_memory_databases_do_not_share_coordination() {
+        let first = database_coordination(Path::new(":memory:"));
+        let second = database_coordination(Path::new(":memory:"));
+
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn in_memory_build_locks_are_not_file_backed() {
+        let lock = BuildFileLock::acquire(Path::new(":memory:"), "S").unwrap();
+
+        assert!(lock.file.is_none());
+        assert!(!BuildFileLock::is_held(Path::new(":memory:"), "S").unwrap());
     }
 
     #[test]

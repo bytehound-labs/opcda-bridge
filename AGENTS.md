@@ -72,6 +72,11 @@ a working opcda-bridge, not a redesign of it.
   shutdown even if it races with notification subscription. Build finalization must release
   ownership before publishing build capacity and resume pending cleanup on every terminal path,
   including startup failure, cancellation, spawn rejection, shutdown, and unexpected unwinding.
+  Coordination keys and persistent build-lock paths must use the canonical identity of an existing
+  database file so relative/symlink aliases cannot bypass the gate. For missing files, canonicalize
+  the parent and reattach the filename; if that cannot be done, retain the original path spelling.
+  Each `:memory:` database gets an independent coordination object and must not create or rely on a
+  filesystem build lock.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 - **Compatibility contract**: Client and gateway package versions are independent. Runtime
