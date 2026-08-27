@@ -197,7 +197,7 @@ impl AdapterInventoryControl {
     fn apply_pacing(&self, pacing: InventoryPacing) -> anyhow::Result<()> {
         self.inner.set_pacing(ExtInventoryPacing {
             min_interval: pacing.min_interval,
-            item_rate_per_second: pacing.item_rate_per_second.unwrap_or(0),
+            item_rate_per_second: pacing.item_rate_per_second,
         });
         if let Some(batch_size) = pacing.batch_size {
             self.inner.set_batch_size(batch_size).map_err(|error| {
