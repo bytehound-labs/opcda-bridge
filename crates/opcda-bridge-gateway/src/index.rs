@@ -2165,7 +2165,12 @@ impl<C: OpcClient> Drop for BuildFinalizationGuard<C> {
         if !self.armed {
             return;
         }
-        self.control.cancel();
+        self.manager.request_inventory_cancel(
+            &self.server,
+            Some(self.generation),
+            &self.control,
+            "build_unwind",
+        );
         self.manager.fail_generation_and_schedule_cleanup(
             &self.server,
             self.generation,
@@ -2297,6 +2302,24 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    fn request_inventory_cancel(
+        &self,
+        server: &str,
+        generation: Option<u64>,
+        control: &Arc<dyn InventoryControl>,
+        source: &str,
+    ) {
+        tracing::warn!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                server,
+                generation = ?generation,
+                cancellation_source = %source,
+                "requesting namespace inventory cancellation"
+        );
+        control.cancel_with_reason(source);
+    }
+
     #[cfg(test)]
     fn install_search_gate(
         &self,
@@ -2392,13 +2415,13 @@ impl<C: OpcClient> IndexManager<C> {
     pub async fn shutdown_background_indexing(&self) {
         self.background_tasks.request_shutdown();
         if let Ok(runtime) = self.runtime.lock() {
-            for state in runtime.values() {
+            for (server, state) in runtime.iter() {
                 if let Some(control) = state
                     .build
                     .as_ref()
                     .and_then(|build| build.control.as_ref())
                 {
-                    control.cancel();
+                    self.request_inventory_cancel(server, None, control, "gateway_shutdown");
                 }
             }
         }
@@ -3218,7 +3241,12 @@ impl<C: OpcClient> IndexManager<C> {
             let message = format!("unable to apply initial inventory pacing: {error}");
             let cancelled = self.take_pending_cancel(server)
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "startup_pacing_failure_cleanup",
+            );
             if cancelled {
                 self.finish_build_owned(server, &build_ownership, None);
                 return self.status(server).await;
@@ -3241,7 +3269,12 @@ impl<C: OpcClient> IndexManager<C> {
         if let Err(error) = control_result {
             let cancelled = self.take_pending_cancel(server)
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "startup_runtime_attach_failure_cleanup",
+            );
             if cancelled {
                 self.finish_build_owned(server, &build_ownership, None);
                 return self.status(server).await;
@@ -3250,7 +3283,12 @@ impl<C: OpcClient> IndexManager<C> {
             return Err(error);
         }
         if self.take_pending_cancel(server) {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "pending_cancel_after_attach",
+            );
             self.finish_build_for_control_owned(server, &handle.control, &build_ownership, None);
             return self.status(server).await;
         }
@@ -3264,7 +3302,12 @@ impl<C: OpcClient> IndexManager<C> {
             "started namespace index inventory"
         );
         if self.background_tasks.is_shutting_down() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "gateway_shutdown_before_capability_probe",
+            );
             self.finish_build_owned(server, &build_ownership, None);
             return self.status(server).await;
         }
@@ -3279,7 +3322,12 @@ impl<C: OpcClient> IndexManager<C> {
             Err(error) => {
                 let cancelled =
                     !control_was_cancelled_before_attach && handle.control.is_cancelled();
-                handle.control.cancel();
+                self.request_inventory_cancel(
+                    server,
+                    None,
+                    &handle.control,
+                    "capability_probe_failure_cleanup",
+                );
                 if cancelled {
                     self.finish_build_for_control_owned(
                         server,
@@ -3309,7 +3357,12 @@ impl<C: OpcClient> IndexManager<C> {
                 );
                 let cancelled =
                     !control_was_cancelled_before_attach && handle.control.is_cancelled();
-                handle.control.cancel();
+                self.request_inventory_cancel(
+                    server,
+                    None,
+                    &handle.control,
+                    "start_generation_failure_cleanup",
+                );
                 if cancelled {
                     self.finish_build_for_control_owned(
                         server,
@@ -3345,7 +3398,12 @@ impl<C: OpcClient> IndexManager<C> {
             });
         if let Err(error) = control_result {
             let cancelled = handle.control.is_cancelled();
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "startup_runtime_validation_failure_cleanup",
+            );
             self.abandon_generation(server, generation, &error.to_string());
             if cancelled {
                 self.finish_build_owned(server, &build_ownership, None);
@@ -3355,14 +3413,24 @@ impl<C: OpcClient> IndexManager<C> {
             return Err(error);
         }
         if !control_was_cancelled_before_attach && handle.control.is_cancelled() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "startup_cancelled",
+            );
             self.abandon_generation(server, generation, "index build cancelled during startup");
             self.finish_build_for_control_owned(server, &handle.control, &build_ownership, None);
             return self.status(server).await;
         }
         self.reconcile_pause_state(server);
         if self.background_tasks.is_shutting_down() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "gateway_shutdown_before_build_spawn",
+            );
             self.abandon_generation(server, generation, "gateway shutdown before index build");
             self.finish_build_owned(server, &build_ownership, None);
             return self.status(server).await;
@@ -3382,7 +3450,12 @@ impl<C: OpcClient> IndexManager<C> {
                     .await;
             })
         {
-            control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &control,
+                "build_spawn_rejected",
+            );
             self.abandon_generation(server, generation, "index build task was not started");
             self.finish_build_for_control_owned(server, &control, &build_ownership, None);
         }
@@ -3548,8 +3621,22 @@ impl<C: OpcClient> IndexManager<C> {
                     }
                     IndexControlAction::Cancel => {
                         if let Some(control) = &build.control {
-                            control.cancel();
+                            tracing::warn!(
+                                process_id = std::process::id(),
+                                database = %self.settings.database_path.display(),
+                                server,
+                                cancellation_source = "grpc_control_cancel",
+                                "requesting namespace inventory cancellation"
+                            );
+                            control.cancel_with_reason("grpc_control_cancel");
                         } else {
+                            tracing::warn!(
+                                process_id = std::process::id(),
+                                database = %self.settings.database_path.display(),
+                                server,
+                                cancellation_source = "grpc_control_cancel_pending",
+                                "recording namespace inventory cancellation before control attach"
+                            );
                             self.pending_cancels
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("index cancel lock poisoned"))?
@@ -3686,7 +3773,12 @@ impl<C: OpcClient> IndexManager<C> {
             match parse_maintenance_windows(&self.settings.maintenance_windows) {
                 Ok(windows) => windows,
                 Err(error) => {
-                    handle.control.cancel();
+                    self.request_inventory_cancel(
+                        &server,
+                        Some(generation),
+                        &handle.control,
+                        "maintenance_window_parse_failure_cleanup",
+                    );
                     let message = error.to_string();
                     self.fail_generation_and_schedule_cleanup(&server, generation, &message);
                     self.finish_build_for_control_owned(
@@ -3778,7 +3870,12 @@ impl<C: OpcClient> IndexManager<C> {
                         break;
                     }
                     Err(error) => {
-                        handle.control.cancel();
+                        self.request_inventory_cancel(
+                            &server,
+                            Some(generation),
+                            &handle.control,
+                            "controller_recovery_failure_cleanup",
+                        );
                         failed = Some(error.to_string());
                         break;
                     }
@@ -3815,7 +3912,12 @@ impl<C: OpcClient> IndexManager<C> {
             {
                 Ok(event) => event,
                 Err(_) => {
-                    handle.control.cancel();
+                    self.request_inventory_cancel(
+                        &server,
+                        Some(generation),
+                        &handle.control,
+                        "inventory_event_timeout",
+                    );
                     failed = Some(format!(
                         "inventory event timed out after {} seconds",
                         self.settings.operation_timeout_seconds.max(1)
@@ -3922,7 +4024,12 @@ impl<C: OpcClient> IndexManager<C> {
                                 error = %error,
                                 "namespace index pacing update failed"
                             );
-                            handle.control.cancel();
+                            self.request_inventory_cancel(
+                                &server,
+                                Some(generation),
+                                &handle.control,
+                                "adaptive_pacing_update_failure_cleanup",
+                            );
                             failed = Some(message);
                             break;
                         }

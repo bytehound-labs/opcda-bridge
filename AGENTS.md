@@ -57,7 +57,10 @@ a working opcda-bridge, not a redesign of it.
   and return of the first 128 bounded native operations with browse paths, item names, native
   durations, iterator results, and failures. Use these logs to distinguish scheduler admission
   or pacing delays from a native COM browse stall or event-delivery problem; do not infer the
-  boundary from a missing `BrowseOPCItemIDs` message alone.
+  boundary from a missing `BrowseOPCItemIDs` message alone. Inventory cancellation requests also
+  carry a source label through the gateway adapter into the native client, and repeated requests
+  report whether cancellation was already pending; use those fields to distinguish operator
+  cancellation, timeout/error cleanup, shutdown, build unwinding, and stream-drop teardown.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate

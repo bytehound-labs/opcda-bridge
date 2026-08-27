@@ -234,7 +234,9 @@ config file — see [Configuration](#configuration) below.
   During promotion, searches reuse the active generation reported by promotion-safe status rather
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
-  becomes available.
+  becomes available. Cancellation requests carry a diagnostic source label through the gateway
+  adapter into the native client; stream teardown and repeated requests remain distinguishable in
+  logs without changing cancellation semantics.
   Matching is case-insensitive with exact/prefix/contains ranking, and responses report
   `has_more` when the requested result window is exceeded. This preserves status, discovery,
   reads, writes, and lazy browse responsiveness during search.

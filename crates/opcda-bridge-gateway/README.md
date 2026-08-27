@@ -36,6 +36,10 @@ query operations for explicitly configured OPC servers. Capability responses adv
 search support, its protocol version, the configured result limit, and the server's index state.
 Indexed results contain exact ItemIDs and breadcrumb labels, never browse-session node keys.
 Refreshes run asynchronously, and gateway shutdown cancels active indexing before the process exits.
+Cancellation diagnostics include a source label at the gateway and native-client boundaries, so
+operator logs distinguish gRPC cancellation, timeout/error cleanup, shutdown, unexpected build
+unwinding, and stream-drop cleanup. Repeated requests also report whether cancellation was already
+pending.
 An inventory can complete successfully with a non-fatal warning when the OPC server rejects
 specific namespace branches; the generation remains active and usable, and the status diagnostic
 is reported as a warning unless the index state is `failed`.

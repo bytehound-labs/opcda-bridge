@@ -152,6 +152,13 @@ pub trait InventoryControl: Send + Sync {
     fn pause(&self);
     fn resume(&self);
     fn cancel(&self);
+    /// Request cancellation with a diagnostic source label.
+    ///
+    /// Implementations that do not support source propagation retain the
+    /// original cancellation behavior through this default method.
+    fn cancel_with_reason(&self, _reason: &str) {
+        self.cancel();
+    }
     /// Applies limits to subsequent native inventory calls.
     ///
     /// A failure is terminal for the active build because continuing with stale

@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Diagnostic native-inventory traces now cover the first 128 bounded operations with operation
   names, browse paths, item names, boundary/pacing waits, native durations, iterator results,
   and failures.
+- Inventory cancellation logs carry a source label through the gateway adapter into the native
+  client and report repeated cancellation requests.
 
 ## [0.4.11](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.10...opcda-bridge-gateway-v0.4.11) - 2026-08-27
 
