@@ -57,6 +57,9 @@ Example: `feat(gateway): add tag subscription support`.
   cargo mutants --package opcda-bridge --in-place --no-shuffle --timeout 180
   ```
 
+  Substitute `opcda-bridge-client` or `opcda-bridge-proto` to run a focused portable-crate
+  mutation shard.
+
   Use `--in-diff <diff-file>` for a focused diagnostic run. The weekly/manual workflow covers
   `opcda-bridge`, `opcda-bridge-client`, and `opcda-bridge-proto` on Ubuntu, and
   `opcda-bridge-gateway` on Windows so its COM-specific code is compiled and tested on the
