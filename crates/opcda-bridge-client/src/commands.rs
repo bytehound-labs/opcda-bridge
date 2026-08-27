@@ -2107,16 +2107,18 @@ mod tests {
                 .unwrap();
         let table = render_watch_status(status.clone(), OutputFormat::Table).unwrap();
         assert!(matches!(&table, WatchStatusOutput::Table(_)));
-        if let WatchStatusOutput::Table(rendered) = table {
-            assert!(rendered.contains("Health"));
-        }
+        let rendered = match table {
+            WatchStatusOutput::Table(rendered) | WatchStatusOutput::Json(rendered) => rendered,
+        };
+        assert!(rendered.contains("Health"));
 
         let json = render_watch_status(status, OutputFormat::Json).unwrap();
         assert!(matches!(&json, WatchStatusOutput::Json(_)));
-        if let WatchStatusOutput::Json(rendered) = json {
-            let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-            assert_eq!(value["state"], "ready");
-        }
+        let rendered = match json {
+            WatchStatusOutput::Table(rendered) | WatchStatusOutput::Json(rendered) => rendered,
+        };
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["state"], "ready");
     }
 
     #[tokio::test]
