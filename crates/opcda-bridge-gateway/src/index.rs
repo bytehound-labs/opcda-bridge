@@ -19,7 +19,7 @@ use std::future::Future;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -238,6 +238,12 @@ struct BackgroundTasks {
     idle: tokio::sync::Notify,
     #[cfg(test)]
     panic_next_cleanup_worker: AtomicBool,
+    #[cfg(test)]
+    cleanup_batch_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
+    #[cfg(test)]
+    cleanup_writer_gate_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
+    #[cfg(test)]
+    cleanup_notification_hook: Mutex<Option<Arc<CleanupNotificationHook>>>,
 }
 
 #[derive(Default)]
@@ -258,6 +264,69 @@ struct CleanupTaskState {
     failures: usize,
 }
 
+struct DatabaseCoordination {
+    writer_gate: Arc<Mutex<()>>,
+    active_builds: Arc<Mutex<HashSet<String>>>,
+    build_owners: Arc<Mutex<HashMap<String, Arc<()>>>>,
+    build_changed: Arc<tokio::sync::Notify>,
+}
+
+static DATABASE_COORDINATIONS: OnceLock<Mutex<HashMap<PathBuf, Weak<DatabaseCoordination>>>> =
+    OnceLock::new();
+
+fn database_coordination_key<F>(path: &Path, current_dir: F) -> PathBuf
+where
+    F: FnOnce() -> std::io::Result<PathBuf>,
+{
+    if path == Path::new(":memory:") || path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir()
+            .map(|directory| directory.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn database_coordination(path: &Path) -> Arc<DatabaseCoordination> {
+    let key = database_coordination_key(path, std::env::current_dir);
+    let registry = DATABASE_COORDINATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let coordination = Arc::new(DatabaseCoordination {
+        writer_gate: Arc::new(Mutex::new(())),
+        active_builds: Arc::new(Mutex::new(HashSet::new())),
+        build_owners: Arc::new(Mutex::new(HashMap::new())),
+        build_changed: Arc::new(tokio::sync::Notify::new()),
+    });
+    registry.insert(key, Arc::downgrade(&coordination));
+    coordination
+}
+
+#[cfg(test)]
+struct CleanupBatchHook {
+    started: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    fired: AtomicBool,
+}
+
+#[cfg(test)]
+struct BuildReservationHook {
+    started: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    fired: AtomicBool,
+}
+
+#[cfg(test)]
+struct CleanupNotificationHook {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    fired: AtomicBool,
+}
+
 #[cfg(test)]
 type SearchGate = Option<(
     tokio::sync::oneshot::Sender<()>,
@@ -273,6 +342,42 @@ impl BackgroundTasks {
             idle: tokio::sync::Notify::new(),
             #[cfg(test)]
             panic_next_cleanup_worker: AtomicBool::new(false),
+            #[cfg(test)]
+            cleanup_batch_hook: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_writer_gate_hook: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_notification_hook: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn install_cleanup_notification_hook(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.cleanup_notification_hook.lock().unwrap() = Some(Arc::new(CleanupNotificationHook {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            fired: AtomicBool::new(false),
+        }));
+        (started, release)
+    }
+
+    #[cfg(test)]
+    async fn wait_for_cleanup_notification_hook(&self) {
+        let hook = self
+            .cleanup_notification_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            hook.started.notify_one();
+            hook.release.notified().await;
         }
     }
 
@@ -309,6 +414,76 @@ impl BackgroundTasks {
     fn panic_next_cleanup_worker(&self) {
         self.panic_next_cleanup_worker
             .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn install_cleanup_batch_hook(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.cleanup_batch_hook.lock().unwrap() = Some(Arc::new(CleanupBatchHook {
+            started,
+            release: Mutex::new(release_rx),
+            fired: AtomicBool::new(false),
+        }));
+        (started_rx, release)
+    }
+
+    #[cfg(test)]
+    fn wait_for_cleanup_batch_hook(&self) {
+        let hook = self
+            .cleanup_batch_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            let _ = hook.started.send(());
+            if let Ok(release) = hook.release.lock() {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn install_cleanup_writer_gate_hook(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.cleanup_writer_gate_hook.lock().unwrap() = Some(Arc::new(CleanupBatchHook {
+            started,
+            release: Mutex::new(release_rx),
+            fired: AtomicBool::new(false),
+        }));
+        (started_rx, release)
+    }
+
+    #[cfg(test)]
+    fn wait_for_cleanup_writer_gate_hook(&self) {
+        let hook = self
+            .cleanup_writer_gate_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            let _ = hook.started.send(());
+            if let Ok(release) = hook.release.lock() {
+                let _ = release.recv();
+            }
+        }
     }
 
     fn spawn<F>(self: &Arc<Self>, future: F) -> bool
@@ -1143,6 +1318,19 @@ impl IndexDb {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    fn has_obsolete_generations(&self, server: &str) -> anyhow::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM generations
+                     WHERE server = ?1 AND state IN ('superseded', 'failed')
+                 )",
+                [server],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     fn clear_server(&mut self, server: &str) -> anyhow::Result<()> {
         let transaction = self.connection.transaction()?;
         transaction.execute("DELETE FROM entries_fts WHERE server = ?1", [server])?;
@@ -1230,8 +1418,7 @@ impl IndexDb {
         }
         let mut sql = format!(
             "SELECT e.item_id, e.display_name, e.kind, e.breadcrumbs FROM entries e
-             WHERE e.server = ? AND e.generation = {}",
-            generation
+             WHERE e.server = ? AND e.generation = {generation}"
         );
         let mut values = vec![server.to_string()];
         match mode {
@@ -1439,26 +1626,132 @@ struct CleanupStats {
     fts_entries: u64,
     generations: u64,
     stopped_for_shutdown: bool,
+    deferred_for_build: bool,
 }
 
+#[cfg(test)]
 fn cleanup_obsolete_generations(
     path: &Path,
     server: &str,
     background_tasks: &BackgroundTasks,
 ) -> anyhow::Result<CleanupStats> {
-    let cleanup_started = Instant::now();
-    let mut connection = Connection::open(path)?;
-    connection.pragma_update(None, "foreign_keys", true)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.busy_timeout(Duration::from_secs(5))?;
+    cleanup_obsolete_generations_coordinated(
+        path,
+        server,
+        background_tasks,
+        Arc::new(Mutex::new(())),
+        Arc::new(Mutex::new(HashSet::new())),
+    )
+}
 
+fn cleanup_checkpoint(
+    connection: &Connection,
+    writer_gate: &Mutex<()>,
+    active_builds: &Mutex<HashSet<String>>,
+    path: &Path,
+    server: &str,
+) -> rusqlite::Result<(i64, i64)> {
+    let writer_guard = writer_gate
+        .lock()
+        .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+    let active = active_builds
+        .lock()
+        .map(|builds| !builds.is_empty())
+        .unwrap_or(true);
+    let result = if active {
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %path.display(),
+            server,
+            "skipping namespace index cleanup checkpoint while a build is active"
+        );
+        Err(rusqlite::Error::ExecuteReturnedResults)
+    } else {
+        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+    };
+    drop(writer_guard);
+    result
+}
+
+fn cleanup_obsolete_generations_coordinated(
+    path: &Path,
+    server: &str,
+    background_tasks: &BackgroundTasks,
+    writer_gate: Arc<Mutex<()>>,
+    active_builds: Arc<Mutex<HashSet<String>>>,
+) -> anyhow::Result<CleanupStats> {
+    let cleanup_started = Instant::now();
+    let read_only = IndexDb::open_read_only(path)?;
+    if !read_only.has_obsolete_generations(server)? {
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %path.display(),
+            server,
+            "skipped namespace index cleanup because no obsolete generations exist"
+        );
+        return Ok(CleanupStats::default());
+    }
+    let mut connection = None;
     let mut stats = CleanupStats::default();
     loop {
         if background_tasks.is_shutting_down() {
             stats.stopped_for_shutdown = true;
             break;
         }
-        let transaction = connection.transaction()?;
+        let build_active = || {
+            active_builds
+                .lock()
+                .map(|builds| !builds.is_empty())
+                .unwrap_or(true)
+        };
+        if build_active() {
+            stats.deferred_for_build = true;
+            tracing::info!(
+                process_id = std::process::id(),
+                database = %path.display(),
+                server,
+                "deferring namespace index cleanup while an index build is active"
+            );
+            break;
+        }
+        if !read_only.has_obsolete_generations(server)? {
+            break;
+        }
+        #[cfg(test)]
+        background_tasks.wait_for_cleanup_writer_gate_hook();
+        let writer_guard = writer_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index writer gate poisoned"))?;
+        if build_active() {
+            stats.deferred_for_build = true;
+            tracing::info!(
+                process_id = std::process::id(),
+                database = %path.display(),
+                server,
+                "deferring namespace index cleanup after waiting for the writer gate"
+            );
+            drop(writer_guard);
+            break;
+        }
+        if !read_only.has_obsolete_generations(server)? {
+            drop(writer_guard);
+            break;
+        }
+        #[cfg(test)]
+        background_tasks.wait_for_cleanup_batch_hook();
+        if connection.is_none() {
+            let opened = Connection::open(path)?;
+            opened.pragma_update(None, "foreign_keys", true)?;
+            opened.pragma_update(None, "journal_mode", "WAL")?;
+            opened.busy_timeout(Duration::from_secs(5))?;
+            connection = Some(opened);
+        }
+        let transaction = connection
+            .as_mut()
+            .expect("cleanup connection initialized")
+            .transaction()?;
         let fts_entries = transaction.execute(
             "DELETE FROM entries_fts
              WHERE rowid IN (
@@ -1507,13 +1800,20 @@ fn cleanup_obsolete_generations(
         stats.fts_entries = stats.fts_entries.saturating_add(fts_entries as u64);
         stats.entries = stats.entries.saturating_add(entries as u64);
         stats.generations = stats.generations.saturating_add(generations as u64);
+        drop(writer_guard);
         if fts_entries == 0 && entries == 0 && generations == 0 {
             break;
         }
         std::thread::sleep(CLEANUP_BATCH_PAUSE);
     }
-    let checkpoint = connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    let checkpoint = connection.as_ref().map(|connection| {
+        cleanup_checkpoint(
+            connection,
+            writer_gate.as_ref(),
+            active_builds.as_ref(),
+            path,
+            server,
+        )
     });
     tracing::info!(
         process_id = std::process::id(),
@@ -1524,6 +1824,7 @@ fn cleanup_obsolete_generations(
         fts_entries_deleted = stats.fts_entries,
         generations_deleted = stats.generations,
         stopped_for_shutdown = stats.stopped_for_shutdown,
+        deferred_for_build = stats.deferred_for_build,
         checkpoint = ?checkpoint,
         duration_ms = cleanup_started.elapsed().as_millis() as u64,
         "completed namespace index obsolete-generation cleanup"
@@ -1536,7 +1837,9 @@ async fn run_scheduled_cleanup(
     server: String,
     background_tasks: Arc<BackgroundTasks>,
     cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    coordination: Arc<DatabaseCoordination>,
 ) {
+    let mut shutdown = background_tasks.subscribe();
     let mut consecutive_failures = 0_u32;
     loop {
         let should_run = cleanup_tasks
@@ -1544,7 +1847,7 @@ async fn run_scheduled_cleanup(
             .map(|mut tasks| {
                 let task = tasks.entry(server.clone()).or_default();
                 task.requested = false;
-                !background_tasks.is_shutting_down()
+                !background_tasks.is_shutting_down() && !*shutdown.borrow()
             })
             .unwrap_or(false);
         if !should_run {
@@ -1557,6 +1860,7 @@ async fn run_scheduled_cleanup(
         let cleanup_path = path.clone();
         let cleanup_server = server.clone();
         let background_tasks_for_blocking = Arc::clone(&background_tasks);
+        let coordination_for_blocking = Arc::clone(&coordination);
         let result = match tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if background_tasks_for_blocking
@@ -1565,10 +1869,12 @@ async fn run_scheduled_cleanup(
             {
                 panic!("injected namespace index cleanup worker panic");
             }
-            cleanup_obsolete_generations(
+            cleanup_obsolete_generations_coordinated(
                 &cleanup_path,
                 &cleanup_server,
                 background_tasks_for_blocking.as_ref(),
+                Arc::clone(&coordination_for_blocking.writer_gate),
+                Arc::clone(&coordination_for_blocking.active_builds),
             )
         })
         .await
@@ -1579,6 +1885,40 @@ async fn run_scheduled_cleanup(
             )),
         };
         match result {
+            Ok(stats) if stats.deferred_for_build => {
+                if let Ok(mut tasks) = cleanup_tasks.lock()
+                    && let Some(task) = tasks.get_mut(&server)
+                {
+                    task.requested = true;
+                }
+                tracing::debug!(
+                    process_id = std::process::id(),
+                    database = %path.display(),
+                    server,
+                    "namespace index cleanup remains pending until builds terminate"
+                );
+                let notified = coordination.build_changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let build_active = coordination
+                    .active_builds
+                    .lock()
+                    .map(|builds| !builds.is_empty())
+                    .unwrap_or(true);
+                if !build_active {
+                    continue;
+                }
+                #[cfg(test)]
+                background_tasks.wait_for_cleanup_notification_hook().await;
+                if *shutdown.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = shutdown.changed() => return,
+                }
+                continue;
+            }
             Ok(_) => {}
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
@@ -1627,6 +1967,87 @@ async fn run_scheduled_cleanup(
     }
 }
 
+struct CleanupWorkerGuard {
+    active: Arc<AtomicBool>,
+    path: PathBuf,
+    background_tasks: Arc<BackgroundTasks>,
+    cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    coordination: Arc<DatabaseCoordination>,
+}
+
+impl Drop for CleanupWorkerGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        spawn_cleanup_worker_if_idle(
+            Arc::clone(&self.active),
+            self.path.clone(),
+            Arc::clone(&self.background_tasks),
+            Arc::clone(&self.cleanup_tasks),
+            Arc::clone(&self.coordination),
+            false,
+        );
+    }
+}
+
+fn spawn_cleanup_worker_if_idle(
+    active: Arc<AtomicBool>,
+    path: PathBuf,
+    background_tasks: Arc<BackgroundTasks>,
+    cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    coordination: Arc<DatabaseCoordination>,
+    reject_spawn: bool,
+) {
+    if active.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let server = match cleanup_tasks.lock() {
+        Ok(mut tasks) => {
+            let server = tasks
+                .iter()
+                .find_map(|(server, task)| task.requested.then(|| server.clone()));
+            if let Some(server) = &server
+                && let Some(task) = tasks.get_mut(server)
+            {
+                task.running = true;
+            }
+            server
+        }
+        Err(_) => None,
+    };
+    let Some(server) = server else {
+        active.store(false, Ordering::Release);
+        return;
+    };
+    let worker_active = Arc::clone(&active);
+    let worker_path = path.clone();
+    let worker_tasks = Arc::clone(&background_tasks);
+    let worker_cleanup_tasks = Arc::clone(&cleanup_tasks);
+    let worker_coordination = Arc::clone(&coordination);
+    let worker_background_tasks = Arc::clone(&background_tasks);
+    let spawned = !reject_spawn
+        && background_tasks.spawn(async move {
+            let _worker_guard = CleanupWorkerGuard {
+                active: worker_active,
+                path: worker_path,
+                background_tasks: worker_tasks,
+                cleanup_tasks: Arc::clone(&worker_cleanup_tasks),
+                coordination: Arc::clone(&worker_coordination),
+            };
+            run_scheduled_cleanup(
+                path,
+                server,
+                worker_background_tasks,
+                worker_cleanup_tasks,
+                worker_coordination,
+            )
+            .await;
+        });
+    if !spawned && let Ok(mut tasks) = cleanup_tasks.lock() {
+        tasks.retain(|_, task| !task.running);
+        active.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 struct DbStatus {
     generation: u64,
@@ -1651,6 +2072,9 @@ pub struct IndexManager<C: OpcClient> {
     client: Arc<C>,
     settings: ResolvedIndexConfig,
     database: Arc<Mutex<Option<IndexDb>>>,
+    coordination: Arc<DatabaseCoordination>,
+    writer_gate: Arc<Mutex<()>>,
+    build_changed: Arc<tokio::sync::Notify>,
     build_locks: Arc<Mutex<HashMap<String, BuildFileLock>>>,
     runtime: Arc<Mutex<HashMap<String, RuntimeState>>>,
     active_builds: Arc<Mutex<HashSet<String>>>,
@@ -1663,13 +2087,75 @@ pub struct IndexManager<C: OpcClient> {
     host_metrics: Arc<dyn HostMetricsProvider>,
     background_tasks: Arc<BackgroundTasks>,
     cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    cleanup_worker_active: Arc<AtomicBool>,
     background_started: AtomicBool,
     #[cfg(test)]
     reject_next_build_spawn: AtomicBool,
     #[cfg(test)]
     reject_next_cleanup_spawn: AtomicBool,
     #[cfg(test)]
+    build_reservation_hook: Mutex<Option<Arc<BuildReservationHook>>>,
+    #[cfg(test)]
     search_gate: Arc<Mutex<SearchGate>>,
+}
+
+struct BuildFinalizationGuard<C: OpcClient> {
+    manager: Arc<IndexManager<C>>,
+    server: String,
+    generation: u64,
+    control: Arc<dyn InventoryControl>,
+    ownership: Arc<()>,
+    armed: bool,
+}
+
+impl<C: OpcClient> BuildFinalizationGuard<C> {
+    fn new(
+        manager: Arc<IndexManager<C>>,
+        server: String,
+        generation: u64,
+        control: Arc<dyn InventoryControl>,
+        ownership: Arc<()>,
+    ) -> Self {
+        Self {
+            manager,
+            server,
+            generation,
+            control,
+            ownership,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<C: OpcClient> Drop for BuildFinalizationGuard<C> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.control.cancel();
+        self.manager.fail_generation_and_schedule_cleanup(
+            &self.server,
+            self.generation,
+            "namespace index build unwound unexpectedly",
+        );
+        self.manager.finish_build_for_control_owned(
+            &self.server,
+            &self.control,
+            &self.ownership,
+            Some("namespace index build unwound unexpectedly".into()),
+        );
+        tracing::error!(
+            process_id = std::process::id(),
+            database = %self.manager.settings.database_path.display(),
+            server = %self.server,
+            generation = self.generation,
+            "namespace index build unwound unexpectedly; ownership was released"
+        );
+    }
 }
 
 fn storage_diagnostics_for_path(path: &Path) -> StorageDiagnostics {
@@ -1696,6 +2182,7 @@ impl<C: OpcClient> IndexManager<C> {
     pub fn new(client: Arc<C>, settings: ResolvedIndexConfig) -> Self {
         let cache_capacity = settings.query_cache_capacity.max(1);
         let host_metrics = default_host_metrics_provider(&settings.database_path);
+        let coordination = database_coordination(&settings.database_path);
         tracing::debug!(
             process_id = std::process::id(),
             database = %settings.database_path.display(),
@@ -1708,9 +2195,12 @@ impl<C: OpcClient> IndexManager<C> {
             client,
             settings,
             database: Arc::new(Mutex::new(None)),
+            coordination: Arc::clone(&coordination),
+            writer_gate: Arc::clone(&coordination.writer_gate),
+            build_changed: Arc::clone(&coordination.build_changed),
             build_locks: Arc::new(Mutex::new(HashMap::new())),
             runtime: Arc::new(Mutex::new(HashMap::new())),
-            active_builds: Arc::new(Mutex::new(HashSet::new())),
+            active_builds: Arc::clone(&coordination.active_builds),
             pending_cancels: Arc::new(Mutex::new(HashSet::new())),
             promoting: Arc::new(Mutex::new(HashSet::new())),
             foreground_users: Arc::new(Mutex::new(HashMap::new())),
@@ -1724,11 +2214,14 @@ impl<C: OpcClient> IndexManager<C> {
             host_metrics,
             background_tasks: Arc::new(BackgroundTasks::new()),
             cleanup_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cleanup_worker_active: Arc::new(AtomicBool::new(false)),
             background_started: AtomicBool::new(false),
             #[cfg(test)]
             reject_next_build_spawn: AtomicBool::new(false),
             #[cfg(test)]
             reject_next_cleanup_spawn: AtomicBool::new(false),
+            #[cfg(test)]
+            build_reservation_hook: Mutex::new(None),
             #[cfg(test)]
             search_gate: Arc::new(Mutex::new(None)),
         }
@@ -1786,6 +2279,41 @@ impl<C: OpcClient> IndexManager<C> {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.search_gate.lock().unwrap() = Some((started_tx, release_rx));
         (started_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    fn install_build_reservation_hook(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.build_reservation_hook.lock().unwrap() = Some(Arc::new(BuildReservationHook {
+            started,
+            release: Mutex::new(release_rx),
+            fired: AtomicBool::new(false),
+        }));
+        (started_rx, release)
+    }
+
+    #[cfg(test)]
+    fn wait_for_build_reservation_hook(&self) {
+        let hook = self
+            .build_reservation_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            let _ = hook.started.send(());
+            if let Ok(release) = hook.release.lock() {
+                let _ = release.recv();
+            }
+        }
     }
 
     pub fn start_background_indexing(self: &Arc<Self>) {
@@ -1908,7 +2436,7 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     async fn active_profile_changed(&self, server: &str) -> anyhow::Result<bool> {
-        let stored_profile = match self.with_database(|db| db.active_profile(server)) {
+        let stored_profile = match self.with_database_read(|db| db.active_profile(server)) {
             Ok(Some(stored_profile)) => stored_profile,
             Ok(None) => {
                 tracing::warn!(
@@ -1964,7 +2492,7 @@ impl<C: OpcClient> IndexManager<C> {
                             "automatic namespace index rebuild is waiting for a maintenance window"
                         );
                     } else {
-                        if let Err(error) = self.with_database(|db| db.clear_server(server)) {
+                        if let Err(error) = self.with_database_write(|db| db.clear_server(server)) {
                             tracing::warn!(
                                 server = %server,
                                 error = %error,
@@ -2282,7 +2810,7 @@ impl<C: OpcClient> IndexManager<C> {
                 }
             }
         } else {
-            self.with_database(|db| db.status_rows(server))?
+            self.with_database_read(|db| db.status_rows(server))?
         };
         let active_row = rows.iter().find(|row| row.state == "active").cloned();
         let staging_row = rows.iter().find(|row| row.state == "staging").cloned();
@@ -2487,7 +3015,7 @@ impl<C: OpcClient> IndexManager<C> {
         if self.background_tasks.is_shutting_down() {
             return self.status(server).await;
         }
-        let storage = self.with_database(|db| Ok(db.storage_diagnostics()))?;
+        let storage = self.with_database_read(|db| Ok(db.storage_diagnostics()))?;
         if storage.free_bytes.is_some_and(|free| {
             free < self
                 .settings
@@ -2503,7 +3031,7 @@ impl<C: OpcClient> IndexManager<C> {
             );
         }
         self.load_persisted_retry_state(server)?;
-        let should_start = {
+        let build_ownership = {
             let foreground_users = self
                 .foreground_users
                 .lock()
@@ -2527,7 +3055,7 @@ impl<C: OpcClient> IndexManager<C> {
                     .is_some_and(|retry| SystemTime::now() < retry);
             let circuit_open = !force && state.circuit_open;
             if state.build.is_some() || backing_off || circuit_open {
-                false
+                None
             } else if active_builds >= self.settings.concurrency.max(1) as usize {
                 anyhow::bail!("namespace index build concurrency limit reached");
             } else {
@@ -2541,6 +3069,28 @@ impl<C: OpcClient> IndexManager<C> {
                     );
                 }
                 let lock = BuildFileLock::acquire(&self.settings.database_path, server)?;
+                #[cfg(test)]
+                self.wait_for_build_reservation_hook();
+                let ownership = Arc::new(());
+                let mut build_owners = self
+                    .coordination
+                    .build_owners
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("index build-owner registry poisoned"))?;
+                if build_owners.contains_key(server) {
+                    anyhow::bail!(
+                        "index build owner is already registered in this process for server {server}"
+                    );
+                }
+                let mut active_builds = self
+                    .active_builds
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("index active-build lock poisoned"))?;
+                if active_builds.len() >= self.settings.concurrency.max(1) as usize {
+                    anyhow::bail!("namespace index build concurrency limit reached");
+                }
+                build_owners.insert(server.to_string(), Arc::clone(&ownership));
+                active_builds.insert(server.to_string());
                 build_locks.insert(server.to_string(), lock);
                 state.build = Some(RuntimeBuild {
                     control: None,
@@ -2556,16 +3106,12 @@ impl<C: OpcClient> IndexManager<C> {
                     last_commit_latency_ms: None,
                 });
                 state.last_error = None;
-                self.active_builds
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("index active-build lock poisoned"))?
-                    .insert(server.to_string());
-                true
+                Some(ownership)
             }
         };
-        if !should_start {
+        let Some(build_ownership) = build_ownership else {
             return self.status(server).await;
-        }
+        };
 
         let initial_limits = self.initial_inventory_limits();
         let handle = match self
@@ -2579,10 +3125,10 @@ impl<C: OpcClient> IndexManager<C> {
             Ok(handle) => handle,
             Err(error) => {
                 if self.take_pending_cancel(server) {
-                    self.finish_build(server, None);
+                    self.finish_build_owned(server, &build_ownership, None);
                     return self.status(server).await;
                 }
-                self.record_start_failure(server, &error.to_string())?;
+                self.record_start_failure(server, &build_ownership, &error.to_string())?;
                 return Err(error);
             }
         };
@@ -2593,10 +3139,10 @@ impl<C: OpcClient> IndexManager<C> {
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
             handle.control.cancel();
             if cancelled {
-                self.finish_build(server, None);
+                self.finish_build_owned(server, &build_ownership, None);
                 return self.status(server).await;
             }
-            self.record_start_failure(server, &message)?;
+            self.record_start_failure(server, &build_ownership, &message)?;
             return Err(anyhow::anyhow!(message));
         }
         let control_result = self
@@ -2616,15 +3162,15 @@ impl<C: OpcClient> IndexManager<C> {
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
             handle.control.cancel();
             if cancelled {
-                self.finish_build(server, None);
+                self.finish_build_owned(server, &build_ownership, None);
                 return self.status(server).await;
             }
-            self.finish_build(server, Some(error.to_string()));
+            self.finish_build_owned(server, &build_ownership, Some(error.to_string()));
             return Err(error);
         }
         if self.take_pending_cancel(server) {
             handle.control.cancel();
-            self.finish_build_for_control(server, &handle.control, None);
+            self.finish_build_for_control_owned(server, &handle.control, &build_ownership, None);
             return self.status(server).await;
         }
         tracing::info!(
@@ -2638,7 +3184,7 @@ impl<C: OpcClient> IndexManager<C> {
         );
         if self.background_tasks.is_shutting_down() {
             handle.control.cancel();
-            self.finish_build(server, None);
+            self.finish_build_owned(server, &build_ownership, None);
             return self.status(server).await;
         }
         let (organization, source) = match self
@@ -2654,14 +3200,19 @@ impl<C: OpcClient> IndexManager<C> {
                     !control_was_cancelled_before_attach && handle.control.is_cancelled();
                 handle.control.cancel();
                 if cancelled {
-                    self.finish_build_for_control(server, &handle.control, None);
+                    self.finish_build_for_control_owned(
+                        server,
+                        &handle.control,
+                        &build_ownership,
+                        None,
+                    );
                     return self.status(server).await;
                 }
-                self.record_start_failure(server, &error.to_string())?;
+                self.record_start_failure(server, &build_ownership, &error.to_string())?;
                 return Err(error);
             }
         };
-        let generation = self.with_database(|db| {
+        let generation = self.with_database_write(|db| {
             db.start_generation(server, organization, source, &timestamp_now())
         });
         let generation = match generation {
@@ -2679,10 +3230,15 @@ impl<C: OpcClient> IndexManager<C> {
                     !control_was_cancelled_before_attach && handle.control.is_cancelled();
                 handle.control.cancel();
                 if cancelled {
-                    self.finish_build_for_control(server, &handle.control, None);
+                    self.finish_build_for_control_owned(
+                        server,
+                        &handle.control,
+                        &build_ownership,
+                        None,
+                    );
                     return self.status(server).await;
                 }
-                self.record_start_failure(server, &error.to_string())?;
+                self.record_start_failure(server, &build_ownership, &error.to_string())?;
                 return Err(error);
             }
         };
@@ -2711,23 +3267,23 @@ impl<C: OpcClient> IndexManager<C> {
             handle.control.cancel();
             self.abandon_generation(server, generation, &error.to_string());
             if cancelled {
-                self.finish_build(server, None);
+                self.finish_build_owned(server, &build_ownership, None);
                 return self.status(server).await;
             }
-            self.finish_build(server, Some(error.to_string()));
+            self.finish_build_owned(server, &build_ownership, Some(error.to_string()));
             return Err(error);
         }
         if !control_was_cancelled_before_attach && handle.control.is_cancelled() {
             handle.control.cancel();
             self.abandon_generation(server, generation, "index build cancelled during startup");
-            self.finish_build_for_control(server, &handle.control, None);
+            self.finish_build_for_control_owned(server, &handle.control, &build_ownership, None);
             return self.status(server).await;
         }
         self.reconcile_pause_state(server);
         if self.background_tasks.is_shutting_down() {
             handle.control.cancel();
             self.abandon_generation(server, generation, "gateway shutdown before index build");
-            self.finish_build(server, None);
+            self.finish_build_owned(server, &build_ownership, None);
             return self.status(server).await;
         }
         let manager = Arc::clone(self);
@@ -2737,14 +3293,17 @@ impl<C: OpcClient> IndexManager<C> {
         let reject_spawn = self.reject_next_build_spawn.swap(false, Ordering::AcqRel);
         #[cfg(not(test))]
         let reject_spawn = false;
+        let build_ownership_for_task = Arc::clone(&build_ownership);
         if reject_spawn
             || !self.background_tasks.spawn(async move {
-                manager.run_build(server_name, generation, handle).await;
+                manager
+                    .run_build(server_name, generation, handle, build_ownership_for_task)
+                    .await;
             })
         {
             control.cancel();
             self.abandon_generation(server, generation, "index build task was not started");
-            self.finish_build_for_control(server, &control, None);
+            self.finish_build_for_control_owned(server, &control, &build_ownership, None);
         }
         self.status(server).await
     }
@@ -2815,7 +3374,7 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn load_persisted_retry_state(&self, server: &str) -> anyhow::Result<()> {
-        let persisted = self.with_database(|db| db.retry_state(server))?;
+        let persisted = self.with_database_read(|db| db.retry_state(server))?;
         let mut runtime = self
             .runtime
             .lock()
@@ -2952,7 +3511,7 @@ impl<C: OpcClient> IndexManager<C> {
         } else if status.state == IndexState::Promoting {
             None
         } else {
-            self.with_database(|db| db.search_generation(server))?
+            self.with_database_read(|db| db.search_generation(server))?
         };
         let Some(generation) = generation else {
             return Ok(IndexedSearch {
@@ -2986,7 +3545,7 @@ impl<C: OpcClient> IndexManager<C> {
         #[cfg(test)]
         let search_gate = self.search_gate.lock().unwrap().take();
         let mut matches = if database_path == Path::new(":memory:") {
-            self.with_database(|db| db.search(server, generation, query, mode, limit))?
+            self.with_database_read(|db| db.search(server, generation, query, mode, limit))?
         } else {
             tokio::task::spawn_blocking(move || {
                 #[cfg(test)]
@@ -3032,7 +3591,15 @@ impl<C: OpcClient> IndexManager<C> {
         server: String,
         generation: u64,
         mut handle: InventoryHandle,
+        ownership: Arc<()>,
     ) {
+        let mut finalization = BuildFinalizationGuard::new(
+            Arc::clone(&self),
+            server.clone(),
+            generation,
+            Arc::clone(&handle.control),
+            Arc::clone(&ownership),
+        );
         let build_started = Instant::now();
         let maintenance_windows =
             match parse_maintenance_windows(&self.settings.maintenance_windows) {
@@ -3041,7 +3608,13 @@ impl<C: OpcClient> IndexManager<C> {
                     handle.control.cancel();
                     let message = error.to_string();
                     self.fail_generation_and_schedule_cleanup(&server, generation, &message);
-                    self.finish_build_for_control(&server, &handle.control, Some(message));
+                    self.finish_build_for_control_owned(
+                        &server,
+                        &handle.control,
+                        &ownership,
+                        Some(message),
+                    );
+                    finalization.disarm();
                     return;
                 }
             };
@@ -3174,9 +3747,9 @@ impl<C: OpcClient> IndexManager<C> {
                         .saturating_sub(accounted_active_time_ms);
                     accounted_active_time_ms = progress.active_time_ms;
                     last_progress = progress.clone();
-                    if let Err(error) =
-                        self.with_database(|db| db.update_progress(&server, generation, &progress))
-                    {
+                    if let Err(error) = self.with_database_write(|db| {
+                        db.update_progress(&server, generation, &progress)
+                    }) {
                         tracing::error!(
                             process_id = std::process::id(),
                             database = %self.settings.database_path.display(),
@@ -3320,12 +3893,12 @@ impl<C: OpcClient> IndexManager<C> {
                 error = %error,
                 "namespace index build failed"
             );
-            self.finish_build_for_control(&server, &handle.control, Some(error));
+            self.finish_build_for_control_owned(&server, &handle.control, &ownership, Some(error));
         } else if completed && !cancelled && !handle.control.is_cancelled() {
             let result = match self.mark_promoting(&server) {
                 Ok(()) => {
                     let completed_at = timestamp_now();
-                    let result = self.with_database(|db| {
+                    let result = self.with_database_write(|db| {
                         db.promote_with_profile(
                             &server,
                             generation,
@@ -3367,7 +3940,7 @@ impl<C: OpcClient> IndexManager<C> {
                             "namespace index completed with warning"
                         );
                     }
-                    self.finish_build_for_control(&server, &handle.control, None);
+                    self.finish_build_for_control_owned(&server, &handle.control, &ownership, None);
                 }
                 Err(error) => {
                     tracing::error!(
@@ -3384,9 +3957,10 @@ impl<C: OpcClient> IndexManager<C> {
                         generation,
                         &error.to_string(),
                     );
-                    self.finish_build_for_control(
+                    self.finish_build_for_control_owned(
                         &server,
                         &handle.control,
+                        &ownership,
                         Some(error.to_string()),
                     );
                 }
@@ -3402,8 +3976,9 @@ impl<C: OpcClient> IndexManager<C> {
                 cancelled,
                 "namespace index build cancelled"
             );
-            self.finish_build_for_control(&server, &handle.control, None);
+            self.finish_build_for_control_owned(&server, &handle.control, &ownership, None);
         }
+        finalization.disarm();
     }
 
     fn commit_pending_entries(
@@ -3416,7 +3991,7 @@ impl<C: OpcClient> IndexManager<C> {
             return Ok(0);
         }
         let started = Instant::now();
-        let result = self.with_database(|db| db.insert_entries(server, generation, pending));
+        let result = self.with_database_write(|db| db.insert_entries(server, generation, pending));
         if let Ok(mut runtime) = self.runtime.lock()
             && let Some(build) = runtime
                 .get_mut(server)
@@ -3792,79 +4367,117 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    #[cfg(test)]
     fn finish_build(&self, server: &str, error: Option<String>) {
-        if let Ok(mut runtime) = self.runtime.lock()
-            && let Some(state) = runtime.get_mut(server)
-        {
-            state.last_error = error.clone();
-            if error.is_some() {
-                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-                state.circuit_open =
-                    state.consecutive_failures >= self.settings.circuit_failure_threshold;
-                state.retry_after = Some(
-                    SystemTime::now()
-                        + retry_delay(
-                            server,
-                            state.consecutive_failures,
-                            state.circuit_open,
-                            self.settings.circuit_open_seconds,
-                        ),
-                );
-            } else {
-                state.retry_after = None;
-                state.consecutive_failures = 0;
-                state.circuit_open = false;
-            }
-            state.build = None;
-        }
-        let _ = self.persist_retry_state(server);
-        self.clear_pause_overlays(server);
-        self.clear_build_lock(server);
-        self.clear_active_build(server);
-        self.clear_pending_cancel(server);
+        let ownership = self
+            .coordination
+            .build_owners
+            .lock()
+            .ok()
+            .and_then(|owners| owners.get(server).cloned());
+        self.finish_build_inner(server, None, ownership.as_ref(), error);
     }
 
+    #[cfg(test)]
     fn finish_build_for_control(
         &self,
         server: &str,
         control: &Arc<dyn InventoryControl>,
         error: Option<String>,
     ) {
+        let ownership = self
+            .coordination
+            .build_owners
+            .lock()
+            .ok()
+            .and_then(|owners| owners.get(server).cloned());
+        self.finish_build_inner(server, Some(control), ownership.as_ref(), error);
+    }
+
+    fn finish_build_owned(&self, server: &str, ownership: &Arc<()>, error: Option<String>) {
+        self.finish_build_inner(server, None, Some(ownership), error);
+    }
+
+    fn finish_build_for_control_owned(
+        &self,
+        server: &str,
+        control: &Arc<dyn InventoryControl>,
+        ownership: &Arc<()>,
+        error: Option<String>,
+    ) {
+        self.finish_build_inner(server, Some(control), Some(ownership), error);
+    }
+
+    fn finish_build_inner(
+        &self,
+        server: &str,
+        control: Option<&Arc<dyn InventoryControl>>,
+        ownership: Option<&Arc<()>>,
+        error: Option<String>,
+    ) {
         let owns_build = match self.runtime.lock() {
             Ok(mut runtime) => {
-                if let Some(state) = runtime.get_mut(server) {
-                    let is_current = state
-                        .build
-                        .as_ref()
-                        .and_then(|build| build.control.as_ref())
-                        .is_some_and(|current| Arc::ptr_eq(current, control));
-                    if is_current {
-                        state.last_error = error.clone();
-                        if error.is_some() {
-                            state.consecutive_failures =
-                                state.consecutive_failures.saturating_add(1);
-                            state.circuit_open = state.consecutive_failures
-                                >= self.settings.circuit_failure_threshold;
-                            state.retry_after = Some(
-                                SystemTime::now()
-                                    + retry_delay(
-                                        server,
-                                        state.consecutive_failures,
-                                        state.circuit_open,
-                                        self.settings.circuit_open_seconds,
-                                    ),
+                let is_owner = if let Some(ownership) = ownership {
+                    let token_matches = match self.coordination.build_owners.lock() {
+                        Ok(owners) => owners
+                            .get(server)
+                            .is_some_and(|current| Arc::ptr_eq(current, ownership)),
+                        Err(_) => {
+                            tracing::error!(
+                                process_id = std::process::id(),
+                                database = %self.settings.database_path.display(),
+                                server,
+                                "unable to finalize namespace index build because the ownership registry is poisoned"
                             );
-                        } else {
-                            state.retry_after = None;
-                            state.consecutive_failures = 0;
-                            state.circuit_open = false;
+                            return;
                         }
-                        let _ = state.build.take();
+                    };
+                    let control_matches = match control {
+                        Some(control) => runtime.get(server).is_none_or(|state| {
+                            state.build.as_ref().is_none_or(|build| {
+                                build
+                                    .control
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, control))
+                            })
+                        }),
+                        None => true,
+                    };
+                    token_matches && control_matches
+                } else if let Some(state) = runtime.get(server) {
+                    match control {
+                        Some(control) => state
+                            .build
+                            .as_ref()
+                            .and_then(|build| build.control.as_ref())
+                            .is_some_and(|current| Arc::ptr_eq(current, control)),
+                        None => state.build.is_some(),
                     }
-                    is_current
                 } else {
                     false
+                };
+                if is_owner && let Some(state) = runtime.get_mut(server) {
+                    state.last_error = error.clone();
+                    if error.is_some() {
+                        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                        state.circuit_open =
+                            state.consecutive_failures >= self.settings.circuit_failure_threshold;
+                        state.retry_after = Some(
+                            SystemTime::now()
+                                + retry_delay(
+                                    server,
+                                    state.consecutive_failures,
+                                    state.circuit_open,
+                                    self.settings.circuit_open_seconds,
+                                ),
+                        );
+                    } else {
+                        state.retry_after = None;
+                        state.consecutive_failures = 0;
+                        state.circuit_open = false;
+                    }
                 }
+                is_owner
             }
             Err(_) => {
                 tracing::error!(
@@ -3879,11 +4492,25 @@ impl<C: OpcClient> IndexManager<C> {
         if owns_build {
             let _ = self.persist_retry_state(server);
             self.clear_pause_overlays(server);
-        }
-        if owns_build {
-            self.clear_build_lock(server);
+            if let Ok(mut owners) = self.coordination.build_owners.lock()
+                && ownership.is_none_or(|ownership| {
+                    owners
+                        .get(server)
+                        .is_some_and(|current| Arc::ptr_eq(current, ownership))
+                })
+            {
+                owners.remove(server);
+            }
             self.clear_active_build(server);
-        } else {
+            self.clear_build_lock(server);
+            if let Ok(mut runtime) = self.runtime.lock()
+                && let Some(state) = runtime.get_mut(server)
+            {
+                let _ = state.build.take();
+            }
+            self.schedule_cleanup(server);
+            self.clear_pending_cancel(server);
+        } else if control.is_some() {
             tracing::warn!(
                 process_id = std::process::id(),
                 database = %self.settings.database_path.display(),
@@ -3891,34 +4518,15 @@ impl<C: OpcClient> IndexManager<C> {
                 "ignored completion from obsolete namespace index build"
             );
         }
-        self.clear_pending_cancel(server);
     }
 
-    fn record_start_failure(&self, server: &str, error: &str) -> anyhow::Result<()> {
-        let mut runtime = self
-            .runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
-        let state = runtime.entry(server.to_string()).or_default();
-        state.last_error = Some(error.to_string());
-        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        state.circuit_open = state.consecutive_failures >= self.settings.circuit_failure_threshold;
-        state.retry_after = Some(
-            SystemTime::now()
-                + retry_delay(
-                    server,
-                    state.consecutive_failures,
-                    state.circuit_open,
-                    self.settings.circuit_open_seconds,
-                ),
-        );
-        state.build = None;
-        drop(runtime);
-        self.persist_retry_state(server)?;
-        self.clear_pause_overlays(server);
-        self.clear_build_lock(server);
-        self.clear_active_build(server);
-        self.clear_pending_cancel(server);
+    fn record_start_failure(
+        &self,
+        server: &str,
+        ownership: &Arc<()>,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.finish_build_owned(server, ownership, Some(error.to_string()));
         Ok(())
     }
 
@@ -3936,7 +4544,9 @@ impl<C: OpcClient> IndexManager<C> {
                 )
             })
             .unwrap_or((None, 0, false));
-        self.with_database(|db| db.set_retry_state(server, retry_after, failures, circuit_open))
+        self.with_database_write(|db| {
+            db.set_retry_state(server, retry_after, failures, circuit_open)
+        })
     }
 
     fn clear_build_lock(&self, server: &str) {
@@ -3948,11 +4558,12 @@ impl<C: OpcClient> IndexManager<C> {
     fn clear_active_build(&self, server: &str) {
         if let Ok(mut active) = self.active_builds.lock() {
             active.remove(server);
+            self.build_changed.notify_waiters();
         }
     }
 
     fn fail_generation_and_schedule_cleanup(&self, server: &str, generation: u64, error: &str) {
-        match self.with_database(|db| db.fail_generation(server, generation, error)) {
+        match self.with_database_write(|db| db.fail_generation(server, generation, error)) {
             Ok(()) => self.schedule_cleanup(server),
             Err(database_error) => tracing::error!(
                 process_id = std::process::id(),
@@ -3966,7 +4577,7 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn abandon_generation(&self, server: &str, generation: u64, reason: &str) {
-        match self.with_database(|db| db.discard_empty_generation(server, generation)) {
+        match self.with_database_write(|db| db.discard_empty_generation(server, generation)) {
             Ok(true) => {}
             Ok(false) => self.fail_generation_and_schedule_cleanup(server, generation, reason),
             Err(error) => tracing::error!(
@@ -3981,19 +4592,14 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn schedule_cleanup(&self, server: &str) {
-        if self.background_tasks.is_shutting_down() {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         let should_spawn = match self.cleanup_tasks.lock() {
             Ok(mut tasks) => {
                 let task = tasks.entry(server.to_string()).or_default();
                 task.requested = true;
-                if task.running {
-                    false
-                } else {
-                    task.running = true;
-                    true
-                }
+                !task.running
             }
             Err(_) => {
                 tracing::error!(
@@ -4005,26 +4611,26 @@ impl<C: OpcClient> IndexManager<C> {
                 return;
             }
         };
-        if !should_spawn {
+        if !should_spawn || self.background_tasks.is_shutting_down() {
             return;
         }
-
-        let path = self.settings.database_path.clone();
-        let cleanup_server = server.to_string();
-        let background_tasks = Arc::clone(&self.background_tasks);
-        let cleanup_tasks = Arc::clone(&self.cleanup_tasks);
-        #[cfg(test)]
-        let reject_spawn = self.reject_next_cleanup_spawn.swap(false, Ordering::AcqRel);
-        #[cfg(not(test))]
-        let reject_spawn = false;
-        if (reject_spawn
-            || !self.background_tasks.spawn(async move {
-                run_scheduled_cleanup(path, cleanup_server, background_tasks, cleanup_tasks).await;
-            }))
-            && let Ok(mut tasks) = self.cleanup_tasks.lock()
-        {
-            tasks.remove(server);
-        }
+        spawn_cleanup_worker_if_idle(
+            Arc::clone(&self.cleanup_worker_active),
+            self.settings.database_path.clone(),
+            Arc::clone(&self.background_tasks),
+            Arc::clone(&self.cleanup_tasks),
+            Arc::clone(&self.coordination),
+            {
+                #[cfg(test)]
+                {
+                    self.reject_next_cleanup_spawn.swap(false, Ordering::AcqRel)
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            },
+        );
     }
 
     fn require_configured(&self, server: &str) -> anyhow::Result<()> {
@@ -4034,32 +4640,63 @@ impl<C: OpcClient> IndexManager<C> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn with_database<F, R>(&self, operation: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut IndexDb) -> anyhow::Result<R>,
     {
+        self.with_database_read(operation)
+    }
+
+    fn with_database_read<F, R>(&self, operation: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut IndexDb) -> anyhow::Result<R>,
+    {
+        let needs_open = self
+            .database
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?
+            .is_none();
+        let cleanup_servers = if needs_open {
+            let _writer_guard = self
+                .writer_gate
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index writer gate poisoned"))?;
+            let mut database = self
+                .database
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
+            self.initialize_database(&mut database)?
+        } else {
+            Vec::new()
+        };
+        let result = {
+            let mut database = self
+                .database
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
+            operation(database.as_mut().expect("database initialized"))
+        };
+        for server in cleanup_servers {
+            self.schedule_cleanup(&server);
+        }
+        result
+    }
+
+    fn with_database_write<F, R>(&self, operation: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut IndexDb) -> anyhow::Result<R>,
+    {
+        let _writer_guard = self
+            .writer_gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index writer gate poisoned"))?;
         let (result, cleanup_servers) = {
             let mut database = self
                 .database
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
-            let opened = database.is_none();
-            if opened {
-                tracing::debug!(
-                    process_id = std::process::id(),
-                    database = %self.settings.database_path.display(),
-                    "initializing namespace index database handle"
-                );
-                *database = Some(IndexDb::open(&self.settings.database_path)?);
-            }
-            let cleanup_servers = if opened {
-                database
-                    .as_ref()
-                    .expect("database initialized")
-                    .obsolete_servers()?
-            } else {
-                Vec::new()
-            };
+            let cleanup_servers = self.initialize_database(&mut database)?;
             (
                 operation(database.as_mut().expect("database initialized")),
                 cleanup_servers,
@@ -4069,6 +4706,23 @@ impl<C: OpcClient> IndexManager<C> {
             self.schedule_cleanup(&server);
         }
         result
+    }
+
+    fn initialize_database(&self, database: &mut Option<IndexDb>) -> anyhow::Result<Vec<String>> {
+        if database.is_none() {
+            tracing::debug!(
+                process_id = std::process::id(),
+                database = %self.settings.database_path.display(),
+                "initializing namespace index database handle"
+            );
+            *database = Some(IndexDb::open(&self.settings.database_path)?);
+            Ok(database
+                .as_ref()
+                .expect("database initialized")
+                .obsolete_servers()?)
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -4500,6 +5154,32 @@ mod tests {
             "unspecified"
         );
         assert_eq!(namespace_string(NamespaceOrganization::Flat), "flat");
+    }
+
+    #[test]
+    fn database_coordination_key_handles_relative_and_unresolvable_paths() {
+        let directory = tempdir().unwrap();
+        let absolute = directory.path().join("index.sqlite3");
+        assert_eq!(
+            database_coordination_key(Path::new(":memory:"), std::env::current_dir),
+            PathBuf::from(":memory:")
+        );
+        assert_eq!(
+            database_coordination_key(&absolute, std::env::current_dir),
+            absolute
+        );
+        assert_eq!(
+            database_coordination_key(Path::new("index.sqlite3"), || {
+                Ok(PathBuf::from("/database"))
+            }),
+            PathBuf::from("/database/index.sqlite3")
+        );
+        assert_eq!(
+            database_coordination_key(Path::new("index.sqlite3"), || {
+                Err(std::io::Error::other("current directory unavailable"))
+            }),
+            PathBuf::from("index.sqlite3")
+        );
     }
 
     #[test]
@@ -5831,6 +6511,540 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_precheck_avoids_a_write_when_no_obsolete_generation_exists() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-precheck.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = Instant::now();
+        let stats = cleanup_obsolete_generations(&path, "S", &BackgroundTasks::new()).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(stats.batches, 0);
+        drop(blocker);
+    }
+
+    #[test]
+    fn cleanup_checkpoint_defers_for_builds_and_tolerates_poisoned_locks() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-checkpoint.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        let writer_gate = Mutex::new(());
+        let active_builds = Mutex::new(HashSet::new());
+
+        assert!(cleanup_checkpoint(&connection, &writer_gate, &active_builds, &path, "S",).is_ok());
+
+        active_builds.lock().unwrap().insert("S".into());
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                cleanup_checkpoint(&connection, &writer_gate, &active_builds, &path, "S",).is_err()
+            );
+        });
+        active_builds.lock().unwrap().clear();
+
+        let poisoned_builds = Arc::new(Mutex::new(HashSet::new()));
+        let poison_builds = Arc::clone(&poisoned_builds);
+        std::thread::spawn(move || {
+            let _guard = poison_builds.lock().unwrap();
+            panic!("poison cleanup checkpoint active-build lock");
+        })
+        .join()
+        .unwrap_err();
+        assert!(
+            cleanup_checkpoint(
+                &connection,
+                &writer_gate,
+                poisoned_builds.as_ref(),
+                &path,
+                "S",
+            )
+            .is_err()
+        );
+
+        let poisoned_gate = Arc::new(Mutex::new(()));
+        let poison_gate = Arc::clone(&poisoned_gate);
+        std::thread::spawn(move || {
+            let _guard = poison_gate.lock().unwrap();
+            panic!("poison cleanup checkpoint writer lock");
+        })
+        .join()
+        .unwrap_err();
+        assert!(
+            cleanup_checkpoint(
+                &connection,
+                poisoned_gate.as_ref(),
+                &active_builds,
+                &path,
+                "S",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_rechecks_build_state_after_waiting_for_the_writer_gate() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-gate-recheck.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.fail_generation("S", generation, "obsolete").unwrap();
+        drop(db);
+
+        let background_tasks = Arc::new(BackgroundTasks::new());
+        let (started, release) = background_tasks.install_cleanup_writer_gate_hook();
+        let writer_gate = Arc::new(Mutex::new(()));
+        let active_builds = Arc::new(Mutex::new(HashSet::new()));
+        let cleanup_path = path.clone();
+        let cleanup_tasks = Arc::clone(&background_tasks);
+        let cleanup_writer_gate = Arc::clone(&writer_gate);
+        let cleanup_active_builds = Arc::clone(&active_builds);
+        let cleanup = std::thread::spawn(move || {
+            let subscriber = tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                cleanup_obsolete_generations_coordinated(
+                    &cleanup_path,
+                    "S",
+                    cleanup_tasks.as_ref(),
+                    cleanup_writer_gate,
+                    cleanup_active_builds,
+                )
+            })
+        });
+
+        started.recv().unwrap();
+        active_builds.lock().unwrap().insert("T".into());
+        release.send(()).unwrap();
+        let stats = cleanup.join().unwrap().unwrap();
+        assert_eq!(stats.batches, 0);
+        assert!(stats.deferred_for_build);
+        assert_eq!(
+            IndexDb::open(&path)
+                .unwrap()
+                .status_rows("S")
+                .unwrap()
+                .len(),
+            1
+        );
+        background_tasks.wait_for_cleanup_writer_gate_hook();
+    }
+
+    #[test]
+    fn cleanup_rechecks_obsolete_data_after_waiting_for_the_writer_gate() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-obsolete-recheck.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.fail_generation("S", generation, "obsolete").unwrap();
+        drop(db);
+
+        let background_tasks = Arc::new(BackgroundTasks::new());
+        let (started, release) = background_tasks.install_cleanup_writer_gate_hook();
+        let writer_gate = Arc::new(Mutex::new(()));
+        let active_builds = Arc::new(Mutex::new(HashSet::new()));
+        let cleanup_path = path.clone();
+        let cleanup_tasks = Arc::clone(&background_tasks);
+        let cleanup_writer_gate = Arc::clone(&writer_gate);
+        let cleanup_active_builds = Arc::clone(&active_builds);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_obsolete_generations_coordinated(
+                &cleanup_path,
+                "S",
+                cleanup_tasks.as_ref(),
+                cleanup_writer_gate,
+                cleanup_active_builds,
+            )
+        });
+
+        started.recv().unwrap();
+        let remover = Connection::open(&path).unwrap();
+        remover
+            .execute("DELETE FROM generations WHERE server = 'S'", [])
+            .unwrap();
+        drop(remover);
+        release.send(()).unwrap();
+        let stats = cleanup.join().unwrap().unwrap();
+        assert_eq!(stats.batches, 0);
+        assert!(!stats.deferred_for_build);
+        assert!(
+            IndexDb::open(&path)
+                .unwrap()
+                .status_rows("S")
+                .unwrap()
+                .is_empty()
+        );
+        background_tasks.wait_for_cleanup_writer_gate_hook();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_first_build_waits_for_the_shared_writer_gate() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-build-gate.sqlite3");
+        let client = Arc::new(MockOpcClient::default());
+        let manager = Arc::new(IndexManager::new(client, settings(path.clone())));
+        manager
+            .with_database(|db| {
+                let generation =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.fail_generation("S", generation, "obsolete")?;
+                Ok(())
+            })
+            .unwrap();
+        let (cleanup_started, cleanup_release) =
+            manager.background_tasks.install_cleanup_batch_hook();
+        manager.schedule_cleanup("S");
+        tokio::task::spawn_blocking(move || cleanup_started.recv().unwrap())
+            .await
+            .unwrap();
+
+        let refresh_manager = Arc::clone(&manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!refresh.is_finished());
+
+        cleanup_release.send(()).unwrap();
+        refresh.await.unwrap().unwrap();
+        wait_for_build(&manager, IndexState::Ready).await;
+        manager.background_tasks.wait_for_cleanup_batch_hook();
+        assert_eq!(manager.status("S").await.unwrap().active_generation, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_and_build_share_the_writer_gate_across_servers() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cross-server-gate.sqlite3");
+        let client = Arc::new(MockOpcClient::default());
+        let mut config = settings(path.clone());
+        config.servers.push("T".into());
+        let manager = Arc::new(IndexManager::new(client, config));
+        manager
+            .with_database(|db| {
+                let generation =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.fail_generation("S", generation, "obsolete")?;
+                Ok(())
+            })
+            .unwrap();
+        let (cleanup_started, cleanup_release) =
+            manager.background_tasks.install_cleanup_batch_hook();
+        manager.schedule_cleanup("S");
+        tokio::task::spawn_blocking(move || cleanup_started.recv().unwrap())
+            .await
+            .unwrap();
+
+        let refresh_manager = Arc::clone(&manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("T", true).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!refresh.is_finished());
+        cleanup_release.send(()).unwrap();
+        refresh.await.unwrap().unwrap();
+        wait_for_state(&manager, "T", IndexState::Ready).await;
+    }
+
+    #[test]
+    fn build_reservation_hook_blocks_once_and_then_becomes_inert() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("build-reservation-hook.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        let (started, release) = manager.install_build_reservation_hook();
+        let waiter = Arc::clone(&manager);
+        let wait = std::thread::spawn(move || waiter.wait_for_build_reservation_hook());
+        started.recv().unwrap();
+        release.send(()).unwrap();
+        wait.join().unwrap();
+        manager.wait_for_build_reservation_hook();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_rejects_a_build_owner_registered_during_reservation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("build-owner-race.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        let (started, release) = manager.install_build_reservation_hook();
+        let hook_manager = Arc::clone(&manager);
+        let hook = std::thread::spawn(move || {
+            started.recv().unwrap();
+            hook_manager
+                .coordination
+                .build_owners
+                .lock()
+                .unwrap()
+                .insert("S".into(), Arc::new(()));
+            release.send(()).unwrap();
+        });
+
+        let error = manager.refresh("S", true).await.unwrap_err();
+        hook.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("build owner is already registered in this process")
+        );
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+        assert!(manager.build_locks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_rechecks_the_concurrency_limit_after_reservation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("build-concurrency-race.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        let (started, release) = manager.install_build_reservation_hook();
+        let hook_manager = Arc::clone(&manager);
+        let hook = std::thread::spawn(move || {
+            started.recv().unwrap();
+            hook_manager
+                .active_builds
+                .lock()
+                .unwrap()
+                .insert("T".into());
+            release.send(()).unwrap();
+        });
+
+        let error = manager.refresh("S", true).await.unwrap_err();
+        hook.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("namespace index build concurrency limit reached")
+        );
+        assert!(manager.build_locks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stays_pending_while_any_build_is_active_and_resumes_after_termination() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-deferred.sqlite3");
+        let manager = Arc::new(IndexManager::new(Arc::new(MockOpcClient::default()), {
+            let mut config = settings(path);
+            config.servers.push("T".into());
+            config
+        }));
+        let (obsolete, active) = manager
+            .with_database(|db| {
+                let obsolete =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", obsolete, &[inventory_entry("Obsolete", "S.Obsolete")])?;
+                db.fail_generation("S", obsolete, "failed")?;
+                let active =
+                    db.start_generation("T", NamespaceOrganization::Flat, BrowseSource::Flat, "2")?;
+                db.insert_entries("T", active, &[inventory_entry("Active", "T.Active")])?;
+                db.promote("T", active, "3", &completed_progress(1))?;
+                Ok((obsolete, active))
+            })
+            .unwrap();
+        let (hook_started, hook_release) =
+            manager.background_tasks.install_cleanup_notification_hook();
+        manager.active_builds.lock().unwrap().insert("T".into());
+        manager.schedule_cleanup("S");
+        hook_started.notified().await;
+        assert!(
+            manager
+                .cleanup_tasks
+                .lock()
+                .unwrap()
+                .get("S")
+                .is_some_and(|task| task.requested && task.running)
+        );
+
+        manager.active_builds.lock().unwrap().remove("T");
+        manager.coordination.build_changed.notify_waiters();
+        hook_release.notify_one();
+        manager.background_tasks.wait_for_idle().await;
+        assert_eq!(
+            manager
+                .with_database(|db| {
+                    db.connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM generations
+                             WHERE server = 'S' AND generation = ?1",
+                            [obsolete as i64],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(manager.status("T").await.unwrap().active_generation, active);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_on_one_manager_resumes_after_a_build_on_another_manager_finishes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cross-manager-cleanup.sqlite3");
+        let manager_a = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path.clone()),
+        ));
+        let manager_b = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        let obsolete = manager_a
+            .with_database(|db| {
+                let obsolete =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", obsolete, &[inventory_entry("Obsolete", "S.Obsolete")])?;
+                db.fail_generation("S", obsolete, "failed")?;
+                Ok(obsolete)
+            })
+            .unwrap();
+        manager_a.active_builds.lock().unwrap().insert("T".into());
+        let (hook_started, hook_release) = manager_b
+            .background_tasks
+            .install_cleanup_notification_hook();
+
+        manager_b.schedule_cleanup("S");
+        hook_started.notified().await;
+        assert!(
+            manager_b
+                .cleanup_tasks
+                .lock()
+                .unwrap()
+                .get("S")
+                .is_some_and(|task| task.requested && task.running)
+        );
+
+        manager_a.active_builds.lock().unwrap().remove("T");
+        manager_a.coordination.build_changed.notify_waiters();
+        hook_release.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            manager_b.background_tasks.wait_for_idle(),
+        )
+        .await
+        .expect("cross-manager cleanup did not resume after build completion");
+
+        assert_eq!(
+            manager_b
+                .with_database(|db| {
+                    db.connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM generations
+                             WHERE server = 'S' AND generation = ?1",
+                            [obsolete as i64],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_cleanup_exits_when_shutdown_precedes_notification_subscription() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-shutdown-race.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        manager
+            .with_database(|db| {
+                let obsolete =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", obsolete, &[inventory_entry("Obsolete", "S.Obsolete")])?;
+                db.fail_generation("S", obsolete, "failed")?;
+                Ok(())
+            })
+            .unwrap();
+        manager.active_builds.lock().unwrap().insert("T".into());
+        let (hook_started, hook_release) =
+            manager.background_tasks.install_cleanup_notification_hook();
+
+        manager.schedule_cleanup("S");
+        hook_started.notified().await;
+        manager.background_tasks.request_shutdown();
+        hook_release.notify_one();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.background_tasks.wait_for_idle(),
+        )
+        .await
+        .expect("deferred cleanup did not stop after shutdown");
+        assert!(manager.cleanup_tasks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_notification_registration_closes_the_lost_wakeup_window() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-notification-race.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(path),
+        ));
+        let obsolete = manager
+            .with_database(|db| {
+                let obsolete =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", obsolete, &[inventory_entry("Obsolete", "S.Obsolete")])?;
+                db.fail_generation("S", obsolete, "failed")?;
+                Ok(obsolete)
+            })
+            .unwrap();
+        let (hook_started, hook_release) =
+            manager.background_tasks.install_cleanup_notification_hook();
+        let writer_guard = manager.coordination.writer_gate.lock().unwrap();
+        manager.schedule_cleanup("S");
+        manager.active_builds.lock().unwrap().insert("T".into());
+        drop(writer_guard);
+        hook_started.notified().await;
+
+        manager.active_builds.lock().unwrap().remove("T");
+        manager.coordination.build_changed.notify_waiters();
+        hook_release.notify_one();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.background_tasks.wait_for_idle(),
+        )
+        .await
+        .expect("cleanup worker missed the build-completion notification");
+        assert_eq!(
+            manager
+                .with_database(|db| {
+                    db.connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM generations
+                             WHERE server = 'S' AND generation = ?1",
+                            [obsolete as i64],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(Into::into)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn cleanup_uses_a_separate_connection_without_blocking_primary_reads() {
         use std::thread;
 
@@ -6033,6 +7247,12 @@ mod tests {
             "S".into(),
             Arc::clone(&background_tasks),
             Arc::clone(&cleanup_tasks),
+            Arc::new(DatabaseCoordination {
+                writer_gate: Arc::new(Mutex::new(())),
+                active_builds: Arc::new(Mutex::new(HashSet::new())),
+                build_owners: Arc::new(Mutex::new(HashMap::new())),
+                build_changed: Arc::new(tokio::sync::Notify::new()),
+            }),
         )
         .await;
 
@@ -7272,14 +8492,15 @@ mod tests {
     async fn refresh_discards_generation_when_runtime_build_disappears() {
         let directory = tempdir().unwrap();
         let control = Arc::new(RecordingInventoryControl::default());
+        let recovery_handle = immediate_inventory_handle();
         let capability_started = Arc::new(Notify::new());
         let capability_release = Arc::new(Notify::new());
         let client = Arc::new(
             LifecycleClient::new(
-                vec![Ok(handle_with_control(
-                    VecDeque::new(),
-                    Arc::clone(&control),
-                ))],
+                vec![
+                    Ok(handle_with_control(VecDeque::new(), Arc::clone(&control))),
+                    Ok(recovery_handle),
+                ],
                 vec![],
             )
             .with_capability_gate(
@@ -7308,6 +8529,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+        assert!(manager.coordination.build_owners.lock().unwrap().is_empty());
+        assert!(manager.build_locks.lock().unwrap().is_empty());
+        assert!(manager.pause_overlays.lock().unwrap().is_empty());
+        assert!(manager.pending_cancels.lock().unwrap().is_empty());
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Ready).await;
     }
 
     #[tokio::test]
@@ -7980,11 +9209,23 @@ mod tests {
         manager.abandon_generation("S", 1, "abandoned");
 
         let cleanup_tasks = Arc::clone(&manager.cleanup_tasks);
+        let poisoned_cleanup_tasks = Arc::clone(&cleanup_tasks);
         let _ = std::panic::catch_unwind(move || {
             let _guard = cleanup_tasks.lock().unwrap();
             panic!("poison cleanup registry for error-path coverage");
         });
         manager.schedule_cleanup("S");
+
+        let cleanup_worker_active = Arc::new(AtomicBool::new(false));
+        spawn_cleanup_worker_if_idle(
+            Arc::clone(&cleanup_worker_active),
+            manager.settings.database_path.clone(),
+            Arc::new(BackgroundTasks::new()),
+            poisoned_cleanup_tasks,
+            Arc::clone(&manager.coordination),
+            false,
+        );
+        assert!(!cleanup_worker_active.load(Ordering::Acquire));
     }
 
     #[test]
@@ -8082,6 +9323,71 @@ mod tests {
         ));
         manager.foreground_end("Missing");
         tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[test]
+    fn finish_build_checks_control_identity_without_an_ownership_token() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("defensive-finalization.sqlite3")),
+        ));
+        let current: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, Arc::clone(&current));
+        manager.coordination.build_owners.lock().unwrap().clear();
+        let obsolete: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            manager.finish_build_inner("S", Some(&obsolete), None, None);
+            manager.finish_build_inner("S", None, None, None);
+        });
+        assert!(
+            manager
+                .runtime
+                .lock()
+                .unwrap()
+                .get("S")
+                .unwrap()
+                .build
+                .is_none()
+        );
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn finish_build_handles_a_poisoned_build_owner_registry() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("poisoned-finalization.sqlite3")),
+        ));
+        insert_runtime_build(&manager, Arc::new(RecordingInventoryControl::default()));
+        let owners = Arc::clone(&manager.coordination.build_owners);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = owners.lock().unwrap();
+            panic!("poison build-owner registry for finalization error-path coverage");
+        });
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let ownership = Arc::new(());
+        tracing::subscriber::with_default(subscriber, || {
+            manager.finish_build_owned("S", &ownership, None);
+        });
+        assert!(
+            manager
+                .runtime
+                .lock()
+                .unwrap()
+                .get("S")
+                .unwrap()
+                .build
+                .is_some()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8595,6 +9901,46 @@ mod tests {
         release_search.send(()).unwrap();
         let search = search_task.await.unwrap().unwrap();
         assert_eq!(search.matches.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_only_status_and_search_remain_responsive_while_writer_gate_is_held() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("read-only-gate.sqlite3")),
+        ));
+        seed_active_generation(
+            &manager,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            &timestamp_now(),
+        );
+        let (locked, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        let gate_manager = Arc::clone(&manager);
+        let gate_thread = std::thread::spawn(move || {
+            let _writer_guard = gate_manager.writer_gate.lock().unwrap();
+            locked.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(1), manager.status("S"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.active_generation, 1);
+        let search = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.search("S", "persisted", 3, 10),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(search.matches.len(), 1);
+        release.send(()).unwrap();
+        gate_thread.join().unwrap();
     }
 
     #[tokio::test]
@@ -9847,7 +11193,7 @@ mod tests {
             })
             .unwrap();
         let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
-        insert_runtime_build(&manager, Arc::clone(&control));
+        let ownership = insert_runtime_build(&manager, Arc::clone(&control));
         Arc::clone(&manager)
             .run_build(
                 "S".into(),
@@ -9856,6 +11202,7 @@ mod tests {
                     stream: Box::new(DelayedCompletionStream { phase: 0 }),
                     control,
                 },
+                ownership,
             )
             .await;
         assert_eq!(manager.status("S").await.unwrap().state, IndexState::Failed);
@@ -9878,7 +11225,7 @@ mod tests {
             })
             .unwrap();
         let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
-        insert_runtime_build(&successful, Arc::clone(&control));
+        let ownership = insert_runtime_build(&successful, Arc::clone(&control));
         Arc::clone(&successful)
             .run_build(
                 "S".into(),
@@ -9887,6 +11234,7 @@ mod tests {
                     stream: Box::new(DelayedCompletionStream { phase: 0 }),
                     control,
                 },
+                ownership,
             )
             .await;
         assert_eq!(
@@ -9909,7 +11257,7 @@ mod tests {
             })
             .unwrap();
         let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
-        insert_runtime_build(&promotion, Arc::clone(&control));
+        let ownership = insert_runtime_build(&promotion, Arc::clone(&control));
         let promoting = Arc::clone(&promotion.promoting);
         let _ = std::panic::catch_unwind(move || {
             let _guard = promoting.lock().unwrap();
@@ -9934,11 +11282,53 @@ mod tests {
                     }),
                     control,
                 },
+                ownership,
             )
             .await;
         assert_eq!(
             promotion.status("S").await.unwrap().state,
             IndexState::Failed
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unexpected_build_unwind_releases_ownership_and_resumes_cleanup() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("unwind.sqlite3")),
+        ));
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+        let generation = manager
+            .with_database(|db| {
+                db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            })
+            .unwrap();
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        let ownership = insert_runtime_build(&manager, Arc::clone(&control));
+        let result = tokio::spawn(Arc::clone(&manager).run_build(
+            "S".into(),
+            generation,
+            InventoryHandle {
+                stream: Box::new(PanickingInventoryStream),
+                control,
+            },
+            ownership,
+        ))
+        .await;
+        assert!(result.is_err());
+        manager.background_tasks.wait_for_idle().await;
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+        assert!(manager.cleanup_tasks.lock().unwrap().is_empty());
+        assert!(
+            manager
+                .with_database(|db| db.status_rows("S"))
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -9996,7 +11386,7 @@ mod tests {
         let control = Arc::new(RecordingInventoryControl::default());
         control.cancel_on_pause();
         let control: Arc<dyn InventoryControl> = control;
-        insert_runtime_build(&adaptive, Arc::clone(&control));
+        let ownership = insert_runtime_build(&adaptive, Arc::clone(&control));
         Arc::clone(&adaptive)
             .run_build(
                 "S".into(),
@@ -10018,6 +11408,7 @@ mod tests {
                     }),
                     control,
                 },
+                ownership,
             )
             .await;
         assert_eq!(
@@ -10297,6 +11688,15 @@ mod tests {
         events: VecDeque<anyhow::Result<InventoryEvent>>,
     }
 
+    struct PanickingInventoryStream;
+
+    #[async_trait::async_trait]
+    impl InventoryStream for PanickingInventoryStream {
+        async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+            panic!("injected inventory stream panic");
+        }
+    }
+
     #[async_trait::async_trait]
     impl InventoryStream for VecInventoryStream {
         async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
@@ -10539,7 +11939,20 @@ mod tests {
     fn insert_runtime_build<C: OpcClient>(
         manager: &Arc<IndexManager<C>>,
         control: Arc<dyn InventoryControl>,
-    ) {
+    ) -> Arc<()> {
+        let ownership = Arc::new(());
+        manager
+            .coordination
+            .build_owners
+            .lock()
+            .unwrap()
+            .insert("S".into(), Arc::clone(&ownership));
+        manager
+            .coordination
+            .active_builds
+            .lock()
+            .unwrap()
+            .insert("S".into());
         manager.runtime.lock().unwrap().insert(
             "S".into(),
             RuntimeState {
@@ -10564,6 +11977,7 @@ mod tests {
                 sentinel_checked_at: None,
             },
         );
+        ownership
     }
 
     fn seed_active_generation<C: OpcClient>(
