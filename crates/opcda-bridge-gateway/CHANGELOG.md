@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.11](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.10...opcda-bridge-gateway-v0.4.11) - 2026-08-27
+
+### Fixed
+
+- *(gateway)* canonicalize index database identity ([#87](https://github.com/bytehound-labs/opcda-bridge/pull/87))
+
 ### Fixed
 
 - Canonicalize existing index database identities for writer coordination and persistent build
