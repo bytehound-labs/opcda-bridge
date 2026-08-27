@@ -5199,7 +5199,7 @@ mod tests {
         );
         assert_eq!(
             database_coordination_key(&absolute, std::env::current_dir),
-            absolute
+            canonical_database_path(&absolute)
         );
         assert_eq!(
             database_coordination_key(Path::new("index.sqlite3"), || {
