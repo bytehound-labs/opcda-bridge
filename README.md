@@ -547,6 +547,10 @@ cargo install cargo-mutants --version 27.1.0
 cargo mutants --package opcda-bridge --in-place --no-shuffle --timeout 180
 ```
 
+For a focused portable-crate run, substitute `opcda-bridge-client` or
+`opcda-bridge-proto` as the package name. The client shard includes request-forwarding,
+pagination, safety-cap, and output-rendering coverage.
+
 Use `--in-diff <diff-file>` for a focused local run. The workflow runs every Saturday at
 03:17 UTC, accepts a package selector through `workflow_dispatch`, and retains each
 `mutants.out/` report for 14 days. A shard fails when a behavioral mutation survives or times out;

@@ -323,7 +323,7 @@ pub async fn cmd_browse(
     ensure_page_bound(&combined, first_size)?;
     let mut pages = 1;
 
-    while all && !combined.complete && combined.nodes.len() < max_results as usize {
+    while should_fetch_browse_page(all, combined.complete, combined.nodes.len(), max_results) {
         let token = combined.next_page_token.clone().unwrap_or_default();
         let remaining = max_results - combined.nodes.len() as u32;
         let request_size = page_size.min(remaining);
@@ -346,10 +346,10 @@ pub async fn cmd_browse(
         combined.next_page_token = page.next_page_token;
         combined.complete = page.complete;
         combined.warning = merge_warnings(combined.warning, page.warning);
-        pages += 1;
+        pages = next_browse_page_count(pages);
     }
 
-    if all && !combined.complete && combined.nodes.len() >= max_results as usize {
+    if stopped_at_browse_safety_cap(all, combined.complete, combined.nodes.len(), max_results) {
         combined.warning = merge_warnings(
             combined.warning,
             Some(format!(
@@ -360,6 +360,28 @@ pub async fn cmd_browse(
 
     println!("{}", render_browse(combined, pages, format)?);
     Ok(())
+}
+
+fn next_browse_page_count(pages: u32) -> u32 {
+    pages + 1
+}
+
+fn should_fetch_browse_page(
+    all: bool,
+    complete: bool,
+    node_count: usize,
+    max_results: u32,
+) -> bool {
+    all && !complete && node_count < max_results as usize
+}
+
+fn stopped_at_browse_safety_cap(
+    all: bool,
+    complete: bool,
+    node_count: usize,
+    max_results: u32,
+) -> bool {
+    all && !complete && node_count >= max_results as usize
 }
 
 fn ensure_page_bound(page: &BrowsePage, requested: u32) -> anyhow::Result<()> {
@@ -449,6 +471,26 @@ enum SearchOutputEvent {
     },
 }
 
+fn search_completion_messages(
+    format: OutputFormat,
+    complete: bool,
+    cancelled: bool,
+    truncated: bool,
+    warning: Option<&str>,
+) -> Vec<String> {
+    if format == OutputFormat::Table {
+        let mut messages = vec![format!(
+            "Search complete: complete={complete}, cancelled={cancelled}, truncated={truncated}"
+        )];
+        if let Some(warning) = warning {
+            messages.push(format!("Warning: {warning}"));
+        }
+        messages
+    } else {
+        Vec::new()
+    }
+}
+
 fn search_output_event(event: SearchEvent) -> SearchOutputEvent {
     match event {
         SearchEvent::Match(found) => SearchOutputEvent::Match {
@@ -536,16 +578,18 @@ pub async fn cmd_search(
                 "Search progress: visited={}, matches={}, partial={}",
                 progress.visited_nodes, progress.matches, progress.partial
             ),
-            SearchEvent::Completed(completed) if format == OutputFormat::Table => {
-                eprintln!(
-                    "Search complete: complete={}, cancelled={}, truncated={}",
-                    completed.complete, completed.cancelled, completed.truncated
-                );
-                if let Some(warning) = completed.warning {
-                    eprintln!("Warning: {warning}");
+            SearchEvent::Completed(completed) => {
+                for message in search_completion_messages(
+                    format,
+                    completed.complete,
+                    completed.cancelled,
+                    completed.truncated,
+                    completed.warning.as_deref(),
+                ) {
+                    eprintln!("{message}");
                 }
             }
-            SearchEvent::Match(_) | SearchEvent::Completed(_) => {}
+            SearchEvent::Match(_) => {}
         }
     }
     Ok(())
@@ -1038,6 +1082,27 @@ fn render_index_status(status: SearchIndexStatus, format: OutputFormat) -> anyho
     }
 }
 
+enum WatchStatusOutput {
+    Table(String),
+    Json(String),
+}
+
+fn render_watch_status(
+    status: SearchIndexStatus,
+    format: OutputFormat,
+) -> anyhow::Result<WatchStatusOutput> {
+    match format {
+        OutputFormat::Table => {
+            let rendered = render_index_status(status, format)?;
+            Ok(WatchStatusOutput::Table(rendered))
+        }
+        OutputFormat::Json => {
+            let rendered = serde_json::to_string(&IndexStatusOutput::from(status))?;
+            Ok(WatchStatusOutput::Json(rendered))
+        }
+    }
+}
+
 pub async fn cmd_index_status(
     host: String,
     server: String,
@@ -1069,15 +1134,15 @@ async fn watch_index_status(
                 break;
             }
         };
-        if format == OutputFormat::Table {
-            print!("\x1b[2J\x1b[H");
-            println!("{}", render_index_status(status, format)?);
-            std::io::stdout().flush()?;
-        } else {
-            println!(
-                "{}",
-                serde_json::to_string(&IndexStatusOutput::from(status))?
-            );
+        match render_watch_status(status, format)? {
+            WatchStatusOutput::Table(rendered) => {
+                print!("\x1b[2J\x1b[H");
+                println!("{rendered}");
+                std::io::stdout().flush()?;
+            }
+            WatchStatusOutput::Json(rendered) => {
+                println!("{rendered}");
+            }
         }
         tokio::select! {
             result = &mut ctrl_c => {
@@ -1294,6 +1359,7 @@ mod tests {
         SearchIndexControlAction, SearchIndexState,
     };
     use opcda_bridge_proto::bridge::search_event;
+    use opcda_bridge_proto::bridge::write_request::TypedValue;
     use opcda_bridge_proto::bridge::{
         BrowseBreadcrumb, BrowseNode as ProtoBrowseNode, BrowseNodeKind as ProtoBrowseNodeKind,
         BrowsePage as ProtoBrowsePage, BrowseSource as ProtoBrowseSource, GetCapabilitiesResponse,
@@ -1357,6 +1423,9 @@ mod tests {
             },
             ..Default::default()
         };
+        let capabilities_requests = Arc::clone(&service.capabilities_requests);
+        let read_requests = Arc::clone(&service.read_requests);
+        let write_requests = Arc::clone(&service.write_requests);
         let host = start_mock_server(service).await;
         cmd_servers(host.clone(), OutputFormat::Table)
             .await
@@ -1406,6 +1475,26 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(capabilities_requests.lock().unwrap()[0].server, "S");
+        {
+            let requests = read_requests.lock().unwrap();
+            assert_eq!(requests[0].server, "S");
+            assert_eq!(requests[0].tag_ids, ["t"]);
+        }
+        {
+            let requests = write_requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].server, "S");
+            assert_eq!(requests[0].tag_id, "t");
+            assert!(matches!(
+                requests[0].typed_value,
+                Some(TypedValue::IntValue(1))
+            ));
+            assert!(matches!(
+                requests[1].typed_value,
+                Some(TypedValue::StringValue(ref value)) if value == "text"
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1527,12 +1616,18 @@ mod tests {
         let rendered = render_compatibility(&exact, OutputFormat::Table).unwrap();
         assert!(rendered.contains("unknown"));
         assert!(rendered.contains('1'));
+        assert_eq!(version_range(Some(ProtocolVersionRange::exact(1))), "1");
+        assert_eq!(
+            version_range(Some(ProtocolVersionRange { min: 1, max: 2 })),
+            "1-2"
+        );
+        assert_eq!(version_range(None), "unknown");
     }
 
     #[tokio::test]
     async fn browse_one_page_preserves_metadata_and_request() {
         let service = MockBridgeService {
-            browse_responses: vec![page(false, Some("next"), "A")],
+            browse_responses: vec![page(false, Some("next"), "A"), page(true, None, "B")],
             ..Default::default()
         };
         let requests = Arc::clone(&service.browse_requests);
@@ -1558,17 +1653,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browse_all_follows_pages_and_honors_safety_cap() {
+    async fn browse_all_follows_pages_and_honors_remaining_limit() {
         let service = MockBridgeService {
-            browse_responses: vec![
-                page(false, Some("next-1"), "A"),
-                page(false, Some("next-2"), "B"),
-            ],
+            browse_responses: vec![page(false, Some("next-1"), "A"), page(true, None, "B")],
             ..Default::default()
         };
         let requests = Arc::clone(&service.browse_requests);
         let host = start_mock_server(service).await;
         cmd_browse(
+            host,
+            "S".into(),
+            None,
+            None,
+            None,
+            3,
+            true,
+            3,
+            false,
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].page_token.as_deref(), Some("next-1"));
+        assert_eq!(requests[1].page_size, 2);
+    }
+
+    #[tokio::test]
+    async fn browse_all_reports_exhausted_mock_response_sequence() {
+        let service = MockBridgeService {
+            browse_responses: vec![page(false, Some("next"), "A")],
+            ..Default::default()
+        };
+        let host = start_mock_server(service).await;
+        let error = cmd_browse(
             host,
             "S".into(),
             None,
@@ -1581,10 +1700,25 @@ mod tests {
             OutputFormat::Table,
         )
         .await
-        .unwrap();
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].page_token.as_deref(), Some("next-1"));
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mock browse response sequence exhausted")
+        );
+    }
+
+    #[test]
+    fn browse_paging_helpers_preserve_page_counts_and_cap_conditions() {
+        assert_eq!(next_browse_page_count(1), 2);
+        assert!(should_fetch_browse_page(true, false, 1, 2));
+        assert!(!should_fetch_browse_page(false, false, 1, 2));
+        assert!(!should_fetch_browse_page(true, true, 1, 2));
+        assert!(!should_fetch_browse_page(true, false, 2, 2));
+        assert!(stopped_at_browse_safety_cap(true, false, 2, 2));
+        assert!(!stopped_at_browse_safety_cap(false, false, 2, 2));
+        assert!(!stopped_at_browse_safety_cap(true, true, 2, 2));
+        assert!(!stopped_at_browse_safety_cap(true, false, 1, 2));
     }
 
     #[tokio::test]
@@ -1965,6 +2099,28 @@ mod tests {
         assert!(table.contains("failure"));
     }
 
+    #[test]
+    fn watched_status_rendering_preserves_table_and_json_shapes() {
+        let status: opcda_bridge::SearchIndexStatus =
+            proto_index_status(ProtoSearchIndexState::Ready)
+                .try_into()
+                .unwrap();
+        let table = render_watch_status(status.clone(), OutputFormat::Table).unwrap();
+        assert!(matches!(&table, WatchStatusOutput::Table(_)));
+        let rendered = match table {
+            WatchStatusOutput::Table(rendered) | WatchStatusOutput::Json(rendered) => rendered,
+        };
+        assert!(rendered.contains("Health"));
+
+        let json = render_watch_status(status, OutputFormat::Json).unwrap();
+        assert!(matches!(&json, WatchStatusOutput::Json(_)));
+        let rendered = match json {
+            WatchStatusOutput::Table(rendered) | WatchStatusOutput::Json(rendered) => rendered,
+        };
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["state"], "ready");
+    }
+
     #[tokio::test]
     async fn index_status_watch_renders_and_stops_on_ctrl_c() {
         let service = MockBridgeService {
@@ -2104,6 +2260,23 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["event"], "progress");
         assert_eq!(value["visited_nodes"], 3);
+    }
+
+    #[test]
+    fn search_completion_messages_only_render_table_diagnostics() {
+        let table =
+            search_completion_messages(OutputFormat::Table, true, false, true, Some("cap reached"));
+        assert_eq!(
+            table,
+            [
+                "Search complete: complete=true, cancelled=false, truncated=true",
+                "Warning: cap reached",
+            ]
+        );
+        assert!(
+            search_completion_messages(OutputFormat::Json, true, false, true, Some("cap reached"),)
+                .is_empty()
+        );
     }
 
     #[test]
