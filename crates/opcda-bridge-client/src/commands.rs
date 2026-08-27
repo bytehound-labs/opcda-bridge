@@ -1092,12 +1092,14 @@ fn render_watch_status(
     format: OutputFormat,
 ) -> anyhow::Result<WatchStatusOutput> {
     match format {
-        OutputFormat::Table => Ok(WatchStatusOutput::Table(render_index_status(
-            status, format,
-        )?)),
-        OutputFormat::Json => Ok(WatchStatusOutput::Json(serde_json::to_string(
-            &IndexStatusOutput::from(status),
-        )?)),
+        OutputFormat::Table => {
+            let rendered = render_index_status(status, format)?;
+            Ok(WatchStatusOutput::Table(rendered))
+        }
+        OutputFormat::Json => {
+            let rendered = serde_json::to_string(&IndexStatusOutput::from(status))?;
+            Ok(WatchStatusOutput::Json(rendered))
+        }
     }
 }
 
@@ -1678,6 +1680,34 @@ mod tests {
         assert_eq!(requests[1].page_size, 2);
     }
 
+    #[tokio::test]
+    async fn browse_all_reports_exhausted_mock_response_sequence() {
+        let service = MockBridgeService {
+            browse_responses: vec![page(false, Some("next"), "A")],
+            ..Default::default()
+        };
+        let host = start_mock_server(service).await;
+        let error = cmd_browse(
+            host,
+            "S".into(),
+            None,
+            None,
+            None,
+            1,
+            true,
+            2,
+            false,
+            OutputFormat::Table,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mock browse response sequence exhausted")
+        );
+    }
+
     #[test]
     fn browse_paging_helpers_preserve_page_counts_and_cap_conditions() {
         assert_eq!(next_browse_page_count(1), 2);
@@ -2075,16 +2105,17 @@ mod tests {
             proto_index_status(ProtoSearchIndexState::Ready)
                 .try_into()
                 .unwrap();
-        match render_watch_status(status.clone(), OutputFormat::Table).unwrap() {
-            WatchStatusOutput::Table(rendered) => assert!(rendered.contains("Health")),
-            WatchStatusOutput::Json(_) => panic!("table format rendered as JSON"),
+        let table = render_watch_status(status.clone(), OutputFormat::Table).unwrap();
+        assert!(matches!(&table, WatchStatusOutput::Table(_)));
+        if let WatchStatusOutput::Table(rendered) = table {
+            assert!(rendered.contains("Health"));
         }
-        match render_watch_status(status, OutputFormat::Json).unwrap() {
-            WatchStatusOutput::Json(rendered) => {
-                let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
-                assert_eq!(value["state"], "ready");
-            }
-            WatchStatusOutput::Table(_) => panic!("JSON format rendered as a table"),
+
+        let json = render_watch_status(status, OutputFormat::Json).unwrap();
+        assert!(matches!(&json, WatchStatusOutput::Json(_)));
+        if let WatchStatusOutput::Json(rendered) = json {
+            let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(value["state"], "ready");
         }
     }
 

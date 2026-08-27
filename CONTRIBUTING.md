@@ -58,7 +58,8 @@ Example: `feat(gateway): add tag subscription support`.
   ```
 
   Substitute `opcda-bridge-client` or `opcda-bridge-proto` to run a focused portable-crate
-  mutation shard.
+  mutation shard. The client shard covers request forwarding, pagination, safety caps, and
+  output rendering.
 
   Use `--in-diff <diff-file>` for a focused diagnostic run. The weekly/manual workflow covers
   `opcda-bridge`, `opcda-bridge-client`, and `opcda-bridge-proto` on Ubuntu, and

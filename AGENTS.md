@@ -184,7 +184,8 @@ cargo mutants --package opcda-bridge --in-place --no-shuffle --timeout 180
 ```
 
 Substitute `opcda-bridge-client` or `opcda-bridge-proto` to run a focused portable-crate
-mutation shard.
+mutation shard. The client shard covers request forwarding, pagination, safety caps, and
+output rendering.
 
 Use `cargo mutants --in-diff <diff-file> --in-place` for a focused diagnostic run. Do not edit
 source files while an in-place mutation run is active.

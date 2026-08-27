@@ -548,7 +548,8 @@ cargo mutants --package opcda-bridge --in-place --no-shuffle --timeout 180
 ```
 
 For a focused portable-crate run, substitute `opcda-bridge-client` or
-`opcda-bridge-proto` as the package name.
+`opcda-bridge-proto` as the package name. The client shard includes request-forwarding,
+pagination, safety-cap, and output-rendering coverage.
 
 Use `--in-diff <diff-file>` for a focused local run. The workflow runs every Saturday at
 03:17 UTC, accepts a package selector through `workflow_dispatch`, and retains each
