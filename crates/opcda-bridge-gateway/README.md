@@ -56,6 +56,7 @@ remains available, so status and search continue to use that snapshot while clea
 An interrupted initial build remains failed and visible because no complete snapshot can replace it.
 Database coordination and persistent build-lock paths use the canonical identity of the database
 file, so existing-file aliases such as relative paths and symlinks cannot bypass coordination.
+If the file and its parent cannot be canonicalized, the original path spelling is retained.
 Independent in-memory databases are isolated from the registry and do not create filesystem
 build-lock sidecars.
 Uncached indexed searches use a separate read-only SQLite connection and rank only a bounded

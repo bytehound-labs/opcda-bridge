@@ -226,6 +226,7 @@ config file — see [Configuration](#configuration) below.
   is quarantined rather than serving silently incomplete substring results.
   Database coordination and persistent build-lock paths use the canonical identity of the database
   file, so existing-file aliases such as relative paths and symlinks cannot bypass coordination.
+  If the file and its parent cannot be canonicalized, the original path spelling is retained.
   Independent in-memory databases are not shared through the registry and do not create filesystem
   build-lock sidecars.
   Indexed queries use a dedicated read-only SQLite connection and a bounded in-memory ranking

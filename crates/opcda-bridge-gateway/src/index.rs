@@ -297,12 +297,10 @@ fn canonical_database_path(path: &Path) -> PathBuf {
     let Some(file_name) = path.file_name() else {
         return path.to_path_buf();
     };
-    let Some(parent) = path.parent() else {
-        return path.to_path_buf();
-    };
-    fs::canonicalize(parent)
+    path.parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
         .map(|canonical_parent| canonical_parent.join(file_name))
-        .unwrap_or_else(|_| path.to_path_buf())
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn new_database_coordination() -> Arc<DatabaseCoordination> {
@@ -5197,6 +5195,7 @@ mod tests {
             database_coordination_key(Path::new(":memory:"), std::env::current_dir),
             PathBuf::from(":memory:")
         );
+        assert_eq!(canonical_database_path(Path::new("")), PathBuf::from(""));
         assert_eq!(
             database_coordination_key(&absolute, std::env::current_dir),
             canonical_database_path(&absolute)
