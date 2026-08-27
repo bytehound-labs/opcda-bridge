@@ -109,4 +109,6 @@ as absent.
 Diagnostic gateway builds used for isolated native-inventory investigations may pin a specific
 `bytehound-opc-da-client` commit from the companion `opc-cli` repository. Such builds are for
 sidecar diagnosis only and are not release artifacts; production gateways continue to use the
-published client crate.
+published client crate. The gateway forwards both adaptive pacing controls to the native client:
+the optional item rate is sent as `0` when unlimited, matching the native client's pacing
+contract.
