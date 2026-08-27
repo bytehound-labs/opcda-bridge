@@ -105,3 +105,8 @@ An optional `sentinel_tag` is read during health probes; omitted or unavailable 
 configuration is reported explicitly rather than treated as a healthy zero value. Status also
 distinguishes a configured sentinel from its probe result, so an unprobed sentinel is not reported
 as absent.
+
+Diagnostic gateway builds used for isolated native-inventory investigations may pin a specific
+`bytehound-opc-da-client` commit from the companion `opc-cli` repository. Such builds are for
+sidecar diagnosis only and are not release artifacts; production gateways continue to use the
+published client crate.

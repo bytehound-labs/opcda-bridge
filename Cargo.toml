@@ -20,7 +20,9 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs2 = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
-opc-da-client = { package = "bytehound-opc-da-client", version = "0.2.8" }
+# Diagnostic-only build pin for the isolated NAS startup investigation. This branch is
+# intentionally not a release source and must not be merged as the normal dependency.
+opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "014e88af4c0b8ef12b4105295c5a011fb234c2be", version = "0.2.8" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
 prost = "0.14"
