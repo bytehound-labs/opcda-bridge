@@ -2681,51 +2681,51 @@ impl<C: OpcClient> IndexManager<C> {
         };
         let (control, reason, previous_reason, foreground_users, operator_paused, controller_state) =
             match self.runtime.lock() {
-            Ok(mut runtime) => {
-                let Some(build) = runtime
-                    .get_mut(server)
-                    .and_then(|state| state.build.as_mut())
-                else {
+                Ok(mut runtime) => {
+                    let Some(build) = runtime
+                        .get_mut(server)
+                        .and_then(|state| state.build.as_mut())
+                    else {
+                        return;
+                    };
+                    let foreground = build.foreground_users > 0
+                        || build
+                            .quiet_until
+                            .is_some_and(|deadline| deadline > Instant::now());
+                    let reason = if build.operator_paused {
+                        Some(crate::controller::PauseReason::Operator)
+                    } else if foreground {
+                        Some(crate::controller::PauseReason::Foreground)
+                    } else if overlay.maintenance {
+                        Some(crate::controller::PauseReason::Maintenance)
+                    } else if overlay.health {
+                        Some(crate::controller::PauseReason::OpcHealth)
+                    } else if let Some(crate::controller::ControllerState::Paused(reason)) =
+                        build.controller_state
+                    {
+                        Some(reason)
+                    } else {
+                        None
+                    };
+                    let previous_reason = build.pause_reason;
+                    build.pause_reason = reason;
+                    (
+                        build.control.clone(),
+                        reason,
+                        previous_reason,
+                        build.foreground_users,
+                        build.operator_paused,
+                        build.controller_state,
+                    )
+                }
+                Err(_) => {
+                    tracing::error!(
+                        server,
+                        "unable to reconcile namespace index pause state because the runtime lock is poisoned"
+                    );
                     return;
-                };
-                let foreground = build.foreground_users > 0
-                    || build
-                        .quiet_until
-                        .is_some_and(|deadline| deadline > Instant::now());
-                let reason = if build.operator_paused {
-                    Some(crate::controller::PauseReason::Operator)
-                } else if foreground {
-                    Some(crate::controller::PauseReason::Foreground)
-                } else if overlay.maintenance {
-                    Some(crate::controller::PauseReason::Maintenance)
-                } else if overlay.health {
-                    Some(crate::controller::PauseReason::OpcHealth)
-                } else if let Some(crate::controller::ControllerState::Paused(reason)) =
-                    build.controller_state
-                {
-                    Some(reason)
-                } else {
-                    None
-                };
-                let previous_reason = build.pause_reason;
-                build.pause_reason = reason;
-                (
-                    build.control.clone(),
-                    reason,
-                    previous_reason,
-                    build.foreground_users,
-                    build.operator_paused,
-                    build.controller_state,
-                )
-            }
-            Err(_) => {
-                tracing::error!(
-                    server,
-                    "unable to reconcile namespace index pause state because the runtime lock is poisoned"
-                );
-                return;
-            }
-        };
+                }
+            };
         if previous_reason != reason {
             tracing::info!(
                 server,
