@@ -172,7 +172,10 @@ The weekly/manual workflow runs the three portable packages (`opcda-bridge`,
 and exercise its `cfg(windows)` COM/service implementation rather than treating that code as
 unreachable. Full mutation testing is advisory rather than a required PR status because the
 gateway shard is substantially longer than ordinary validation; a shard still fails on any
-surviving or timed-out mutant, and its report is uploaded for 14 days.
+surviving or timed-out mutant, and its report is uploaded for 14 days. The shared configuration
+contains only two narrowly documented equivalence exclusions in the compatibility evaluator:
+one comparison is value-equivalent at equality, and the current catalog gives all exact-pair
+evidence rows the same status. Remove the latter if those catalog statuses ever diverge.
 
 Run a package locally with:
 
