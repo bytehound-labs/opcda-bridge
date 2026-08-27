@@ -22,7 +22,7 @@ fs2 = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 # Diagnostic-only build pin for the isolated NAS startup investigation. This branch is
 # intentionally not a release source and must not be merged as the normal dependency.
-opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "29a690d6900c3213b39ffc7ba39836d85e1dbdc3", version = "0.2.8" }
+opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "b815aa6", version = "0.2.8" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
 prost = "0.14"

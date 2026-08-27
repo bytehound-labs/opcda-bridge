@@ -226,7 +226,7 @@ struct RuntimeState {
     sentinel_checked_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct PauseOverlayState {
     maintenance: bool,
     health: bool,
@@ -2615,22 +2615,39 @@ impl<C: OpcClient> IndexManager<C> {
     fn set_pause_overlay(&self, server: &str, maintenance: Option<bool>, health: Option<bool>) {
         let update_result = self.pause_overlays.lock().map(|mut overlays| {
             let state = overlays.entry(server.to_string()).or_default();
+            let previous = *state;
             if let Some(value) = maintenance {
                 state.maintenance = value;
             }
             if let Some(value) = health {
                 state.health = value;
             }
+            let current = *state;
             if !state.maintenance && !state.health {
                 overlays.remove(server);
             }
+            (previous, current)
         });
-        if update_result.is_err() {
-            tracing::error!(
-                server,
-                "unable to update namespace index pause overlays because the overlay lock is poisoned"
-            );
-            return;
+        match update_result {
+            Ok((previous, current)) => {
+                if previous != current {
+                    tracing::info!(
+                        server,
+                        previous_maintenance = previous.maintenance,
+                        previous_health = previous.health,
+                        maintenance = current.maintenance,
+                        health = current.health,
+                        "namespace index pause overlay changed"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    server,
+                    "unable to update namespace index pause overlays because the overlay lock is poisoned"
+                );
+                return;
+            }
         }
         self.reconcile_pause_state(server);
     }
@@ -2662,7 +2679,8 @@ impl<C: OpcClient> IndexManager<C> {
                 return;
             }
         };
-        let (control, reason) = match self.runtime.lock() {
+        let (control, reason, previous_reason, foreground_users, operator_paused, controller_state) =
+            match self.runtime.lock() {
             Ok(mut runtime) => {
                 let Some(build) = runtime
                     .get_mut(server)
@@ -2689,8 +2707,16 @@ impl<C: OpcClient> IndexManager<C> {
                 } else {
                     None
                 };
+                let previous_reason = build.pause_reason;
                 build.pause_reason = reason;
-                (build.control.clone(), reason)
+                (
+                    build.control.clone(),
+                    reason,
+                    previous_reason,
+                    build.foreground_users,
+                    build.operator_paused,
+                    build.controller_state,
+                )
             }
             Err(_) => {
                 tracing::error!(
@@ -2700,6 +2726,19 @@ impl<C: OpcClient> IndexManager<C> {
                 return;
             }
         };
+        if previous_reason != reason {
+            tracing::info!(
+                server,
+                previous_reason = previous_reason.map(|value| value.as_str()),
+                reason = reason.map(|value| value.as_str()),
+                foreground_users,
+                operator_paused,
+                controller_state = ?controller_state,
+                maintenance_overlay = overlay.maintenance,
+                health_overlay = overlay.health,
+                "namespace index pause reason changed"
+            );
+        }
         if let Some(control) = control {
             if reason.is_some() {
                 control.pause();
@@ -2727,6 +2766,11 @@ impl<C: OpcClient> IndexManager<C> {
             build.foreground_users = foreground_users;
             build.quiet_until = None;
         }
+        tracing::info!(
+            server,
+            foreground_users,
+            "namespace index foreground activity started"
+        );
         self.reconcile_pause_state(server);
         ForegroundGuard {
             manager: Arc::clone(self),
@@ -2743,7 +2787,7 @@ impl<C: OpcClient> IndexManager<C> {
         let resume_server_name = server_name.clone();
         let decrement_runtime = Arc::clone(&runtime);
         let decrement = move || {
-            if let Ok(mut users) = foreground_users.lock() {
+            let remaining = if let Ok(mut users) = foreground_users.lock() {
                 let remaining = users
                     .get_mut(&server_name)
                     .map(|count| {
@@ -2754,7 +2798,15 @@ impl<C: OpcClient> IndexManager<C> {
                 if remaining == 0 {
                     users.remove(&server_name);
                 }
-            }
+                remaining
+            } else {
+                0
+            };
+            tracing::info!(
+                server = %server_name,
+                foreground_users = remaining,
+                "namespace index foreground activity ended"
+            );
             if let Ok(mut states) = decrement_runtime.lock()
                 && let Some(build) = states
                     .get_mut(&server_name)
@@ -3673,6 +3725,8 @@ impl<C: OpcClient> IndexManager<C> {
             .then(|| AdaptiveIndexController::new(self.controller_config(), build_started));
         let mut effective_duty_cycle_percent = self.settings.duty_cycle_percent;
         let mut last_commit_at = Instant::now();
+        let mut event_wait_logs = 0_u8;
+        let mut event_wait_return_logs = 0_u8;
         if let Some(controller) = controller.as_ref() {
             self.update_runtime_controller(&server, controller.limits(), controller.state(), None);
         }
@@ -3730,6 +3784,29 @@ impl<C: OpcClient> IndexManager<C> {
                     }
                 }
             }
+            if event_wait_logs < 3 {
+                tracing::info!(
+                    server,
+                    generation,
+                    entries_seen = last_progress.entries_seen,
+                    unique_items = last_progress.unique_items,
+                    paused_time_ms = last_progress.paused_time_ms,
+                    controller_state = ?controller.as_ref().map(AdaptiveIndexController::state),
+                    pause_reason = ?self
+                        .runtime
+                        .lock()
+                        .ok()
+                        .and_then(|runtime| {
+                            runtime
+                                .get(&server)
+                                .and_then(|state| state.build.as_ref())
+                                .and_then(|build| build.pause_reason)
+                        }),
+                    "waiting for next native inventory event"
+                );
+                event_wait_logs = event_wait_logs.saturating_add(1);
+            }
+            let event_wait_started = Instant::now();
             let event = match tokio::time::timeout(
                 Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
                 handle.stream.next(),
@@ -3746,6 +3823,15 @@ impl<C: OpcClient> IndexManager<C> {
                     break;
                 }
             };
+            if event_wait_return_logs < 3 {
+                tracing::info!(
+                    server,
+                    generation,
+                    event_wait_elapsed_ms = event_wait_started.elapsed().as_millis(),
+                    "native inventory event wait returned"
+                );
+                event_wait_return_logs = event_wait_return_logs.saturating_add(1);
+            }
             let Some(event) = event else {
                 break;
             };
@@ -4086,12 +4172,22 @@ impl<C: OpcClient> IndexManager<C> {
         let mut outside_window =
             !windows.is_empty() && !maintenance_window_active(windows, Local::now());
         self.set_pause_overlay(server, Some(outside_window), None);
+        if outside_window {
+            tracing::info!(
+                server,
+                windows = windows.len(),
+                "namespace inventory waiting for an active maintenance window"
+            );
+        }
         while outside_window {
             if !wait_with_cancellation(control, Duration::from_secs(1)).await {
                 return false;
             }
             outside_window = !maintenance_window_active(windows, Local::now());
             self.set_pause_overlay(server, Some(outside_window), None);
+        }
+        if !windows.is_empty() {
+            tracing::info!(server, "namespace inventory maintenance window is active");
         }
         true
     }
@@ -4136,6 +4232,11 @@ impl<C: OpcClient> IndexManager<C> {
                 return true;
             }
             let started = Instant::now();
+            tracing::info!(
+                server,
+                sentinel_due,
+                "starting namespace inventory health probe"
+            );
             self.set_pause_overlay(server, None, Some(true));
             let result = self
                 .with_opc_timeout(
@@ -4172,6 +4273,14 @@ impl<C: OpcClient> IndexManager<C> {
             let healthy = result.is_ok()
                 && elapsed <= Duration::from_millis(self.settings.health_latency_threshold_ms);
             let healthy = healthy && sentinel.as_ref().is_none_or(|(healthy, _)| *healthy);
+            tracing::info!(
+                server,
+                capability_probe_ok = result.is_ok(),
+                elapsed_ms = elapsed.as_millis(),
+                sentinel_healthy = ?sentinel.as_ref().map(|(healthy, _)| *healthy),
+                healthy,
+                "namespace inventory health probe completed"
+            );
             self.update_health_state(
                 server,
                 if self.settings.sentinel_tag.is_none() {
@@ -4289,10 +4398,24 @@ impl<C: OpcClient> IndexManager<C> {
                 .get_mut(server)
                 .and_then(|state| state.build.as_mut())
         {
+            let previous_state = build.controller_state;
             build.effective_limits = Some(limits);
             build.controller_state = Some(state);
             build.recovery_deadline = recovery_deadline;
+            let transitioned = previous_state != Some(state);
             drop(runtime);
+            if transitioned {
+                tracing::info!(
+                    server,
+                    previous_state = ?previous_state,
+                    state = ?state,
+                    item_rate_per_second = limits.item_rate_per_second,
+                    batch_size = limits.batch_size,
+                    duty_cycle_percent = limits.duty_cycle_percent,
+                    recovery_deadline = ?recovery_deadline.map(instant_timestamp),
+                    "namespace index controller state changed"
+                );
+            }
             self.reconcile_pause_state(server);
         }
     }

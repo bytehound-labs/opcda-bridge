@@ -51,6 +51,12 @@ a working opcda-bridge, not a redesign of it.
   limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
   OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
   start a replacement build.
+- **Native inventory startup diagnostics are boundary-aware.** Diagnostic builds of the gateway
+  and the pinned `bytehound-opc-da-client` identify pause overlays, health probes, controller
+  and foreground transitions, event waits, inventory-boundary pause/pacing waits, and the entry
+  and return of the first bounded native operations. Use these logs to distinguish scheduler
+  admission delays from a native COM browse stall; do not infer the boundary from a missing
+  `BrowseOPCItemIDs` message alone.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate

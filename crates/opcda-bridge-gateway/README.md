@@ -110,4 +110,7 @@ Diagnostic gateway builds used for isolated native-inventory investigations may 
 `bytehound-opc-da-client` commit from the companion `opc-cli` repository. Such builds are for
 sidecar diagnosis only and are not release artifacts; production gateways continue to use the
 published client crate. The gateway forwards both adaptive pacing controls to the native client:
-the optional item rate remains optional, matching the native client's pacing contract.
+the optional item rate remains optional, matching the native client's pacing contract. Diagnostic
+logs also identify pause-overlay, health-probe, controller-state, foreground-activity, and native
+inventory-event-wait transitions so a startup stall can be separated from a native COM browse
+stall.

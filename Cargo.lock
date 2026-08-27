@@ -197,7 +197,7 @@ checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 [[package]]
 name = "bytehound-opc-da-client"
 version = "0.2.8"
-source = "git+https://github.com/bytehound-labs/opc-cli.git?rev=29a690d6900c3213b39ffc7ba39836d85e1dbdc3#29a690d6900c3213b39ffc7ba39836d85e1dbdc3"
+source = "git+https://github.com/bytehound-labs/opc-cli.git?rev=b815aa6#b815aa6"
 dependencies = [
  "anyhow",
  "async-trait",
