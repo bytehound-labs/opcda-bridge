@@ -248,6 +248,9 @@ config file — see [Configuration](#configuration) below.
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
   becomes available.
+  If refresh setup fails or shutdown wins before the background build task starts, the provisional
+  generation is abandoned and the build reservation is released without disturbing the last
+  complete active generation.
   Matching is case-insensitive with exact/prefix/contains ranking, and responses report
   `has_more` when the requested result window is exceeded. This preserves status, discovery,
   reads, writes, and lazy browse responsiveness during search.
