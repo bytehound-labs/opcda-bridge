@@ -540,23 +540,6 @@ cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
 sonar-scanner
 ```
 
-Mutation testing runs separately from required PR validation because it is intentionally
-long-running. The weekly/manual workflow uses [`cargo-mutants`](https://mutants.rs/) across the
-portable library, client, and protocol crates on Ubuntu and the Windows gateway on Windows:
-
-```sh
-cargo install cargo-mutants --version 27.1.0
-cargo mutants --package opcda-bridge --in-place --no-shuffle --timeout 180
-```
-
-Use `--in-diff <diff-file>` for a focused local run. The workflow runs every Saturday at
-03:17 UTC, accepts a package selector through `workflow_dispatch`, and retains each
-`mutants.out/` report for 14 days. A shard fails when a behavioral mutation survives or times out;
-the Windows gateway is kept on a Windows runner so its platform-specific implementation is
-actually compiled and exercised. The shared mutation configuration excludes only two
-catalog-specific equivalent mutations whose output cannot differ with the current compatibility
-metadata; all other surviving mutations fail the shard.
-
 Tagged binary releases include SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures,
 and GitHub artifact provenance attestations. Running the release workflow manually builds and
 uploads packages as workflow artifacts without creating a GitHub release. The client and gateway

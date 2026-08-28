@@ -50,18 +50,6 @@ Example: `feat(gateway): add tag subscription support`.
   on any OS: tests exercise a hand-written `MockOpcClient` instead of a live COM connection.
 - Hardware-in-the-loop tests (against a real Windows host + OPC DA server) aren't part of CI;
   note manual verification steps in the PR description when a change needs them.
-- Mutation testing uses `cargo-mutants` to check whether the test suite detects behavioral
-  changes that ordinary coverage can miss. Run one package locally with:
-
-  ```sh
-  cargo mutants --package opcda-bridge --in-place --no-shuffle --timeout 180
-  ```
-
-  Use `--in-diff <diff-file>` for a focused diagnostic run. The weekly/manual workflow covers
-  `opcda-bridge`, `opcda-bridge-client`, and `opcda-bridge-proto` on Ubuntu, and
-  `opcda-bridge-gateway` on Windows so its COM-specific code is compiled and tested on the
-  platform where it exists. Full mutation testing is intentionally not a required PR check
-  because the gateway shard is long-running; reports are retained as workflow artifacts.
 
 - Cross-version protocol checks run from the isolated `compatibility-tests/` workspace:
   `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`.
@@ -89,12 +77,6 @@ keyless signatures, and provenance; use the release workflow's manual dispatch f
 validation without publishing. Intentional Protobuf wire-contract breaks must carry the
 `breaking-protobuf` label; without that explicit approval, the Buf compatibility check blocks the
 pull request.
-
-The weekly cargo-mutants workflow runs on Saturdays at 03:17 UTC and supports manual package
-selection. It is advisory rather than merge-blocking, while every mutation shard fails when a
-mutant survives or times out. The shared configuration has only two narrowly documented
-compatibility-catalog equivalence exclusions; add no broader exclusions without first proving
-that a mutation is unobservable.
 
 The generated compatibility files must remain synchronized with
 `crates/opcda-bridge-proto/compatibility.toml`:

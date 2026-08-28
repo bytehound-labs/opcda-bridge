@@ -3881,7 +3881,7 @@ impl<C: OpcClient> IndexManager<C> {
                     }
                 }
             }
-            if event_wait_logs < 3 {
+            event_wait_logs = if event_wait_logs < 3 {
                 tracing::info!(
                     server,
                     generation,
@@ -3901,8 +3901,10 @@ impl<C: OpcClient> IndexManager<C> {
                         }),
                     "waiting for next native inventory event"
                 );
-                event_wait_logs = event_wait_logs.saturating_add(1);
-            }
+                event_wait_logs.saturating_add(1)
+            } else {
+                event_wait_logs
+            };
             let event_wait_started = Instant::now();
             let event = match tokio::time::timeout(
                 Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
@@ -3925,15 +3927,17 @@ impl<C: OpcClient> IndexManager<C> {
                     break;
                 }
             };
-            if event_wait_return_logs < 3 {
+            event_wait_return_logs = if event_wait_return_logs < 3 {
                 tracing::info!(
                     server,
                     generation,
                     event_wait_elapsed_ms = event_wait_started.elapsed().as_millis(),
                     "native inventory event wait returned"
                 );
-                event_wait_return_logs = event_wait_return_logs.saturating_add(1);
-            }
+                event_wait_return_logs.saturating_add(1)
+            } else {
+                event_wait_return_logs
+            };
             let Some(event) = event else {
                 break;
             };
@@ -9758,6 +9762,11 @@ mod tests {
         ));
         let control = Arc::new(RecordingInventoryControl::default());
         let trait_control: Arc<dyn InventoryControl> = control.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
         manager.runtime.lock().unwrap().insert(
             "S".into(),
             RuntimeState {
@@ -11252,6 +11261,39 @@ mod tests {
             refresh.await.unwrap().unwrap().state,
             IndexState::NotIndexed
         );
+
+        let startup_control = Arc::new(RecordingInventoryControl::default());
+        let startup_started = Arc::new(Notify::new());
+        let startup_release = Arc::new(Notify::new());
+        let startup_manager = Arc::new(IndexManager::new(
+            Arc::new(
+                LifecycleClient::new(
+                    vec![Ok(handle_with_control(
+                        VecDeque::new(),
+                        Arc::clone(&startup_control),
+                    ))],
+                    vec![],
+                )
+                .with_inventory_gate(Arc::clone(&startup_started), Arc::clone(&startup_release)),
+            ),
+            settings(directory.path().join("runtime-attach-failure.sqlite3")),
+        ));
+        let refresh_manager = Arc::clone(&startup_manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+        startup_started.notified().await;
+        let runtime = Arc::clone(&startup_manager.runtime);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = runtime.lock().unwrap();
+            panic!("poison runtime before startup control attachment");
+        });
+        startup_release.notify_one();
+        let error = refresh.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "index runtime lock poisoned");
+        assert!(startup_control.is_cancelled());
+        assert_eq!(
+            startup_control.cancellation_reasons(),
+            vec!["startup_runtime_attach_failure_cleanup"]
+        );
     }
 
     #[tokio::test]
@@ -11331,6 +11373,11 @@ mod tests {
             Arc::new(MockOpcClient::default()),
             settings(directory.path().join("poisoned-guards.sqlite3")),
         ));
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
         let overlays = Arc::clone(&manager.pause_overlays);
         let _ = std::panic::catch_unwind(move || {
             let _guard = overlays.lock().unwrap();
@@ -11408,12 +11455,142 @@ mod tests {
                 .await
         );
 
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::ERROR)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
         let runtime = Arc::clone(&manager.runtime);
         let _ = std::panic::catch_unwind(move || {
             let _guard = runtime.lock().unwrap();
             panic!("poison runtime");
         });
         manager.reconcile_pause_state("S");
+    }
+
+    #[tokio::test]
+    async fn control_cancel_records_reason_for_attached_control() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("attached-cancel.sqlite3")),
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, trait_control);
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let status = manager
+            .control("S", IndexControlAction::Cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(status.state, IndexState::Partial);
+        assert!(control.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            control.cancellation_reasons(),
+            vec!["grpc_control_cancel".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn event_wait_diagnostics_stop_after_three_iterations() {
+        let directory = tempdir().unwrap();
+        let control = Arc::new(RecordingInventoryControl::default());
+        let progress = InventoryProgress {
+            branches_visited: 1,
+            entries_seen: 0,
+            unique_items: 0,
+            active_time_ms: 0,
+            paused_time_ms: 0,
+            items_per_second: 0.0,
+            estimated_remaining_ms: None,
+        };
+        let mut events = VecDeque::new();
+        for _ in 0..4 {
+            events.push_back(Ok(InventoryEvent::Progress(progress.clone())));
+        }
+        events.push_back(Ok(InventoryEvent::Completed(InventoryCompleted {
+            complete: true,
+            cancelled: false,
+            truncated: false,
+            warning: None,
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+        })));
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(LifecycleClient::new(
+                vec![Ok(handle_with_control(events, Arc::clone(&control)))],
+                vec![],
+            )),
+            settings(directory.path().join("event-wait-diagnostics.sqlite3")),
+        ));
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Ready).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_build_records_controller_recovery_pacing_failure() {
+        struct PauseUntilSlicePacing(Arc<RecordingInventoryControl>);
+
+        impl HostMetricsProvider for PauseUntilSlicePacing {
+            fn snapshot(&self) -> HostMetrics {
+                HostMetrics {
+                    cpu_percent: Some(if self.0.pacing_calls.load(Ordering::Acquire) < 2 {
+                        95.0
+                    } else {
+                        0.0
+                    }),
+                    ..HostMetrics::default()
+                }
+            }
+        }
+
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("recovery-pacing-failure.sqlite3"));
+        config.adaptive = true;
+        config.adaptive_recovery_delay_seconds = 1;
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.fail_pacing_on_call(3);
+        let client = LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::from([Ok(InventoryEvent::Slice(InventorySliceObservation {
+                    sequence: 1,
+                    backend: InventorySliceBackend::Da2,
+                    nodes_returned: 0,
+                    has_more: false,
+                    native_operations: 1,
+                    elapsed_ms: 1,
+                    entries_seen: 0,
+                    unique_items: 0,
+                }))]),
+                Arc::clone(&control),
+            ))],
+            vec![],
+        );
+        let manager = Arc::new(
+            IndexManager::new(Arc::new(client), config)
+                .with_host_metrics_provider(Arc::new(PauseUntilSlicePacing(Arc::clone(&control)))),
+        );
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Failed).await;
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::Failed);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("unable to update inventory pacing while recovering: test pacing update failure")
+        );
+        assert!(control.is_cancelled());
+        assert_eq!(
+            control.cancellation_reasons(),
+            vec!["controller_recovery_failure_cleanup"]
+        );
     }
 
     #[tokio::test]
@@ -11937,6 +12114,7 @@ mod tests {
         resume_count: AtomicUsize,
         pacing_calls: AtomicUsize,
         fail_pacing_on_call: AtomicUsize,
+        cancel_reasons: Mutex<Vec<String>>,
     }
 
     impl InventoryControl for RecordingInventoryControl {
@@ -11955,6 +12133,11 @@ mod tests {
 
         fn cancel(&self) {
             self.cancelled.store(true, Ordering::Release);
+        }
+
+        fn cancel_with_reason(&self, reason: &str) {
+            self.cancel();
+            self.cancel_reasons.lock().unwrap().push(reason.into());
         }
 
         fn is_cancelled(&self) -> bool {
@@ -11978,6 +12161,10 @@ mod tests {
 
         fn fail_pacing_on_call(&self, call: usize) {
             self.fail_pacing_on_call.store(call, Ordering::Release);
+        }
+
+        fn cancellation_reasons(&self) -> Vec<String> {
+            self.cancel_reasons.lock().unwrap().clone()
         }
     }
 

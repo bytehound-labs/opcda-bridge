@@ -169,32 +169,11 @@ targets both at 100% with a 1% threshold). CI fails if coverage drops. All code 
 branches, edge cases, and default values — must be tested. When adding new code, add
 corresponding tests in the same PR to maintain 100% coverage.
 
-### Mutation testing
+### Test effectiveness
 
-The repository uses `cargo-mutants` as a deeper test-effectiveness check: it mutates compiled Rust
-behavior and fails when the existing tests do not detect the change. Shared defaults live in
-`.cargo/mutants.toml`, including `--locked` Cargo invocations, all features, and a 20-second
-minimum test timeout. The pinned tool version is `27.1.0`.
-
-The weekly/manual workflow runs the three portable packages (`opcda-bridge`,
-`opcda-bridge-client`, and `opcda-bridge-proto`) on Ubuntu and the Windows-only
-`opcda-bridge-gateway` package on Windows. Keeping the gateway on Windows is required to compile
-and exercise its `cfg(windows)` COM/service implementation rather than treating that code as
-unreachable. Full mutation testing is advisory rather than a required PR status because the
-gateway shard is substantially longer than ordinary validation; a shard still fails on any
-surviving or timed-out mutant, and its report is uploaded for 14 days. The shared configuration
-contains only two narrowly documented equivalence exclusions in the compatibility evaluator:
-one comparison is value-equivalent at equality, and the current catalog gives all exact-pair
-evidence rows the same status. Remove the latter if those catalog statuses ever diverge.
-
-Run a package locally with:
-
-```sh
-cargo mutants --package opcda-bridge --in-place --no-shuffle --timeout 180
-```
-
-Use `cargo mutants --in-diff <diff-file> --in-place` for a focused diagnostic run. Do not edit
-source files while an in-place mutation run is active.
+Mutation testing is not part of the repository workflow. Test effectiveness is enforced through
+the 100% coverage gate, focused regression tests, full workspace tests, and the security and
+compatibility checks described below.
 
 ### Test design for the gateway
 
