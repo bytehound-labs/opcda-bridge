@@ -90,6 +90,9 @@ controller decisions update both the native slice batch size and pacing interval
 interval provides a time limit for low-volume inventories. Runtime status includes rolling
 foreground latency/error/quality metrics, host/storage availability, and persisted scheduler
 backoff diagnostics.
+The native and compatibility browse iterators also terminate after 64 consecutive identical
+successful values with a contextual non-progress error, so a server-side enumerator that does not
+advance cannot hold an inventory open indefinitely. Short duplicate sequences remain valid.
 If the native client rejects an initial or adaptive pacing update, the build fails visibly and
 the previous complete generation remains active; pacing errors are never logged and ignored.
 Completed generations are refreshed weekly by default. The first automatic build waits for a

@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Canonicalize existing index database identities for writer coordination and persistent build
   locks, while isolating independent in-memory databases from the shared registry and filesystem
   lock sidecars.
+- Bound native and compatibility browse iterators so 64 consecutive identical successful values
+  produce a contextual terminal error instead of an unbounded inventory stall.
 
 ## [0.4.10](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.9...opcda-bridge-gateway-v0.4.10) - 2026-08-27
 
