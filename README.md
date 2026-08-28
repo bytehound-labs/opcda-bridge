@@ -270,6 +270,10 @@ config file — see [Configuration](#configuration) below.
   DA2 hierarchical inventory validates every server-reported branch before queueing it.
   Branch-only names rejected by native navigation with `E_INVALIDARG` are skipped and included in
   the completion warning, while names that resolve to exact items remain selectable.
+  If the DA2 branch iterator itself reaches the bounded non-progress threshold, the diagnostic
+  client discards only that branch iterator and continues with the independent item iterator.
+  The completion warning identifies the skipped iterator; item-side non-progress and unrelated
+  native errors remain terminal.
 - Release a browse session before its gateway-side expiry:
 
   ```sh

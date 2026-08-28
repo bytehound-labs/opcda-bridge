@@ -132,4 +132,8 @@ inventory-event-wait transitions so a startup stall can be separated from a nati
 stall. The pinned diagnostic client traces the first 128 bounded native operations with operation
 names, DA2 paths, item names, boundary/pacing waits, native durations, iterator results, and
 failures, so a stall can be classified as scheduler admission, pacing, native COM browsing, or
-inventory event delivery.
+inventory event delivery. For DA2 hierarchical inventory, a bounded
+`BrowseNonProgress` from the branch iterator is recoverable: the diagnostic client drops that
+malformed branch iterator, continues with the independent item iterator, and reports the skipped
+iterator in the completion warning. The same condition from the item iterator and unrelated
+native errors remain terminal.

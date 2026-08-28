@@ -63,10 +63,14 @@ a working opcda-bridge, not a redesign of it.
   carry a source label through the gateway adapter into the native client, and repeated requests
   report whether cancellation was already pending; use those fields to distinguish operator
   cancellation, timeout/error cleanup, shutdown, build unwinding, and stream-drop teardown.
-- **Inventory failures are terminal, typed failures.** The native inventory worker catches
-  unexpected panics, logs the payload type without exposing panic contents through the public
-  protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
-  every reported count before indexing so malformed native counts cannot panic the worker.
+- **Inventory failures are terminal, typed failures, except for bounded DA2 branch recovery.**
+  The native inventory worker catches unexpected panics, logs the payload type without exposing
+  panic contents through the public protocol, and delivers an `OpcError` to the stream. Fixed-size
+  COM iterator buffers validate every reported count before indexing so malformed native counts
+  cannot panic the worker. During hierarchical DA2 inventory, a `BrowseNonProgress` from the
+  branch iterator is recoverable: the branch iterator is dropped, the independent item iterator
+  continues, and the completion warning identifies the skipped iterator. Item-side non-progress
+  and unrelated errors remain terminal.
 - **Indexed search is isolated from foreground database coordination.** Uncached full-text
   queries open a read-only SQLite connection outside the process-wide writable database mutex,
   retain only a bounded ranked candidate set, and fetch metadata for the final result page.
