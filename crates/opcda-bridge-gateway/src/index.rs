@@ -4906,16 +4906,7 @@ impl<C: OpcClient> IndexManager<C> {
             }
             self.set_pause_overlay(server, None, Some(true));
             let observation = self.probe_health(server).await;
-            self.update_health_state(
-                server,
-                if !observation.sentinel_configured {
-                    HealthProbeState::Unavailable
-                } else if observation.healthy {
-                    HealthProbeState::Healthy
-                } else {
-                    HealthProbeState::Unhealthy
-                },
-            );
+            self.update_health_state(server, Self::health_state(&observation));
             if observation.healthy {
                 self.set_pause_overlay(server, None, Some(false));
                 *backoff = Duration::from_secs(1);
@@ -4936,6 +4927,14 @@ impl<C: OpcClient> IndexManager<C> {
                 self.set_pause_overlay(server, None, Some(false));
                 return false;
             }
+        }
+    }
+
+    fn health_state(observation: &HealthProbeObservation) -> HealthProbeState {
+        match (observation.sentinel_configured, observation.healthy) {
+            (false, _) => HealthProbeState::Unavailable,
+            (true, true) => HealthProbeState::Healthy,
+            (true, false) => HealthProbeState::Unhealthy,
         }
     }
 

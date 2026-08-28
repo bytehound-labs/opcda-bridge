@@ -45,8 +45,10 @@ is reported as a warning unless the index state is `failed`.
 Each build checks its maintenance-window, health, and adaptive recovery gates before requesting
 the next inventory event. Health readiness combines capability and latency checks with the
 optional sentinel tag; unhealthy targets pause inventory with bounded exponential backoff and
-healthy recovery resumes it with the configured pacing. Cancellation, health failure, or a
-rejected pacing update terminates the build without replacing the last complete generation.
+healthy recovery resumes it with the configured pacing. Without a sentinel tag, the health
+status is reported as `Unavailable` while capability and latency checks can still permit the
+build. Cancellation, health failure, or a rejected pacing update terminates the build without
+replacing the last complete generation.
 Pending entries are flushed before terminal state is recorded, and successful completion with a
 non-fatal inventory warning remains searchable while the warning is exposed in status.
 Completed active generations are durable across gateway restarts. Activation is an atomic metadata
