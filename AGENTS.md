@@ -64,8 +64,10 @@ a working opcda-bridge, not a redesign of it.
   must never make status,
   discovery, reads, writes, or lazy browse wait on a broad query; during promotion it must use the
   active generation from the promotion-safe status read rather than call back through the writable
-  database mutex. Cancellation issued while inventory startup is awaiting its control handle must
-  be queued and applied when the handle becomes available.
+  database mutex. Live search streams begin with an initial progress event, emit matches in browse
+  order with progress after each page, and end with completion or an explicit truncation warning.
+  Cancellation issued while inventory startup is awaiting its control handle must be queued and
+  applied when the handle becomes available.
 - **SQLite writer coordination is database-wide and cleanup is build-aware.** Every mutation on
   an index database file, including primary build progress/failure writes and cleanup batches on
   the separate WAL connection, must pass through the same internal writer gate; per-server build

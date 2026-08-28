@@ -190,6 +190,9 @@ config file — see [Configuration](#configuration) below.
   opcda-bridge-client --host 192.168.1.50:7600 search Device1 \
     --server Kepware.KepServerEX.V5 --match-mode contains
   ```
+  A normal search stream starts with an initial progress event, emits matches in browse order
+  with progress updates after each page, and ends with a completion event. Result or visit caps
+  can terminate the stream early with a truncation warning.
 - Use the persistent gateway-owned index for fast interactive discovery. Only servers explicitly
   allowed by the gateway configuration can be indexed, and indexed search never falls back to
   live traversal:
