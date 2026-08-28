@@ -54,6 +54,9 @@ from another manager instance sharing the database. Shutdown is also observed wh
 that deferred wait. An interrupted refresh is superseded when a complete active generation
 remains available, so status and search continue to use that snapshot while cleanup runs.
 An interrupted initial build remains failed and visible because no complete snapshot can replace it.
+Status combines the persisted generation snapshot with runtime build, health, storage,
+foreground, and scheduler diagnostics. During promotion, persisted status is read through a
+read-only connection; a runtime error overrides the reported state only when no build is active.
 Database coordination and persistent build-lock paths use the canonical identity of the database
 file, so existing-file aliases such as relative paths and symlinks cannot bypass coordination.
 If the file and its parent cannot be canonicalized, the original path spelling is retained.

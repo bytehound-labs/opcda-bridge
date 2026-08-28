@@ -89,6 +89,11 @@ a working opcda-bridge, not a redesign of it.
   the parent and reattach the filename; if that cannot be done, retain the original path spelling.
   Each `:memory:` database gets an independent coordination object and must not create or rely on a
   filesystem build lock.
+- **Index status is an aggregation of durable and runtime state.** Status combines the persisted
+  generation snapshot with runtime build, health, storage, foreground, and scheduler diagnostics.
+  Promotion reads persisted rows through a read-only connection and filesystem diagnostics; a
+  runtime error changes the reported state only when no build is active, so an in-flight build
+  remains represented by its current lifecycle state.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 - **Compatibility contract**: Client and gateway package versions are independent. Runtime
