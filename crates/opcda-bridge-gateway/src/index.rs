@@ -2053,13 +2053,11 @@ async fn run_cleanup_worker(
 async fn wait_for_deferred_cleanup(
     path: &Path,
     server: &str,
-    background_tasks: &Arc<BackgroundTasks>,
+    _background_tasks: &Arc<BackgroundTasks>,
     coordination: &Arc<DatabaseCoordination>,
     cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> bool {
-    #[cfg(not(test))]
-    let _ = background_tasks;
     if let Ok(mut tasks) = cleanup_tasks.lock()
         && let Some(task) = tasks.get_mut(server)
     {
@@ -2083,7 +2081,7 @@ async fn wait_for_deferred_cleanup(
         return true;
     }
     #[cfg(test)]
-    background_tasks.wait_for_cleanup_notification_hook().await;
+    _background_tasks.wait_for_cleanup_notification_hook().await;
     if *shutdown.borrow() {
         return false;
     }
@@ -2097,15 +2095,13 @@ async fn retry_cleanup_after_failure(
     path: &Path,
     server: &str,
     background_tasks: &Arc<BackgroundTasks>,
-    cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    _cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
     consecutive_failures: &mut u32,
     error: &anyhow::Error,
 ) -> bool {
-    #[cfg(not(test))]
-    let _ = cleanup_tasks;
     *consecutive_failures = consecutive_failures.saturating_add(1);
     #[cfg(test)]
-    if let Ok(mut tasks) = cleanup_tasks.lock()
+    if let Ok(mut tasks) = _cleanup_tasks.lock()
         && let Some(task) = tasks.get_mut(server)
     {
         task.failures = task.failures.saturating_add(1);
@@ -6823,6 +6819,75 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(stats.batches, 0);
         drop(blocker);
+    }
+
+    #[test]
+    fn cleanup_stops_before_writing_when_shutdown_is_requested() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-shutdown.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.fail_generation("S", generation, "obsolete").unwrap();
+        drop(db);
+
+        let background_tasks = BackgroundTasks::new();
+        background_tasks.request_shutdown();
+        let stats = cleanup_obsolete_generations(&path, "S", &background_tasks).unwrap();
+
+        assert!(stats.stopped_for_shutdown);
+        assert_eq!(stats.batches, 0);
+        assert_eq!(
+            IndexDb::open(&path)
+                .unwrap()
+                .status_rows("S")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cleanup_stops_when_obsolete_data_disappears_before_batch_delete() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-no-progress.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.fail_generation("S", generation, "obsolete").unwrap();
+        drop(db);
+
+        let background_tasks = Arc::new(BackgroundTasks::new());
+        let (started, release) = background_tasks.install_cleanup_batch_hook();
+        let cleanup_path = path.clone();
+        let cleanup_tasks = Arc::clone(&background_tasks);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_obsolete_generations(&cleanup_path, "S", cleanup_tasks.as_ref())
+        });
+
+        started.recv().unwrap();
+        let remover = Connection::open(&path).unwrap();
+        remover
+            .execute("DELETE FROM generations WHERE server = 'S'", [])
+            .unwrap();
+        drop(remover);
+        release.send(()).unwrap();
+
+        let stats = cleanup.join().unwrap().unwrap();
+        assert_eq!(stats.batches, 1);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.fts_entries, 0);
+        assert_eq!(stats.generations, 0);
+        assert!(
+            IndexDb::open(&path)
+                .unwrap()
+                .status_rows("S")
+                .unwrap()
+                .is_empty()
+        );
+        background_tasks.wait_for_cleanup_batch_hook();
     }
 
     #[test]
