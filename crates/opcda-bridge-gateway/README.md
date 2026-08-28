@@ -72,6 +72,10 @@ work is in progress. Matching is case-insensitive with exact/prefix/contains ran
 responses report when additional results exist beyond the requested limit. During promotion,
 searches use the active generation already returned by the promotion-safe status path instead of
 waiting for the writable database mutex.
+Refresh setup is staged before the asynchronous build task is launched. If startup, capability
+negotiation, generation creation, task launch, or shutdown fails at that boundary, the
+provisional generation is abandoned and its build reservation is released while the last
+complete active generation remains available.
 Cancellation
 requests received before inventory startup returns its control handle are retained and applied
 once the handle is available.

@@ -3458,90 +3458,144 @@ impl<C: OpcClient> IndexManager<C> {
             );
         }
         self.load_persisted_retry_state(server)?;
-        let build_ownership = {
-            let foreground_users = self
-                .foreground_users
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index foreground lock poisoned"))?
-                .get(server)
-                .copied()
-                .unwrap_or(0);
-            let mut runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
-            let state = runtime.entry(server.to_string()).or_default();
-            let active_builds = self
-                .active_builds
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index active-build lock poisoned"))?
-                .len();
-            let backing_off = !force
-                && state
-                    .retry_after
-                    .is_some_and(|retry| SystemTime::now() < retry);
-            let circuit_open = !force && state.circuit_open;
-            if state.build.is_some() || backing_off || circuit_open {
-                None
-            } else if active_builds >= self.settings.concurrency.max(1) as usize {
-                anyhow::bail!("namespace index build concurrency limit reached");
-            } else {
-                let mut build_locks = self
-                    .build_locks
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("index build-lock registry poisoned"))?;
-                if build_locks.contains_key(server) {
-                    anyhow::bail!(
-                        "namespace index build lock is already held in this process for server {server}"
-                    );
-                }
-                let lock = BuildFileLock::acquire(&self.settings.database_path, server)?;
-                #[cfg(test)]
-                self.wait_for_build_reservation_hook();
-                let ownership = Arc::new(());
-                let mut build_owners = self
-                    .coordination
-                    .build_owners
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("index build-owner registry poisoned"))?;
-                if build_owners.contains_key(server) {
-                    anyhow::bail!(
-                        "index build owner is already registered in this process for server {server}"
-                    );
-                }
-                let mut active_builds = self
-                    .active_builds
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("index active-build lock poisoned"))?;
-                if active_builds.len() >= self.settings.concurrency.max(1) as usize {
-                    anyhow::bail!("namespace index build concurrency limit reached");
-                }
-                build_owners.insert(server.to_string(), Arc::clone(&ownership));
-                active_builds.insert(server.to_string());
-                build_locks.insert(server.to_string(), lock);
-                state.build = Some(RuntimeBuild {
-                    control: None,
-                    progress: None,
-                    started_at: timestamp_now(),
-                    foreground_users,
-                    operator_paused: false,
-                    quiet_until: None,
-                    effective_limits: None,
-                    controller_state: None,
-                    pause_reason: None,
-                    recovery_deadline: None,
-                    last_commit_latency_ms: None,
-                });
-                state.last_error = None;
-                Some(ownership)
-            }
-        };
+        let build_ownership = self.reserve_refresh_build(server, force)?;
         let Some(build_ownership) = build_ownership else {
             return self.status(server).await;
         };
 
         let initial_limits = self.initial_inventory_limits();
-        let handle = match self
+        let Some(handle) = self
+            .start_refresh_inventory(server, &build_ownership, initial_limits)
+            .await?
+        else {
+            return self.status(server).await;
+        };
+        let Some(control_was_cancelled_before_attach) =
+            self.attach_refresh_control(server, &build_ownership, &handle, initial_limits)?
+        else {
+            return self.status(server).await;
+        };
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server,
+            batch_size = initial_limits.batch_size,
+            item_rate_per_second = initial_limits.item_rate_per_second,
+            duty_cycle_percent = initial_limits.duty_cycle_percent,
+            "started namespace index inventory"
+        );
+        if self.background_tasks.is_shutting_down() {
+            handle.control.cancel();
+            self.finish_build_owned(server, &build_ownership, None);
+            return self.status(server).await;
+        }
+        let Some(generation) = self
+            .start_refresh_generation(
+                server,
+                &handle.control,
+                &build_ownership,
+                control_was_cancelled_before_attach,
+            )
+            .await?
+        else {
+            return self.status(server).await;
+        };
+        self.launch_refresh_build(
+            server,
+            generation,
+            handle,
+            build_ownership,
+            control_was_cancelled_before_attach,
+        )?;
+        self.status(server).await
+    }
+
+    fn reserve_refresh_build(&self, server: &str, force: bool) -> anyhow::Result<Option<Arc<()>>> {
+        let foreground_users = self
+            .foreground_users
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index foreground lock poisoned"))?
+            .get(server)
+            .copied()
+            .unwrap_or(0);
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
+        let state = runtime.entry(server.to_string()).or_default();
+        let active_builds = self
+            .active_builds
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index active-build lock poisoned"))?
+            .len();
+        let backing_off = !force
+            && state
+                .retry_after
+                .is_some_and(|retry| SystemTime::now() < retry);
+        let circuit_open = !force && state.circuit_open;
+        if state.build.is_some() || backing_off || circuit_open {
+            return Ok(None);
+        }
+        if active_builds >= self.settings.concurrency.max(1) as usize {
+            anyhow::bail!("namespace index build concurrency limit reached");
+        }
+        let mut build_locks = self
+            .build_locks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index build-lock registry poisoned"))?;
+        if build_locks.contains_key(server) {
+            anyhow::bail!(
+                "namespace index build lock is already held in this process for server {server}"
+            );
+        }
+        let lock = BuildFileLock::acquire(&self.settings.database_path, server)?;
+        #[cfg(test)]
+        self.wait_for_build_reservation_hook();
+        let ownership = Arc::new(());
+        let mut build_owners = self
+            .coordination
+            .build_owners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index build-owner registry poisoned"))?;
+        if build_owners.contains_key(server) {
+            anyhow::bail!(
+                "index build owner is already registered in this process for server {server}"
+            );
+        }
+        let mut active_builds = self
+            .active_builds
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index active-build lock poisoned"))?;
+        if active_builds.len() >= self.settings.concurrency.max(1) as usize {
+            anyhow::bail!("namespace index build concurrency limit reached");
+        }
+        build_owners.insert(server.to_string(), Arc::clone(&ownership));
+        active_builds.insert(server.to_string());
+        build_locks.insert(server.to_string(), lock);
+        state.build = Some(RuntimeBuild {
+            control: None,
+            progress: None,
+            started_at: timestamp_now(),
+            foreground_users,
+            operator_paused: false,
+            quiet_until: None,
+            effective_limits: None,
+            controller_state: None,
+            pause_reason: None,
+            recovery_deadline: None,
+            last_commit_latency_ms: None,
+        });
+        state.last_error = None;
+        Ok(Some(ownership))
+    }
+
+    async fn start_refresh_inventory(
+        &self,
+        server: &str,
+        build_ownership: &Arc<()>,
+        initial_limits: InventoryLimits,
+    ) -> anyhow::Result<Option<InventoryHandle>> {
+        match self
             .with_opc_timeout(
                 "start inventory",
                 self.client
@@ -3549,16 +3603,25 @@ impl<C: OpcClient> IndexManager<C> {
             )
             .await
         {
-            Ok(handle) => handle,
+            Ok(handle) => Ok(Some(handle)),
             Err(error) => {
                 if self.take_pending_cancel(server) {
-                    self.finish_build_owned(server, &build_ownership, None);
-                    return self.status(server).await;
+                    self.finish_build_owned(server, build_ownership, None);
+                    return Ok(None);
                 }
-                self.record_start_failure(server, &build_ownership, &error.to_string())?;
-                return Err(error);
+                self.record_start_failure(server, build_ownership, &error.to_string())?;
+                Err(error)
             }
-        };
+        }
+    }
+
+    fn attach_refresh_control(
+        &self,
+        server: &str,
+        build_ownership: &Arc<()>,
+        handle: &InventoryHandle,
+        initial_limits: InventoryLimits,
+    ) -> anyhow::Result<Option<bool>> {
         let control_was_cancelled_before_attach = handle.control.is_cancelled();
         if let Err(error) = handle.control.set_pacing(pacing_for_limits(initial_limits)) {
             let message = format!("unable to apply initial inventory pacing: {error}");
@@ -3566,10 +3629,10 @@ impl<C: OpcClient> IndexManager<C> {
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
             handle.control.cancel();
             if cancelled {
-                self.finish_build_owned(server, &build_ownership, None);
-                return self.status(server).await;
+                self.finish_build_owned(server, build_ownership, None);
+                return Ok(None);
             }
-            self.record_start_failure(server, &build_ownership, &message)?;
+            self.record_start_failure(server, build_ownership, &message)?;
             return Err(anyhow::anyhow!(message));
         }
         let control_result = self
@@ -3589,31 +3652,27 @@ impl<C: OpcClient> IndexManager<C> {
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
             handle.control.cancel();
             if cancelled {
-                self.finish_build_owned(server, &build_ownership, None);
-                return self.status(server).await;
+                self.finish_build_owned(server, build_ownership, None);
+                return Ok(None);
             }
-            self.finish_build_owned(server, &build_ownership, Some(error.to_string()));
+            self.finish_build_owned(server, build_ownership, Some(error.to_string()));
             return Err(error);
         }
         if self.take_pending_cancel(server) {
             handle.control.cancel();
-            self.finish_build_for_control_owned(server, &handle.control, &build_ownership, None);
-            return self.status(server).await;
+            self.finish_build_for_control_owned(server, &handle.control, build_ownership, None);
+            return Ok(None);
         }
-        tracing::info!(
-            process_id = std::process::id(),
-            database = %self.settings.database_path.display(),
-            server,
-            batch_size = initial_limits.batch_size,
-            item_rate_per_second = initial_limits.item_rate_per_second,
-            duty_cycle_percent = initial_limits.duty_cycle_percent,
-            "started namespace index inventory"
-        );
-        if self.background_tasks.is_shutting_down() {
-            handle.control.cancel();
-            self.finish_build_owned(server, &build_ownership, None);
-            return self.status(server).await;
-        }
+        Ok(Some(control_was_cancelled_before_attach))
+    }
+
+    async fn start_refresh_generation(
+        &self,
+        server: &str,
+        control: &Arc<dyn InventoryControl>,
+        build_ownership: &Arc<()>,
+        control_was_cancelled_before_attach: bool,
+    ) -> anyhow::Result<Option<u64>> {
         let (organization, source) = match self
             .with_opc_timeout(
                 "inventory capability probe",
@@ -3623,19 +3682,13 @@ impl<C: OpcClient> IndexManager<C> {
         {
             Ok(capabilities) => (capabilities.organization, capabilities.source),
             Err(error) => {
-                let cancelled =
-                    !control_was_cancelled_before_attach && handle.control.is_cancelled();
-                handle.control.cancel();
+                let cancelled = !control_was_cancelled_before_attach && control.is_cancelled();
+                control.cancel();
                 if cancelled {
-                    self.finish_build_for_control_owned(
-                        server,
-                        &handle.control,
-                        &build_ownership,
-                        None,
-                    );
-                    return self.status(server).await;
+                    self.finish_build_for_control_owned(server, control, build_ownership, None);
+                    return Ok(None);
                 }
-                self.record_start_failure(server, &build_ownership, &error.to_string())?;
+                self.record_start_failure(server, build_ownership, &error.to_string())?;
                 return Err(error);
             }
         };
@@ -3653,23 +3706,28 @@ impl<C: OpcClient> IndexManager<C> {
                     error = %error,
                     "namespace index database operation failed"
                 );
-                let cancelled =
-                    !control_was_cancelled_before_attach && handle.control.is_cancelled();
-                handle.control.cancel();
+                let cancelled = !control_was_cancelled_before_attach && control.is_cancelled();
+                control.cancel();
                 if cancelled {
-                    self.finish_build_for_control_owned(
-                        server,
-                        &handle.control,
-                        &build_ownership,
-                        None,
-                    );
-                    return self.status(server).await;
+                    self.finish_build_for_control_owned(server, control, build_ownership, None);
+                    return Ok(None);
                 }
-                self.record_start_failure(server, &build_ownership, &error.to_string())?;
+                self.record_start_failure(server, build_ownership, &error.to_string())?;
                 return Err(error);
             }
         };
         self.schedule_cleanup(server);
+        Ok(Some(generation))
+    }
+
+    fn launch_refresh_build(
+        self: &Arc<Self>,
+        server: &str,
+        generation: u64,
+        handle: InventoryHandle,
+        build_ownership: Arc<()>,
+        control_was_cancelled_before_attach: bool,
+    ) -> anyhow::Result<()> {
         let control_result = self
             .runtime
             .lock()
@@ -3695,7 +3753,7 @@ impl<C: OpcClient> IndexManager<C> {
             self.abandon_generation(server, generation, &error.to_string());
             if cancelled {
                 self.finish_build_owned(server, &build_ownership, None);
-                return self.status(server).await;
+                return Ok(());
             }
             self.finish_build_owned(server, &build_ownership, Some(error.to_string()));
             return Err(error);
@@ -3704,14 +3762,14 @@ impl<C: OpcClient> IndexManager<C> {
             handle.control.cancel();
             self.abandon_generation(server, generation, "index build cancelled during startup");
             self.finish_build_for_control_owned(server, &handle.control, &build_ownership, None);
-            return self.status(server).await;
+            return Ok(());
         }
         self.reconcile_pause_state(server);
         if self.background_tasks.is_shutting_down() {
             handle.control.cancel();
             self.abandon_generation(server, generation, "gateway shutdown before index build");
             self.finish_build_owned(server, &build_ownership, None);
-            return self.status(server).await;
+            return Ok(());
         }
         let manager = Arc::clone(self);
         let server_name = server.to_string();
@@ -3732,7 +3790,7 @@ impl<C: OpcClient> IndexManager<C> {
             self.abandon_generation(server, generation, "index build task was not started");
             self.finish_build_for_control_owned(server, &control, &build_ownership, None);
         }
-        self.status(server).await
+        Ok(())
     }
 
     fn controller_config(&self) -> ControllerConfig {
@@ -3875,6 +3933,14 @@ impl<C: OpcClient> IndexManager<C> {
         action: IndexControlAction,
     ) -> anyhow::Result<IndexStatus> {
         self.require_configured(server)?;
+        self.apply_control_action(server, action)?;
+        if !matches!(action, IndexControlAction::Cancel) {
+            self.reconcile_pause_state(server);
+        }
+        self.status(server).await
+    }
+
+    fn apply_control_action(&self, server: &str, action: IndexControlAction) -> anyhow::Result<()> {
         if let Ok(mut runtime) = self.runtime.lock() {
             if let Some(build) = runtime
                 .get_mut(server)
@@ -3907,10 +3973,7 @@ impl<C: OpcClient> IndexManager<C> {
         } else {
             return Err(anyhow::anyhow!("index runtime lock poisoned"));
         }
-        if !matches!(action, IndexControlAction::Cancel) {
-            self.reconcile_pause_state(server);
-        }
-        self.status(server).await
+        Ok(())
     }
 
     pub async fn search(
