@@ -50,7 +50,9 @@ a working opcda-bridge, not a redesign of it.
 - **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
   limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
   OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
-  start a replacement build.
+  start a replacement build. Persisted retry deadlines take precedence over the normal refresh
+  cadence after a restart, so a failed server is not retried immediately just because the
+  gateway restarted.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
