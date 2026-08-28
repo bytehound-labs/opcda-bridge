@@ -50,7 +50,9 @@ a working opcda-bridge, not a redesign of it.
 - **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
   limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
   OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
-  start a replacement build.
+  start a replacement build. Persisted retry deadlines take precedence over the normal refresh
+  cadence after a restart, so a failed server is not retried immediately just because the
+  gateway restarted.
 - **Native inventory startup diagnostics are boundary-aware.** Diagnostic builds of the gateway
   and the pinned `bytehound-opc-da-client` identify pause overlays, health probes, controller
   and foreground transitions, event waits, inventory-boundary pause/pacing waits, and the entry
@@ -69,12 +71,15 @@ a working opcda-bridge, not a redesign of it.
   queries open a read-only SQLite connection outside the process-wide writable database mutex,
   retain only a bounded ranked candidate set, and fetch metadata for the final result page.
   Exact searches must use separate equality lookups on the normalized display-name and ItemID
-  indexes, then merge and deduplicate those bounded candidate sets before ranking; they must not
-  reintroduce a broad `OR`/`LIKE` ordering scan over the generation. Search must never make status,
+  indexes, each bounded to `limit + 1` rows, then merge and deduplicate those candidate sets before
+  ranking; they must not reintroduce a broad `OR`/`LIKE` ordering scan over the generation. Search
+  must never make status,
   discovery, reads, writes, or lazy browse wait on a broad query; during promotion it must use the
   active generation from the promotion-safe status read rather than call back through the writable
-  database mutex. Cancellation issued while inventory startup is awaiting its control handle must
-  be queued and applied when the handle becomes available.
+  database mutex. Live search streams begin with an initial progress event, emit matches in browse
+  order with progress after each page, and end with completion or an explicit truncation warning.
+  Cancellation issued while inventory startup is awaiting its control handle must be queued and
+  applied when the handle becomes available.
 - **SQLite writer coordination is database-wide and cleanup is build-aware.** Every mutation on
   an index database file, including primary build progress/failure writes and cleanup batches on
   the separate WAL connection, must pass through the same internal writer gate; per-server build
@@ -82,7 +87,11 @@ a working opcda-bridge, not a redesign of it.
   active builds before and after acquiring the gate, yields it between bounded batches, and keeps
   deferred requests pending until the final active build has completed, including when the request
   and build belong to different manager instances sharing that file. Deferred workers must observe
-  shutdown even if it races with notification subscription. Build finalization must release
+  shutdown even if it races with notification subscription; cleanup must stop before opening a
+  new write batch after shutdown and treat a batch with no remaining obsolete rows as no progress.
+  Scheduler attempts keep retry/deferred decisions separate from completion bookkeeping so a
+  pending request is not discarded before its worker outcome is known.
+  Build finalization must release
   ownership before publishing build capacity and resume pending cleanup on every terminal path,
   including startup failure, cancellation, spawn rejection, shutdown, and unexpected unwinding.
   Coordination keys and persistent build-lock paths must use the canonical identity of an existing
@@ -90,6 +99,11 @@ a working opcda-bridge, not a redesign of it.
   the parent and reattach the filename; if that cannot be done, retain the original path spelling.
   Each `:memory:` database gets an independent coordination object and must not create or rely on a
   filesystem build lock.
+- **Index status is an aggregation of durable and runtime state.** Status combines the persisted
+  generation snapshot with runtime build, health, storage, foreground, and scheduler diagnostics.
+  Promotion reads persisted rows through a read-only connection and filesystem diagnostics; a
+  runtime error changes the reported state only when no build is active, so an in-flight build
+  remains represented by its current lifecycle state.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 - **Compatibility contract**: Client and gateway package versions are independent. Runtime

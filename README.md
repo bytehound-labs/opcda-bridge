@@ -190,6 +190,9 @@ config file — see [Configuration](#configuration) below.
   opcda-bridge-client --host 192.168.1.50:7600 search Device1 \
     --server Kepware.KepServerEX.V5 --match-mode contains
   ```
+  A normal search stream starts with an initial progress event, emits matches in browse order
+  with progress updates after each page, and ends with a completion event. Result or visit caps
+  can terminate the stream early with a truncation warning.
 - Use the persistent gateway-owned index for fast interactive discovery. Only servers explicitly
   allowed by the gateway configuration can be indexed, and indexed search never falls back to
   live traversal:
@@ -217,13 +220,23 @@ config file — see [Configuration](#configuration) below.
   different manager instance sharing the same database file, so indexing maintenance does not
   interrupt indexed search requests or compete with progress/failure writes. Deferred cleanup also
   exits cleanly if gateway shutdown begins before it starts waiting for build completion. Transient
-  cleanup failures
-  are retried with bounded backoff. A refresh interrupted by restart is superseded when a complete
+  cleanup stops before starting another write batch once shutdown is requested, and a batch that
+  finds no remaining obsolete rows makes no write. Transient cleanup failures are retried with
+  bounded backoff, and pending cleanup requests remain tracked until a completed pass confirms
+  that no rerun is needed. Persisted retry deadlines take precedence
+  after a restart, so a failed server is not retried immediately just because the gateway was
+  restarted. A refresh interrupted by restart is superseded when a complete
   active generation remains available, so the durable snapshot stays ready while cleanup runs;
+  foreground operations are reference-counted per server; indexing stays paused while any
+  foreground user is active and remains paused through the configured quiet period after the last
+  foreground operation ends.
   interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
   generations do not make a newer active generation appear failed. If relational index rows and
   the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache
   is quarantined rather than serving silently incomplete substring results.
+  Status combines the persisted generation snapshot with runtime build, health, storage,
+  foreground, and scheduler diagnostics. During promotion, persisted status is read through a
+  read-only connection; a runtime error overrides the reported state only when no build is active.
   Database coordination and persistent build-lock paths use the canonical identity of the database
   file, so existing-file aliases such as relative paths and symlinks cannot bypass coordination.
   If the file and its parent cannot be canonicalized, the original path spelling is retained.
@@ -231,15 +244,19 @@ config file — see [Configuration](#configuration) below.
   build-lock sidecars.
   Indexed queries use a dedicated read-only SQLite connection and bounded candidate sets, keeping
   broad searches out of the foreground database mutex. Exact searches use separate equality
-  lookups on the normalized display-name and ItemID indexes, then merge and deduplicate those
-  candidates before ranking; prefix and contains searches retain their existing indexed/FTS
-  paths.
+  lookups on the normalized display-name and ItemID indexes, each bounded to `limit + 1` rows,
+  then merge and deduplicate those candidates before ranking; prefix and contains searches retain
+  their existing indexed/FTS paths.
   During promotion, searches reuse the active generation reported by promotion-safe status rather
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
-  becomes available. Cancellation requests carry a diagnostic source label through the gateway
-  adapter into the native client; stream teardown and repeated requests remain distinguishable in
-  logs without changing cancellation semantics.
+  becomes available.
+  If refresh setup fails or shutdown wins before the background build task starts, the provisional
+  generation is abandoned and the build reservation is released without disturbing the last
+  complete active generation.
+  Cancellation requests carry a diagnostic source label through the gateway adapter into the native
+  client; stream teardown and repeated requests remain distinguishable in logs without changing
+  cancellation semantics.
   Matching is case-insensitive with exact/prefix/contains ranking, and responses report
   `has_more` when the requested result window is exceeded. This preserves status, discovery,
   reads, writes, and lazy browse responsiveness during search.
