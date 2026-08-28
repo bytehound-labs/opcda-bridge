@@ -222,7 +222,8 @@ config file — see [Configuration](#configuration) below.
   exits cleanly if gateway shutdown begins before it starts waiting for build completion. Transient
   cleanup stops before starting another write batch once shutdown is requested, and a batch that
   finds no remaining obsolete rows makes no write. Transient cleanup failures are retried with
-  bounded backoff. Persisted retry deadlines take precedence
+  bounded backoff, and pending cleanup requests remain tracked until a completed pass confirms
+  that no rerun is needed. Persisted retry deadlines take precedence
   after a restart, so a failed server is not retried immediately just because the gateway was
   restarted. A refresh interrupted by restart is superseded when a complete
   active generation remains available, so the durable snapshot stays ready while cleanup runs;

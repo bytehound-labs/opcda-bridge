@@ -79,6 +79,8 @@ a working opcda-bridge, not a redesign of it.
   and build belong to different manager instances sharing that file. Deferred workers must observe
   shutdown even if it races with notification subscription; cleanup must stop before opening a
   new write batch after shutdown and treat a batch with no remaining obsolete rows as no progress.
+  Scheduler attempts keep retry/deferred decisions separate from completion bookkeeping so a
+  pending request is not discarded before its worker outcome is known.
   Build finalization must release
   ownership before publishing build capacity and resume pending cleanup on every terminal path,
   including startup failure, cancellation, spawn rejection, shutdown, and unexpected unwinding.
