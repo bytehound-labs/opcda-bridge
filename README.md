@@ -257,8 +257,10 @@ config file — see [Configuration](#configuration) below.
   Before each inventory event, a build passes its maintenance-window, health, and adaptive
   recovery gates. Health probes check server capabilities, latency, and the optional sentinel
   tag; an unhealthy server pauses the build with bounded exponential backoff, while a healthy
-  recovery resumes it with the configured pacing. Cancellation, probe failure, or a rejected
-  pacing update stops the build and preserves the last complete generation. Pending entries are
+  recovery resumes it with the configured pacing. Without a sentinel tag, the health status is
+  reported as `Unavailable` while capability and latency checks can still permit the build.
+  Cancellation, probe failure, or a rejected pacing update stops the build and preserves the last
+  complete generation. Pending entries are
   flushed before terminal state is recorded, and successful completion or a non-fatal inventory
   warning remains distinct from a failed or cancelled build.
   Matching is case-insensitive with exact/prefix/contains ranking, and responses report
