@@ -226,6 +226,16 @@ struct RuntimeState {
     sentinel_checked_at: Option<Instant>,
 }
 
+#[derive(Default)]
+struct RuntimeStatus {
+    build: Option<RuntimeBuild>,
+    last_error: Option<String>,
+    retry_after: Option<SystemTime>,
+    consecutive_failures: u32,
+    circuit_open: bool,
+    health: HealthProbeState,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct PauseOverlayState {
     maintenance: bool,
@@ -2316,6 +2326,33 @@ struct DbStatus {
     last_error: Option<String>,
 }
 
+struct StatusRows {
+    active: Option<DbStatus>,
+    staging: Option<DbStatus>,
+    failed: Option<DbStatus>,
+    failed_after_active: Option<DbStatus>,
+}
+
+impl StatusRows {
+    fn from_rows(rows: &[DbStatus]) -> Self {
+        let active = rows.iter().find(|row| row.state == "active").cloned();
+        let staging = rows.iter().find(|row| row.state == "staging").cloned();
+        let failed = rows.iter().find(|row| row.state == "failed").cloned();
+        let failed_after_active = active.as_ref().and_then(|active| {
+            failed
+                .as_ref()
+                .filter(|failed| failed.generation > active.generation)
+                .cloned()
+        });
+        Self {
+            active,
+            staging,
+            failed,
+            failed_after_active,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct StoredIndexProfile {
     organization: NamespaceOrganization,
@@ -3070,8 +3107,12 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub async fn status(&self, server: &str) -> anyhow::Result<IndexStatus> {
-        let configured = self.settings.servers.iter().any(|s| s == server);
-        if !configured {
+        if !self
+            .settings
+            .servers
+            .iter()
+            .any(|configured| configured == server)
+        {
             return Ok(empty_status(server, false, IndexState::NotIndexed));
         }
         let sentinel_configured = self.settings.sentinel_tag.is_some();
@@ -3080,12 +3121,47 @@ impl<C: OpcClient> IndexManager<C> {
             .lock()
             .ok()
             .is_some_and(|servers| servers.contains(server));
-        let mut promotion_read_error = None;
-        let rows = if is_promoting && self.settings.database_path != Path::new(":memory:") {
-            match IndexDb::open_read_only(&self.settings.database_path)
+        let (rows, promotion_read_error) = self.load_status_rows(server, is_promoting)?;
+        let rows = StatusRows::from_rows(&rows);
+        let runtime = self.runtime_status(server)?;
+        let storage = self.status_storage(is_promoting)?;
+        let database_bytes = storage
+            .main_bytes
+            .saturating_add(storage.wal_bytes)
+            .saturating_add(storage.shm_bytes);
+        let mut status = self.base_status(
+            server,
+            &rows,
+            runtime.build.as_ref(),
+            is_promoting,
+            database_bytes,
+            sentinel_configured,
+        );
+        status.sentinel_configured = sentinel_configured;
+        self.apply_status_errors(
+            &mut status,
+            runtime.build.is_some(),
+            runtime.last_error.as_deref(),
+            promotion_read_error.as_deref(),
+        );
+        status.foreground_metrics = self.foreground_metrics_snapshot(server);
+        status.host_metrics = self.host_metrics.snapshot();
+        status.storage = storage;
+        self.apply_runtime_status(&mut status, &runtime);
+        status.scheduler = self.scheduler_diagnostics(server, &rows, &runtime);
+        Ok(status)
+    }
+
+    fn load_status_rows(
+        &self,
+        server: &str,
+        is_promoting: bool,
+    ) -> anyhow::Result<(Vec<DbStatus>, Option<String>)> {
+        if is_promoting && self.settings.database_path != Path::new(":memory:") {
+            return match IndexDb::open_read_only(&self.settings.database_path)
                 .and_then(|db| db.status_rows(server))
             {
-                Ok(rows) => rows,
+                Ok(rows) => Ok((rows, None)),
                 Err(error) => {
                     tracing::warn!(
                         process_id = std::process::id(),
@@ -3094,147 +3170,206 @@ impl<C: OpcClient> IndexManager<C> {
                         error = %error,
                         "unable to read namespace index status during promotion"
                     );
-                    promotion_read_error = Some(error.to_string());
-                    Vec::new()
+                    Ok((Vec::new(), Some(error.to_string())))
                 }
+            };
+        }
+        Ok((self.with_database_read(|db| db.status_rows(server))?, None))
+    }
+
+    fn runtime_status(&self, server: &str) -> anyhow::Result<RuntimeStatus> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
+        Ok(runtime
+            .get(server)
+            .map(|state| RuntimeStatus {
+                build: state.build.clone(),
+                last_error: state.last_error.clone(),
+                retry_after: state.retry_after,
+                consecutive_failures: state.consecutive_failures,
+                circuit_open: state.circuit_open,
+                health: state.health,
+            })
+            .unwrap_or_default())
+    }
+
+    fn status_storage(&self, is_promoting: bool) -> anyhow::Result<StorageDiagnostics> {
+        if is_promoting {
+            Ok(storage_diagnostics_for_path(&self.settings.database_path))
+        } else {
+            self.storage_diagnostics()
+        }
+    }
+
+    fn base_status(
+        &self,
+        server: &str,
+        rows: &StatusRows,
+        build: Option<&RuntimeBuild>,
+        is_promoting: bool,
+        database_bytes: u64,
+        sentinel_configured: bool,
+    ) -> IndexStatus {
+        match build {
+            Some(build) => {
+                self.status_during_build(server, rows, build, is_promoting, database_bytes)
             }
-        } else {
-            self.with_database_read(|db| db.status_rows(server))?
-        };
-        let active_row = rows.iter().find(|row| row.state == "active").cloned();
-        let staging_row = rows.iter().find(|row| row.state == "staging").cloned();
-        let failed_row = rows.iter().find(|row| row.state == "failed").cloned();
-        let failed_after_active = active_row.as_ref().and_then(|active| {
-            failed_row
-                .as_ref()
-                .filter(|failed| failed.generation > active.generation)
-                .cloned()
-        });
-        let (build, runtime_error) = {
-            let runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
-            let state = runtime.get(server);
-            (
-                state.and_then(|state| state.build.clone()),
-                state.and_then(|state| state.last_error.clone()),
-            )
-        };
-        let build_active = build.is_some();
-        let build_started_at = build.as_ref().map(|value| value.started_at.clone());
-        let last_success_at = active_row.as_ref().and_then(|row| row.completed_at.clone());
-        let last_attempt_at = build_started_at
+            None => self.status_without_build(server, rows, database_bytes, sentinel_configured),
+        }
+    }
+
+    fn status_during_build(
+        &self,
+        server: &str,
+        rows: &StatusRows,
+        build: &RuntimeBuild,
+        is_promoting: bool,
+        database_bytes: u64,
+    ) -> IndexStatus {
+        let row = rows
+            .active
             .clone()
-            .or_else(|| failed_row.as_ref().map(|row| row.started_at.clone()))
-            .or_else(|| active_row.as_ref().map(|row| row.started_at.clone()));
-        let storage = if is_promoting {
-            storage_diagnostics_for_path(&self.settings.database_path)
-        } else {
-            self.storage_diagnostics()?
-        };
-        let database_bytes = storage
-            .main_bytes
-            .saturating_add(storage.wal_bytes)
-            .saturating_add(storage.shm_bytes);
-        let mut status = if let Some(build) = build {
-            let row = active_row
-                .clone()
-                .or(staging_row.clone())
-                .or(failed_row.clone());
-            if let Some(row) = row {
+            .or_else(|| rows.staging.clone())
+            .or_else(|| rows.failed.clone());
+        match row {
+            Some(row) => {
                 let state = if is_promoting {
                     IndexState::Promoting
-                } else if active_row.is_some() {
+                } else if rows.active.is_some() {
                     IndexState::Refreshing
-                } else if staging_row.is_some() {
+                } else if rows.staging.is_some() {
                     IndexState::Partial
                 } else {
                     IndexState::Failed
                 };
                 let mut status =
                     status_from_row(server, row, state, build.progress.clone(), database_bytes);
-                status.started_at = Some(build.started_at);
+                status.started_at = Some(build.started_at.clone());
                 status
-            } else {
-                IndexStatus {
-                    server: server.to_string(),
-                    state: if is_promoting {
-                        IndexState::Promoting
-                    } else {
-                        IndexState::Partial
-                    },
-                    configured: true,
-                    active_generation: 0,
-                    entry_count: build.progress.as_ref().map_or(0, |p| p.entries_seen),
-                    unique_item_count: build.progress.as_ref().map_or(0, |p| p.unique_items),
-                    started_at: Some(build.started_at),
-                    completed_at: None,
-                    last_error: None,
-                    database_bytes,
-                    organization: NamespaceOrganization::Unspecified,
-                    source: BrowseSource::Unspecified,
-                    progress: build.progress,
-                    effective_limits: build.effective_limits,
-                    controller_state: build.controller_state,
-                    pause_reason: build.pause_reason,
-                    recovery_deadline: build.recovery_deadline.map(instant_timestamp),
-                    foreground_metrics: ForegroundMetrics::default(),
-                    host_metrics: HostMetrics::default(),
-                    health: HealthProbeState::Unavailable,
-                    sentinel_configured,
-                    storage: StorageDiagnostics::default(),
-                    scheduler: SchedulerDiagnostics::default(),
-                }
             }
-        } else if let Some(row) = active_row.clone() {
-            let stale = row
-                .completed_at
-                .as_deref()
-                .and_then(parse_timestamp)
-                .is_some_and(|completed| {
-                    SystemTime::now()
-                        .duration_since(completed)
-                        .unwrap_or_default()
-                        > Duration::from_secs(self.settings.refresh_interval_seconds)
-                });
-            let state = if failed_after_active.is_some() {
-                IndexState::Failed
-            } else if stale {
-                IndexState::Stale
+            None => self.status_from_runtime_build(server, build, is_promoting, database_bytes),
+        }
+    }
+
+    fn status_from_runtime_build(
+        &self,
+        server: &str,
+        build: &RuntimeBuild,
+        is_promoting: bool,
+        database_bytes: u64,
+    ) -> IndexStatus {
+        let mut status = empty_status(
+            server,
+            true,
+            if is_promoting {
+                IndexState::Promoting
             } else {
-                IndexState::Ready
-            };
-            let mut status = status_from_row(server, row, state, None, database_bytes);
-            if let Some(failed) = failed_after_active {
-                status.last_error = failed.last_error;
+                IndexState::Partial
+            },
+        );
+        status.entry_count = build
+            .progress
+            .as_ref()
+            .map_or(0, |progress| progress.entries_seen);
+        status.unique_item_count = build
+            .progress
+            .as_ref()
+            .map_or(0, |progress| progress.unique_items);
+        status.started_at = Some(build.started_at.clone());
+        status.database_bytes = database_bytes;
+        status.progress = build.progress.clone();
+        status.effective_limits = build.effective_limits;
+        status.controller_state = build.controller_state;
+        status.pause_reason = build.pause_reason;
+        status.recovery_deadline = build.recovery_deadline.map(instant_timestamp);
+        status
+    }
+
+    fn status_without_build(
+        &self,
+        server: &str,
+        rows: &StatusRows,
+        database_bytes: u64,
+        sentinel_configured: bool,
+    ) -> IndexStatus {
+        match (
+            rows.active.clone(),
+            rows.staging.clone(),
+            rows.failed.clone(),
+        ) {
+            (Some(row), _, _) => self.status_from_active_row(server, rows, row, database_bytes),
+            (None, Some(row), _) => {
+                status_from_row(server, row, IndexState::Partial, None, database_bytes)
             }
-            status
-        } else if let Some(row) = staging_row {
-            status_from_row(server, row, IndexState::Partial, None, database_bytes)
-        } else if let Some(row) = failed_row {
-            status_from_row(server, row, IndexState::Failed, None, database_bytes)
+            (None, None, Some(row)) => {
+                status_from_row(server, row, IndexState::Failed, None, database_bytes)
+            }
+            (None, None, None) => {
+                let mut status = empty_status(server, true, IndexState::NotIndexed);
+                status.database_bytes = database_bytes;
+                status.sentinel_configured = sentinel_configured;
+                status
+            }
+        }
+    }
+
+    fn status_from_active_row(
+        &self,
+        server: &str,
+        rows: &StatusRows,
+        row: DbStatus,
+        database_bytes: u64,
+    ) -> IndexStatus {
+        let stale = row
+            .completed_at
+            .as_deref()
+            .and_then(parse_timestamp)
+            .is_some_and(|completed| {
+                SystemTime::now()
+                    .duration_since(completed)
+                    .unwrap_or_default()
+                    > Duration::from_secs(self.settings.refresh_interval_seconds)
+            });
+        let state = if rows.failed_after_active.is_some() {
+            IndexState::Failed
+        } else if stale {
+            IndexState::Stale
         } else {
-            let mut status = empty_status(server, true, IndexState::NotIndexed);
-            status.database_bytes = database_bytes;
-            status
+            IndexState::Ready
         };
-        status.sentinel_configured = sentinel_configured;
+        let mut status = status_from_row(server, row, state, None, database_bytes);
+        if let Some(failed) = &rows.failed_after_active {
+            status.last_error = failed.last_error.clone();
+        }
+        status
+    }
+
+    fn apply_status_errors(
+        &self,
+        status: &mut IndexStatus,
+        build_active: bool,
+        runtime_error: Option<&str>,
+        promotion_read_error: Option<&str>,
+    ) {
         if !build_active && let Some(error) = runtime_error {
             status.state = IndexState::Failed;
-            status.last_error = Some(error);
+            status.last_error = Some(error.to_owned());
         }
         if let Some(error) = promotion_read_error {
-            status.last_error = Some(error);
+            status.last_error = Some(error.to_owned());
         }
+    }
+
+    fn foreground_metrics_snapshot(&self, server: &str) -> ForegroundMetrics {
         let active_count = self
             .foreground_users
             .lock()
             .ok()
             .and_then(|users| users.get(server).copied())
             .unwrap_or(0) as u64;
-        status.foreground_metrics = self
-            .foreground_metrics
+        self.foreground_metrics
             .lock()
             .ok()
             .and_then(|metrics| {
@@ -3245,54 +3380,57 @@ impl<C: OpcClient> IndexManager<C> {
             .unwrap_or(ForegroundMetrics {
                 active_count,
                 ..ForegroundMetrics::default()
-            });
-        status.host_metrics = self.host_metrics.snapshot();
-        status.storage = storage;
+            })
+    }
+
+    fn apply_runtime_status(&self, status: &mut IndexStatus, runtime: &RuntimeStatus) {
+        status.health = runtime.health;
+        if let Some(build) = &runtime.build {
+            status.effective_limits = build.effective_limits;
+            status.controller_state = build.controller_state;
+            status.pause_reason = build.pause_reason;
+            status.recovery_deadline = build.recovery_deadline.map(instant_timestamp);
+            status.storage.last_commit_latency_ms = build.last_commit_latency_ms;
+        }
+    }
+
+    fn scheduler_diagnostics(
+        &self,
+        server: &str,
+        rows: &StatusRows,
+        runtime: &RuntimeStatus,
+    ) -> SchedulerDiagnostics {
+        let last_success_at = rows
+            .active
+            .as_ref()
+            .and_then(|row| row.completed_at.clone());
         let mut scheduler = SchedulerDiagnostics {
-            next_refresh_at: last_success_at.as_deref().and_then(|completed| {
-                parse_timestamp(completed).and_then(|completed| {
-                    completed
-                        .checked_add(
-                            Duration::from_secs(self.settings.refresh_interval_seconds.max(1))
-                                .saturating_add(deterministic_jitter(
-                                    server,
-                                    self.settings.schedule_jitter_seconds,
-                                )),
-                        )
-                        .map(system_time_timestamp)
-                })
-            }),
-            last_attempt_at,
+            next_refresh_at: self.next_refresh_at(server, last_success_at.as_deref()),
+            last_attempt_at: runtime
+                .build
+                .as_ref()
+                .map(|build| build.started_at.clone())
+                .or_else(|| rows.failed.as_ref().map(|row| row.started_at.clone()))
+                .or_else(|| rows.active.as_ref().map(|row| row.started_at.clone())),
             last_success_at,
-            last_success_duration_ms: active_row.as_ref().and_then(|row| {
-                row.completed_at
-                    .as_deref()
-                    .and_then(parse_timestamp)
-                    .and_then(|completed| {
-                        parse_timestamp(&row.started_at)
-                            .and_then(|started| completed.duration_since(started).ok())
-                    })
-                    .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
-            }),
+            last_success_duration_ms: rows.active.as_ref().and_then(status_duration_ms),
             ..SchedulerDiagnostics::default()
         };
-        if let Ok(runtime) = self.runtime.lock()
-            && let Some(state) = runtime.get(server)
-        {
-            scheduler.retry_after = state.retry_after.map(system_time_timestamp);
-            scheduler.consecutive_failures = state.consecutive_failures;
-            scheduler.circuit_open = state.circuit_open;
-            status.health = state.health;
-            if let Some(build) = &state.build {
-                status.effective_limits = build.effective_limits;
-                status.controller_state = build.controller_state;
-                status.pause_reason = build.pause_reason;
-                status.recovery_deadline = build.recovery_deadline.map(instant_timestamp);
-                status.storage.last_commit_latency_ms = build.last_commit_latency_ms;
-            }
-        }
-        status.scheduler = scheduler;
-        Ok(status)
+        scheduler.retry_after = runtime.retry_after.map(system_time_timestamp);
+        scheduler.consecutive_failures = runtime.consecutive_failures;
+        scheduler.circuit_open = runtime.circuit_open;
+        scheduler
+    }
+
+    fn next_refresh_at(&self, server: &str, completed: Option<&str>) -> Option<String> {
+        let completed = completed.and_then(parse_timestamp)?;
+        completed
+            .checked_add(
+                Duration::from_secs(self.settings.refresh_interval_seconds.max(1)).saturating_add(
+                    deterministic_jitter(server, self.settings.schedule_jitter_seconds),
+                ),
+            )
+            .map(system_time_timestamp)
     }
 
     pub async fn refresh(
@@ -4706,65 +4844,13 @@ impl<C: OpcClient> IndexManager<C> {
     ) {
         let owns_build = match self.runtime.lock() {
             Ok(mut runtime) => {
-                let is_owner = if let Some(ownership) = ownership {
-                    let token_matches = match self.coordination.build_owners.lock() {
-                        Ok(owners) => owners
-                            .get(server)
-                            .is_some_and(|current| Arc::ptr_eq(current, ownership)),
-                        Err(_) => {
-                            tracing::error!(
-                                process_id = std::process::id(),
-                                database = %self.settings.database_path.display(),
-                                server,
-                                "unable to finalize namespace index build because the ownership registry is poisoned"
-                            );
-                            return;
-                        }
-                    };
-                    let control_matches = match control {
-                        Some(control) => runtime.get(server).is_none_or(|state| {
-                            state.build.as_ref().is_none_or(|build| {
-                                build
-                                    .control
-                                    .as_ref()
-                                    .is_some_and(|current| Arc::ptr_eq(current, control))
-                            })
-                        }),
-                        None => true,
-                    };
-                    token_matches && control_matches
-                } else if let Some(state) = runtime.get(server) {
-                    match control {
-                        Some(control) => state
-                            .build
-                            .as_ref()
-                            .and_then(|build| build.control.as_ref())
-                            .is_some_and(|current| Arc::ptr_eq(current, control)),
-                        None => state.build.is_some(),
-                    }
-                } else {
-                    false
+                let Some(is_owner) =
+                    self.build_completion_is_current(&runtime, server, control, ownership)
+                else {
+                    return;
                 };
-                if is_owner && let Some(state) = runtime.get_mut(server) {
-                    state.last_error = error.clone();
-                    if error.is_some() {
-                        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-                        state.circuit_open =
-                            state.consecutive_failures >= self.settings.circuit_failure_threshold;
-                        state.retry_after = Some(
-                            SystemTime::now()
-                                + retry_delay(
-                                    server,
-                                    state.consecutive_failures,
-                                    state.circuit_open,
-                                    self.settings.circuit_open_seconds,
-                                ),
-                        );
-                    } else {
-                        state.retry_after = None;
-                        state.consecutive_failures = 0;
-                        state.circuit_open = false;
-                    }
+                if is_owner {
+                    self.update_runtime_after_build(&mut runtime, server, error.as_deref());
                 }
                 is_owner
             }
@@ -4779,26 +4865,7 @@ impl<C: OpcClient> IndexManager<C> {
             }
         };
         if owns_build {
-            let _ = self.persist_retry_state(server);
-            self.clear_pause_overlays(server);
-            if let Ok(mut owners) = self.coordination.build_owners.lock()
-                && ownership.is_none_or(|ownership| {
-                    owners
-                        .get(server)
-                        .is_some_and(|current| Arc::ptr_eq(current, ownership))
-                })
-            {
-                owners.remove(server);
-            }
-            self.clear_active_build(server);
-            self.clear_build_lock(server);
-            if let Ok(mut runtime) = self.runtime.lock()
-                && let Some(state) = runtime.get_mut(server)
-            {
-                let _ = state.build.take();
-            }
-            self.schedule_cleanup(server);
-            self.clear_pending_cancel(server);
+            self.finalize_owned_build(server, ownership);
         } else if control.is_some() {
             tracing::warn!(
                 process_id = std::process::id(),
@@ -4806,6 +4873,111 @@ impl<C: OpcClient> IndexManager<C> {
                 server,
                 "ignored completion from obsolete namespace index build"
             );
+        }
+    }
+
+    fn build_completion_is_current(
+        &self,
+        runtime: &HashMap<String, RuntimeState>,
+        server: &str,
+        control: Option<&Arc<dyn InventoryControl>>,
+        ownership: Option<&Arc<()>>,
+    ) -> Option<bool> {
+        if let Some(ownership) = ownership {
+            let token_matches = match self.coordination.build_owners.lock() {
+                Ok(owners) => owners
+                    .get(server)
+                    .is_some_and(|current| Arc::ptr_eq(current, ownership)),
+                Err(_) => {
+                    tracing::error!(
+                        process_id = std::process::id(),
+                        database = %self.settings.database_path.display(),
+                        server,
+                        "unable to finalize namespace index build because the ownership registry is poisoned"
+                    );
+                    return None;
+                }
+            };
+            let control_matches = match control {
+                Some(control) => runtime.get(server).is_none_or(|state| {
+                    state.build.as_ref().is_none_or(|build| {
+                        build
+                            .control
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, control))
+                    })
+                }),
+                None => true,
+            };
+            Some(token_matches && control_matches)
+        } else {
+            Some(runtime.get(server).is_some_and(|state| {
+                match control {
+                    Some(control) => state
+                        .build
+                        .as_ref()
+                        .and_then(|build| build.control.as_ref())
+                        .is_some_and(|current| Arc::ptr_eq(current, control)),
+                    None => state.build.is_some(),
+                }
+            }))
+        }
+    }
+
+    fn update_runtime_after_build(
+        &self,
+        runtime: &mut HashMap<String, RuntimeState>,
+        server: &str,
+        error: Option<&str>,
+    ) {
+        let Some(state) = runtime.get_mut(server) else {
+            return;
+        };
+        state.last_error = error.map(str::to_owned);
+        if error.is_some() {
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            state.circuit_open =
+                state.consecutive_failures >= self.settings.circuit_failure_threshold;
+            state.retry_after = Some(
+                SystemTime::now()
+                    + retry_delay(
+                        server,
+                        state.consecutive_failures,
+                        state.circuit_open,
+                        self.settings.circuit_open_seconds,
+                    ),
+            );
+        } else {
+            state.retry_after = None;
+            state.consecutive_failures = 0;
+            state.circuit_open = false;
+        }
+    }
+
+    fn finalize_owned_build(&self, server: &str, ownership: Option<&Arc<()>>) {
+        let _ = self.persist_retry_state(server);
+        self.clear_pause_overlays(server);
+        self.remove_build_owner(server, ownership);
+        self.clear_active_build(server);
+        self.clear_build_lock(server);
+        if let Ok(mut runtime) = self.runtime.lock()
+            && let Some(state) = runtime.get_mut(server)
+        {
+            let _ = state.build.take();
+        }
+        self.schedule_cleanup(server);
+        self.clear_pending_cancel(server);
+    }
+
+    fn remove_build_owner(&self, server: &str, ownership: Option<&Arc<()>>) {
+        if let Ok(mut owners) = self.coordination.build_owners.lock()
+            && ownership.is_none_or(|ownership| {
+                owners
+                    .get(server)
+                    .is_some_and(|current| Arc::ptr_eq(current, ownership))
+            })
+        {
+            owners.remove(server);
         }
     }
 
@@ -5091,6 +5263,17 @@ fn status_from_row(
         storage: StorageDiagnostics::default(),
         scheduler: SchedulerDiagnostics::default(),
     }
+}
+
+fn status_duration_ms(row: &DbStatus) -> Option<u64> {
+    row.completed_at
+        .as_deref()
+        .and_then(parse_timestamp)
+        .and_then(|completed| {
+            parse_timestamp(&row.started_at)
+                .and_then(|started| completed.duration_since(started).ok())
+        })
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 fn empty_status(server: &str, configured: bool, state: IndexState) -> IndexStatus {

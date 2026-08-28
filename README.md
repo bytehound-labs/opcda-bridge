@@ -231,6 +231,9 @@ config file — see [Configuration](#configuration) below.
   generations do not make a newer active generation appear failed. If relational index rows and
   the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache
   is quarantined rather than serving silently incomplete substring results.
+  Status combines the persisted generation snapshot with runtime build, health, storage,
+  foreground, and scheduler diagnostics. During promotion, persisted status is read through a
+  read-only connection; a runtime error overrides the reported state only when no build is active.
   Database coordination and persistent build-lock paths use the canonical identity of the database
   file, so existing-file aliases such as relative paths and symlinks cannot bypass coordination.
   If the file and its parent cannot be canonicalized, the original path spelling is retained.
