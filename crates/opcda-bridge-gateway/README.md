@@ -117,7 +117,7 @@ published client crate. The gateway forwards both adaptive pacing controls to th
 the optional item rate remains optional, matching the native client's pacing contract. Diagnostic
 logs also identify pause-overlay, health-probe, controller-state, foreground-activity, and native
 inventory-event-wait transitions so a startup stall can be separated from a native COM browse
-stall. The pinned diagnostic client traces the first 128 bounded native operations with operation
-names, DA2 paths, item names, boundary/pacing waits, native durations, iterator results, and
-failures, so a stall can be classified as scheduler admission, pacing, native COM browsing, or
-inventory event delivery.
+stall. The pinned diagnostic client traces the first 4,096 bounded native operations with
+operation names, DA2 paths, item names, boundary/pacing waits, native durations, iterator
+results, and failures, so a stall can be classified as scheduler admission, pacing, native COM
+browsing, or inventory event delivery.

@@ -54,7 +54,7 @@ a working opcda-bridge, not a redesign of it.
 - **Native inventory startup diagnostics are boundary-aware.** Diagnostic builds of the gateway
   and the pinned `bytehound-opc-da-client` identify pause overlays, health probes, controller
   and foreground transitions, event waits, inventory-boundary pause/pacing waits, and the entry
-  and return of the first 128 bounded native operations with browse paths, item names, native
+  and return of the first 4,096 bounded native operations with browse paths, item names, native
   durations, iterator results, and failures. Use these logs to distinguish scheduler admission
   or pacing delays from a native COM browse stall or event-delivery problem; do not infer the
   boundary from a missing `BrowseOPCItemIDs` message alone. Inventory cancellation requests also

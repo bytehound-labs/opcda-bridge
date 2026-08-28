@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Diagnostic native-inventory traces now cover the first 128 bounded operations with operation
+- Diagnostic native-inventory traces now cover the first 4,096 bounded operations with operation
   names, browse paths, item names, boundary/pacing waits, native durations, iterator results,
   and failures.
 - Inventory cancellation logs carry a source label through the gateway adapter into the native
@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(gateway)* canonicalize index database identity ([#87](https://github.com/bytehound-labs/opcda-bridge/pull/87))
+- _(gateway)_ canonicalize index database identity ([#87](https://github.com/bytehound-labs/opcda-bridge/pull/87))
 
 ### Fixed
 
@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(gateway)* coordinate cleanup with index builds
+- _(gateway)_ coordinate cleanup with index builds
 
 ## [0.4.9](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.8...opcda-bridge-gateway-v0.4.9) - 2026-08-26
 
