@@ -59,13 +59,16 @@ file, so existing-file aliases such as relative paths and symlinks cannot bypass
 If the file and its parent cannot be canonicalized, the original path spelling is retained.
 Independent in-memory databases are isolated from the registry and do not create filesystem
 build-lock sidecars.
-Uncached indexed searches use a separate read-only SQLite connection and rank only a bounded
-candidate set in memory, so a broad query cannot hold the coordinator's foreground database
-mutex while it scans the FTS index. Status, discovery, reads, writes, and lazy browse therefore
-remain available while search work is in progress. Matching is case-insensitive with
-exact/prefix/contains ranking, and responses report when additional results exist beyond the
-requested limit. During promotion, searches use the active generation already returned by the
-promotion-safe status path instead of waiting for the writable database mutex. Cancellation
+Uncached indexed searches use a separate read-only SQLite connection and rank only bounded
+candidate sets in memory, so a broad query cannot hold the coordinator's foreground database
+mutex while it scans the FTS index. Exact searches use separate equality lookups on the
+normalized display-name and ItemID indexes, then merge and deduplicate those candidates before
+ranking; prefix and contains searches retain their indexed/FTS paths. Status, discovery, reads,
+writes, and lazy browse therefore remain available while search work is in progress. Matching is
+case-insensitive with exact/prefix/contains ranking, and responses report when additional results
+exist beyond the requested limit. During promotion, searches use the active generation already
+returned by the promotion-safe status path instead of waiting for the writable database mutex.
+Cancellation
 requests received before inventory startup returns its control handle are retained and applied
 once the handle is available.
 
