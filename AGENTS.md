@@ -50,7 +50,9 @@ a working opcda-bridge, not a redesign of it.
 - **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
   limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
   OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
-  start a replacement build.
+  start a replacement build. Persisted retry deadlines take precedence over the normal refresh
+  cadence after a restart, so a failed server is not retried immediately just because the
+  gateway restarted.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
@@ -58,10 +60,16 @@ a working opcda-bridge, not a redesign of it.
 - **Indexed search is isolated from foreground database coordination.** Uncached full-text
   queries open a read-only SQLite connection outside the process-wide writable database mutex,
   retain only a bounded ranked candidate set, and fetch metadata for the final result page.
-  Search must never make status, discovery, reads, writes, or lazy browse wait on a broad query;
-  during promotion it must use the active generation from the promotion-safe status read rather
-  than call back through the writable database mutex. Cancellation issued while inventory startup
-  is awaiting its control handle must be queued and applied when the handle becomes available.
+  Exact searches must use separate equality lookups on the normalized display-name and ItemID
+  indexes, each bounded to `limit + 1` rows, then merge and deduplicate those candidate sets before
+  ranking; they must not reintroduce a broad `OR`/`LIKE` ordering scan over the generation. Search
+  must never make status,
+  discovery, reads, writes, or lazy browse wait on a broad query; during promotion it must use the
+  active generation from the promotion-safe status read rather than call back through the writable
+  database mutex. Live search streams begin with an initial progress event, emit matches in browse
+  order with progress after each page, and end with completion or an explicit truncation warning.
+  Cancellation issued while inventory startup is awaiting its control handle must be queued and
+  applied when the handle becomes available.
 - **SQLite writer coordination is database-wide and cleanup is build-aware.** Every mutation on
   an index database file, including primary build progress/failure writes and cleanup batches on
   the separate WAL connection, must pass through the same internal writer gate; per-server build
@@ -69,7 +77,11 @@ a working opcda-bridge, not a redesign of it.
   active builds before and after acquiring the gate, yields it between bounded batches, and keeps
   deferred requests pending until the final active build has completed, including when the request
   and build belong to different manager instances sharing that file. Deferred workers must observe
-  shutdown even if it races with notification subscription. Build finalization must release
+  shutdown even if it races with notification subscription; cleanup must stop before opening a
+  new write batch after shutdown and treat a batch with no remaining obsolete rows as no progress.
+  Scheduler attempts keep retry/deferred decisions separate from completion bookkeeping so a
+  pending request is not discarded before its worker outcome is known.
+  Build finalization must release
   ownership before publishing build capacity and resume pending cleanup on every terminal path,
   including startup failure, cancellation, spawn rejection, shutdown, and unexpected unwinding.
   Coordination keys and persistent build-lock paths must use the canonical identity of an existing
@@ -77,6 +89,11 @@ a working opcda-bridge, not a redesign of it.
   the parent and reattach the filename; if that cannot be done, retain the original path spelling.
   Each `:memory:` database gets an independent coordination object and must not create or rely on a
   filesystem build lock.
+- **Index status is an aggregation of durable and runtime state.** Status combines the persisted
+  generation snapshot with runtime build, health, storage, foreground, and scheduler diagnostics.
+  Promotion reads persisted rows through a read-only connection and filesystem diagnostics; a
+  runtime error changes the reported state only when no build is active, so an in-flight build
+  remains represented by its current lifecycle state.
 - **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
   the network.
 - **Compatibility contract**: Client and gateway package versions are independent. Runtime
@@ -97,8 +114,20 @@ target for early gateway development.
   merges, no `develop`/release branches, releases tagged directly off `main`. Contrast with the
   author's FalconTune/AccuTune repos, which use a `dev`-branch + `--no-ff` merge model — do not
   carry that convention over here.
-- **Agent workflow**: Always work on a feature branch, open a pull request, and merge only after
-  all required CI/CD checks pass. Never commit directly to `main`.
+- **Standard change protocol**: Start from a clean checkout with local `main` synchronized to
+  `origin/main`, then create a short-lived `<type>/<short-description>` branch. Keep each pull
+  request to one logical change group, run the smallest targeted checks followed by every
+  applicable repository gate, and update the relevant user-facing documentation in the same
+  change. Commit with Conventional Commits, push the branch, and open a focused pull request.
+  Monitor every required CI/CD and SonarQube status; repair failures on the same branch and
+  repeat until all checks pass. If branch protection reports the branch behind `main`, update it
+  before merging. A merge is allowed only when the applicable PR Sonar analysis reports zero
+  `OPEN`/`CONFIRMED` issues; intentional Accepted or False Positive findings must have a durable
+  rationale and related PR or documentation link. Squash-merge only after the complete green
+  result, wait for the resulting `main` workflows and Sonar analysis, and verify the intended
+  findings disappeared without introducing new ones before starting dependent work. Never commit
+  or push directly to `main`, bypass branch protection, use `NOSONAR`, or silence a real finding
+  merely to clean a dashboard.
 - **Commits**: [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`,
   `chore:`, etc.).
 - **Formatting/linting**: `cargo fmt` (default settings) and
@@ -142,9 +171,11 @@ and historical gateway services backed by mock `OpcClient` implementations. An e
 does not need prior CI evidence when its negotiated protocol ranges overlap, but the CLI reports
 such pairings as `unverified`. Release-plz pull requests regenerate the isolated test workspace's
 lockfile before running the same locked test command when package manifests change, because path
-package versions change in the release branch. The release workflow commits the matching lockfile
-after a release commit so the main branch remains runnable with `--locked`. Historical clients
-must keep an exact direct dependency on the protocol crate version they originally shipped with;
+package versions change in the release branch. After a release commit, the release workflow
+proposes the matching compatibility-test lockfile as a separate `release-plz-*` pull request;
+the existing release-PR auto-merge workflow merges it only after the normal required checks pass,
+so generated repository changes never bypass the PR path. Historical clients must keep an exact
+direct dependency on the protocol crate version they originally shipped with;
 otherwise Cargo can resolve their semver range to a newer generated Rust enum whose added variants
 break compilation before the compatibility test can exercise the wire boundary.
 

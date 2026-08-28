@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.19](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.18...opcda-bridge-gateway-v0.4.19) - 2026-08-28
+
+### Other
+
+- *(index)* simplify foreground cleanup
+
+## [0.4.18](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.17...opcda-bridge-gateway-v0.4.18) - 2026-08-28
+
+### Other
+
+- *(gateway)* harden refresh cancellation paths
+
+## [0.4.17](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.16...opcda-bridge-gateway-v0.4.17) - 2026-08-28
+
+### Other
+
+- *(gateway)* split index status and lifecycle finalization ([#114](https://github.com/bytehound-labs/opcda-bridge/pull/114))
+
+## [0.4.16](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.15...opcda-bridge-gateway-v0.4.16) - 2026-08-28
+
+### Other
+
+- *(gateway)* simplify cleanup scheduler
+
+## [0.4.15](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.14...opcda-bridge-gateway-v0.4.15) - 2026-08-28
+
+### Other
+
+- *(gateway)* simplify index scheduler
+
+## [0.4.14](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.13...opcda-bridge-gateway-v0.4.14) - 2026-08-28
+
+### Other
+
+- *(gateway)* simplify live search flow
+
+## [0.4.13](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.12...opcda-bridge-gateway-v0.4.13) - 2026-08-28
+
+### Other
+
+- resolve mechanical Sonar findings ([#102](https://github.com/bytehound-labs/opcda-bridge/pull/102))
+
+## [0.4.12](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.11...opcda-bridge-gateway-v0.4.12) - 2026-08-28
+
+### Fixed
+
+- *(gateway)* use indexed equality for exact search
+
 ## [0.4.11](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.10...opcda-bridge-gateway-v0.4.11) - 2026-08-27
 
 ### Fixed

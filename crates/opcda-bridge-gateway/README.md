@@ -36,6 +36,9 @@ query operations for explicitly configured OPC servers. Capability responses adv
 search support, its protocol version, the configured result limit, and the server's index state.
 Indexed results contain exact ItemIDs and breadcrumb labels, never browse-session node keys.
 Refreshes run asynchronously, and gateway shutdown cancels active indexing before the process exits.
+Foreground operations are reference-counted per server; indexing stays paused while any foreground
+user is active and remains paused through the configured quiet period after the last foreground
+operation ends.
 An inventory can complete successfully with a non-fatal warning when the OPC server rejects
 specific namespace branches; the generation remains active and usable, and the status diagnostic
 is reported as a warning unless the index state is `failed`.
@@ -54,18 +57,29 @@ from another manager instance sharing the database. Shutdown is also observed wh
 that deferred wait. An interrupted refresh is superseded when a complete active generation
 remains available, so status and search continue to use that snapshot while cleanup runs.
 An interrupted initial build remains failed and visible because no complete snapshot can replace it.
+Status combines the persisted generation snapshot with runtime build, health, storage,
+foreground, and scheduler diagnostics. During promotion, persisted status is read through a
+read-only connection; a runtime error overrides the reported state only when no build is active.
 Database coordination and persistent build-lock paths use the canonical identity of the database
 file, so existing-file aliases such as relative paths and symlinks cannot bypass coordination.
 If the file and its parent cannot be canonicalized, the original path spelling is retained.
 Independent in-memory databases are isolated from the registry and do not create filesystem
 build-lock sidecars.
-Uncached indexed searches use a separate read-only SQLite connection and rank only a bounded
-candidate set in memory, so a broad query cannot hold the coordinator's foreground database
-mutex while it scans the FTS index. Status, discovery, reads, writes, and lazy browse therefore
-remain available while search work is in progress. Matching is case-insensitive with
-exact/prefix/contains ranking, and responses report when additional results exist beyond the
-requested limit. During promotion, searches use the active generation already returned by the
-promotion-safe status path instead of waiting for the writable database mutex. Cancellation
+Uncached indexed searches use a separate read-only SQLite connection and rank only bounded
+candidate sets in memory, so a broad query cannot hold the coordinator's foreground database
+mutex while it scans the FTS index. Exact searches use separate equality lookups on the
+normalized display-name and ItemID indexes, each bounded to `limit + 1` rows, then merge and
+deduplicate those candidates before ranking; prefix and contains searches retain their indexed/FTS
+paths. Status, discovery, reads, writes, and lazy browse therefore remain available while search
+work is in progress. Matching is case-insensitive with exact/prefix/contains ranking, and
+responses report when additional results exist beyond the requested limit. During promotion,
+searches use the active generation already returned by the promotion-safe status path instead of
+waiting for the writable database mutex.
+Refresh setup is staged before the asynchronous build task is launched. If startup, capability
+negotiation, generation creation, task launch, or shutdown fails at that boundary, the
+provisional generation is abandoned and its build reservation is released while the last
+complete active generation remains available.
+Cancellation
 requests received before inventory startup returns its control handle are retained and applied
 once the handle is available.
 
