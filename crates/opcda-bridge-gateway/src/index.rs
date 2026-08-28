@@ -320,7 +320,7 @@ fn database_coordination(path: &Path) -> Arc<DatabaseCoordination> {
     let registry = DATABASE_COORDINATIONS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut registry = registry
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
         return existing;
     }
@@ -5005,7 +5005,7 @@ fn build_lock_path(database_path: &Path, server: &str) -> PathBuf {
     let database_path = canonical_database_path(database_path);
     let file_name = database_path
         .file_name()
-        .map_or_else(|| "index.sqlite3".into(), |name| name.to_os_string());
+        .map_or_else(|| "index.sqlite3".into(), std::ffi::OsStr::to_os_string);
     database_path.with_file_name(format!(
         "{}.{}.build.lock",
         file_name.to_string_lossy(),
