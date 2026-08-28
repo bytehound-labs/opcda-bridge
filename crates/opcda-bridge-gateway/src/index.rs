@@ -3941,37 +3941,43 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn apply_control_action(&self, server: &str, action: IndexControlAction) -> anyhow::Result<()> {
-        if let Ok(mut runtime) = self.runtime.lock() {
-            if let Some(build) = runtime
-                .get_mut(server)
-                .and_then(|state| state.build.as_mut())
-            {
-                match action {
-                    IndexControlAction::Pause => build.operator_paused = true,
-                    IndexControlAction::Resume => {
-                        build.operator_paused = false;
-                        if build.foreground_users == 0
-                            && build
-                                .quiet_until
-                                .is_some_and(|deadline| deadline <= Instant::now())
-                        {
-                            build.quiet_until = None;
-                        }
-                    }
-                    IndexControlAction::Cancel => {
-                        if let Some(control) = &build.control {
-                            control.cancel();
-                        } else {
-                            self.pending_cancels
-                                .lock()
-                                .map_err(|_| anyhow::anyhow!("index cancel lock poisoned"))?
-                                .insert(server.to_string());
-                        }
-                    }
-                }
-            }
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
+        let Some(build) = runtime
+            .get_mut(server)
+            .and_then(|state| state.build.as_mut())
+        else {
+            return Ok(());
+        };
+        match action {
+            IndexControlAction::Pause => build.operator_paused = true,
+            IndexControlAction::Resume => Self::resume_build(build),
+            IndexControlAction::Cancel => self.cancel_build(server, build)?,
+        }
+        Ok(())
+    }
+
+    fn resume_build(build: &mut RuntimeBuild) {
+        build.operator_paused = false;
+        if build.foreground_users == 0
+            && build
+                .quiet_until
+                .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            build.quiet_until = None;
+        }
+    }
+
+    fn cancel_build(&self, server: &str, build: &RuntimeBuild) -> anyhow::Result<()> {
+        if let Some(control) = &build.control {
+            control.cancel();
         } else {
-            return Err(anyhow::anyhow!("index runtime lock poisoned"));
+            self.pending_cancels
+                .lock()
+                .map_err(|_| anyhow::anyhow!("index cancel lock poisoned"))?
+                .insert(server.to_string());
         }
         Ok(())
     }
@@ -11639,6 +11645,271 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_treats_cancelled_inventory_start_failure_as_noop() {
+        let directory = tempdir().unwrap();
+        let inventory_started = Arc::new(Notify::new());
+        let inventory_release = Arc::new(Notify::new());
+        let client = Arc::new(
+            LifecycleClient::new(vec![Err("inventory failure".into())], vec![])
+                .with_inventory_gate(
+                    Arc::clone(&inventory_started),
+                    Arc::clone(&inventory_release),
+                ),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("inventory-cancel.sqlite3")),
+        ));
+
+        let refresh_manager = Arc::clone(&manager);
+        let refresh = tokio::spawn(async move { refresh_manager.refresh("S", true).await });
+        inventory_started.notified().await;
+        assert_eq!(
+            manager
+                .control("S", IndexControlAction::Cancel)
+                .await
+                .unwrap()
+                .state,
+            IndexState::Partial
+        );
+        inventory_release.notify_one();
+
+        assert_eq!(
+            refresh.await.unwrap().unwrap().state,
+            IndexState::NotIndexed
+        );
+        assert!(manager.pending_cancels.lock().unwrap().is_empty());
+        assert!(build_lock_path(&directory.path().join("inventory-cancel.sqlite3"), "S").exists());
+    }
+
+    #[tokio::test]
+    async fn attach_control_handles_pending_cancel_after_build_disappears() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("attach-cancel.sqlite3")),
+        ));
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        let ownership = insert_runtime_build(&manager, Arc::clone(&control));
+        manager.runtime.lock().unwrap().get_mut("S").unwrap().build = None;
+        manager.pending_cancels.lock().unwrap().insert("S".into());
+        let handle = InventoryHandle {
+            stream: Box::new(VecInventoryStream {
+                events: VecDeque::new(),
+            }),
+            control: Arc::clone(&control),
+        };
+
+        assert!(
+            manager
+                .attach_refresh_control(
+                    "S",
+                    &ownership,
+                    &handle,
+                    manager.initial_inventory_limits(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(manager.pending_cancels.lock().unwrap().is_empty());
+        assert!(manager.coordination.build_owners.lock().unwrap().is_empty());
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("attach-cancel-control.sqlite3")),
+        ));
+        let control_impl = Arc::new(RecordingInventoryControl::default());
+        control_impl.cancel_on_pacing();
+        let control: Arc<dyn InventoryControl> = control_impl;
+        let ownership = insert_runtime_build(&manager, Arc::clone(&control));
+        manager.runtime.lock().unwrap().get_mut("S").unwrap().build = None;
+        let handle = InventoryHandle {
+            stream: Box::new(VecInventoryStream {
+                events: VecDeque::new(),
+            }),
+            control: Arc::clone(&control),
+        };
+        assert!(
+            manager
+                .attach_refresh_control(
+                    "S",
+                    &ownership,
+                    &handle,
+                    manager.initial_inventory_limits(),
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("attach-error.sqlite3")),
+        ));
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        let ownership = insert_runtime_build(&manager, Arc::clone(&control));
+        manager.runtime.lock().unwrap().get_mut("S").unwrap().build = None;
+        let handle = InventoryHandle {
+            stream: Box::new(VecInventoryStream {
+                events: VecDeque::new(),
+            }),
+            control: Arc::clone(&control),
+        };
+        let error = manager
+            .attach_refresh_control("S", &ownership, &handle, manager.initial_inventory_limits())
+            .unwrap_err();
+        assert_eq!(error.to_string(), "index build disappeared before start");
+        assert!(manager.coordination.build_owners.lock().unwrap().is_empty());
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn start_generation_stops_when_a_cancelled_control_loses_its_build() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(LifecycleClient::new(
+                vec![],
+                vec![Ok(default_capabilities())],
+            )),
+            settings(directory.path().join("generation-cancel.sqlite3")),
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.cancel();
+        let control: Arc<dyn InventoryControl> = control;
+        let ownership = insert_runtime_build(&manager, Arc::clone(&control));
+        manager.runtime.lock().unwrap().get_mut("S").unwrap().build = None;
+        let generation = manager
+            .with_database(|db| {
+                db.start_generation(
+                    "S",
+                    NamespaceOrganization::Hierarchical,
+                    BrowseSource::Da2,
+                    "1",
+                )
+            })
+            .unwrap();
+        let handle = InventoryHandle {
+            stream: Box::new(VecInventoryStream {
+                events: VecDeque::new(),
+            }),
+            control: Arc::clone(&control),
+        };
+
+        assert!(
+            manager
+                .launch_refresh_build("S", generation, handle, ownership, false)
+                .is_ok()
+        );
+        assert!(
+            manager
+                .with_database(|db| db.status_rows("S"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(manager.coordination.build_owners.lock().unwrap().is_empty());
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("generation-mismatch.sqlite3")),
+        ));
+        let wrong_control: Arc<dyn InventoryControl> =
+            Arc::new(RecordingInventoryControl::default());
+        let ownership = insert_runtime_build(&manager, Arc::clone(&wrong_control));
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.cancel();
+        let control: Arc<dyn InventoryControl> = control;
+        manager
+            .runtime
+            .lock()
+            .unwrap()
+            .get_mut("S")
+            .unwrap()
+            .build
+            .as_mut()
+            .unwrap()
+            .control = Some(Arc::clone(&wrong_control));
+        let generation = manager
+            .with_database(|db| {
+                db.start_generation(
+                    "S",
+                    NamespaceOrganization::Hierarchical,
+                    BrowseSource::Da2,
+                    "1",
+                )
+            })
+            .unwrap();
+        let handle = InventoryHandle {
+            stream: Box::new(VecInventoryStream {
+                events: VecDeque::new(),
+            }),
+            control: Arc::clone(&control),
+        };
+        assert!(
+            manager
+                .launch_refresh_build("S", generation, handle, ownership, false)
+                .is_ok()
+        );
+        assert!(
+            manager
+                .with_database(|db| db.status_rows("S"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn control_action_helpers_reconcile_resume_and_queue_cancel() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("control-actions.sqlite3")),
+        ));
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, Arc::clone(&control));
+        {
+            let mut runtime = manager.runtime.lock().unwrap();
+            let build = runtime
+                .get_mut("S")
+                .and_then(|state| state.build.as_mut())
+                .unwrap();
+            build.operator_paused = true;
+            build.foreground_users = 0;
+            build.quiet_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+
+        manager
+            .apply_control_action("S", IndexControlAction::Resume)
+            .unwrap();
+        {
+            let runtime = manager.runtime.lock().unwrap();
+            let build = runtime
+                .get("S")
+                .and_then(|state| state.build.as_ref())
+                .unwrap();
+            assert!(!build.operator_paused);
+            assert!(build.quiet_until.is_none());
+        }
+
+        manager
+            .runtime
+            .lock()
+            .unwrap()
+            .get_mut("S")
+            .unwrap()
+            .build
+            .as_mut()
+            .unwrap()
+            .control = None;
+        manager
+            .apply_control_action("S", IndexControlAction::Cancel)
+            .unwrap();
+        assert!(manager.pending_cancels.lock().unwrap().contains("S"));
+    }
+
     #[tokio::test]
     async fn health_and_recovery_cancellation_edges_are_bounded() {
         let directory = tempdir().unwrap();
@@ -12318,6 +12589,7 @@ mod tests {
         paused: AtomicBool,
         cancelled: AtomicBool,
         cancel_on_pause: AtomicBool,
+        cancel_on_pacing: AtomicBool,
         pause_count: AtomicUsize,
         resume_count: AtomicUsize,
         pacing_calls: AtomicUsize,
@@ -12348,6 +12620,9 @@ mod tests {
 
         fn set_pacing(&self, _pacing: InventoryPacing) -> anyhow::Result<()> {
             let call = self.pacing_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if self.cancel_on_pacing.load(Ordering::Acquire) {
+                self.cancelled.store(true, Ordering::Release);
+            }
             let failure_call = self.fail_pacing_on_call.load(Ordering::Acquire);
             if call == failure_call {
                 anyhow::bail!("test pacing update failure");
@@ -12359,6 +12634,10 @@ mod tests {
     impl RecordingInventoryControl {
         fn cancel_on_pause(&self) {
             self.cancel_on_pause.store(true, Ordering::Release);
+        }
+
+        fn cancel_on_pacing(&self) {
+            self.cancel_on_pacing.store(true, Ordering::Release);
         }
 
         fn fail_pacing_on_call(&self, call: usize) {
