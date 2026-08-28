@@ -114,7 +114,8 @@ distinguishes a configured sentinel from its probe result, so an unprobed sentin
 as absent.
 
 Diagnostic gateway builds used for isolated native-inventory investigations may pin a specific
-`bytehound-opc-da-client` commit from the companion `opc-cli` repository. Such builds are for
+`bytehound-opc-da-client` commit from the companion `opc-cli` repository; the manifest and
+lockfile record the exact source revision used by each diagnostic artifact. Such builds are for
 sidecar diagnosis only and are not release artifacts; production gateways continue to use the
 published client crate. The gateway forwards both adaptive pacing controls to the native client:
 the optional item rate remains optional, matching the native client's pacing contract. Diagnostic
