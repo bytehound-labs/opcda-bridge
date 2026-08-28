@@ -2124,6 +2124,58 @@ async fn retry_cleanup_after_failure(
     retry
 }
 
+enum CleanupAttempt {
+    Retry,
+    Return,
+    Finished,
+}
+
+async fn run_cleanup_attempt(
+    path: &Path,
+    server: &str,
+    background_tasks: &Arc<BackgroundTasks>,
+    cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    coordination: &Arc<DatabaseCoordination>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    consecutive_failures: &mut u32,
+) -> CleanupAttempt {
+    match run_cleanup_worker(path, server, background_tasks, coordination).await {
+        Ok(stats) if stats.deferred_for_build => {
+            if wait_for_deferred_cleanup(
+                path,
+                server,
+                background_tasks,
+                coordination,
+                cleanup_tasks,
+                shutdown,
+            )
+            .await
+            {
+                CleanupAttempt::Retry
+            } else {
+                CleanupAttempt::Return
+            }
+        }
+        Ok(_) => CleanupAttempt::Finished,
+        Err(error) => {
+            if retry_cleanup_after_failure(
+                path,
+                server,
+                background_tasks,
+                cleanup_tasks,
+                consecutive_failures,
+                &error,
+            )
+            .await
+            {
+                CleanupAttempt::Retry
+            } else {
+                CleanupAttempt::Finished
+            }
+        }
+    }
+}
+
 async fn run_scheduled_cleanup(
     path: PathBuf,
     server: String,
@@ -2146,37 +2198,20 @@ async fn run_scheduled_cleanup(
             return;
         }
 
-        match run_cleanup_worker(&path, &server, &background_tasks, &coordination).await {
-            Ok(stats) if stats.deferred_for_build => {
-                if !wait_for_deferred_cleanup(
-                    &path,
-                    &server,
-                    &background_tasks,
-                    &coordination,
-                    &cleanup_tasks,
-                    &mut shutdown,
-                )
-                .await
-                {
-                    return;
-                }
-                continue;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                if retry_cleanup_after_failure(
-                    &path,
-                    &server,
-                    &background_tasks,
-                    &cleanup_tasks,
-                    &mut consecutive_failures,
-                    &error,
-                )
-                .await
-                {
-                    continue;
-                }
-            }
+        match run_cleanup_attempt(
+            &path,
+            &server,
+            &background_tasks,
+            &cleanup_tasks,
+            &coordination,
+            &mut shutdown,
+            &mut consecutive_failures,
+        )
+        .await
+        {
+            CleanupAttempt::Retry => continue,
+            CleanupAttempt::Return => return,
+            CleanupAttempt::Finished => {}
         }
 
         if !clear_finished_cleanup_task(&server, background_tasks.as_ref(), cleanup_tasks.as_ref())
