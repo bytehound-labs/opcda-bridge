@@ -229,8 +229,11 @@ config file — see [Configuration](#configuration) below.
   If the file and its parent cannot be canonicalized, the original path spelling is retained.
   Independent in-memory databases are not shared through the registry and do not create filesystem
   build-lock sidecars.
-  Indexed queries use a dedicated read-only SQLite connection and a bounded in-memory ranking
-  pass for full-text candidates, keeping broad searches out of the foreground database mutex.
+  Indexed queries use a dedicated read-only SQLite connection and bounded candidate sets, keeping
+  broad searches out of the foreground database mutex. Exact searches use separate equality
+  lookups on the normalized display-name and ItemID indexes, each bounded to `limit + 1` rows,
+  then merge and deduplicate those candidates before ranking; prefix and contains searches retain
+  their existing indexed/FTS paths.
   During promotion, searches reuse the active generation reported by promotion-safe status rather
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
