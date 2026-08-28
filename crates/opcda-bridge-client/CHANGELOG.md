@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-client-v0.4.7...opcda-bridge-client-v0.4.8) - 2026-08-27
+
+### Other
+
+- _(client)_ harden mutation coverage ([#93](https://github.com/bytehound-labs/opcda-bridge/pull/93))
+
 ## [0.4.7](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-client-v0.4.6...opcda-bridge-client-v0.4.7) - 2026-08-27
 
 ### Other

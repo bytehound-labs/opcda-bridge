@@ -513,9 +513,18 @@ in-flight requests before it reports `Stopped`.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding standards, and how to get set up.
+All changes, including documentation-only fixes, use a short-lived feature branch and focused
+pull request. Start from synchronized `main`, keep one logical change group per PR, run the
+applicable checks, and repair the same branch until every required status is green. Pull requests
+are squash-merged only after the applicable SonarQube analysis reports zero `OPEN`/`CONFIRMED`
+issues; intentional Accepted or False Positive findings need a durable rationale and related
+link. After merging, wait for the `main` workflows and SonarQube analysis before starting
+dependent work. See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete workflow and coding
+standards.
+
 CI is change-aware: documentation-only changes do not rebuild the workspace, while required status
-checks still complete for branch protection.
+checks still complete for branch protection. Release-plz compatibility lockfile updates are
+proposed as checked `release-plz-*` pull requests rather than pushed directly to `main`.
 
 CI validates Rust code and package metadata, checks Protobuf compatibility against `main` with Buf,
 runs CodeQL and Semgrep analysis, scans complete Git history with the open-source Gitleaks CLI,

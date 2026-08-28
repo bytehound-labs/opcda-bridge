@@ -16,6 +16,20 @@ opcda-bridge is under active development. The practices below apply to all contr
   feature flag rather than sitting unmerged on a branch.
 - Every change, including documentation-only fixes, goes through a feature branch and pull
   request so the repository's checks run before it reaches `main`.
+- After opening a pull request, keep repairing the same branch until every applicable required
+  check and SonarQube status passes. If a check reports that the branch is behind `main`, update
+  the branch before merging; do not bypass the protection rule with a direct push.
+
+The standard change protocol is: synchronize a clean local `main`, create a named feature/fix/docs
+branch, keep one logical change group per pull request, run targeted and applicable full
+validation, commit with Conventional Commits, push and open the focused pull request, repair
+failures on that branch until all required checks are green, and squash-merge only then. Applicable
+PR SonarQube analyses must report zero `OPEN`/`CONFIRMED` issues; an intentional Accepted or False
+Positive finding needs a durable rationale and a related pull request or documentation link. After
+the merge, wait for the resulting `main` workflows and SonarQube analysis and verify the intended
+findings disappeared without introducing new ones before starting dependent work. Direct pushes to
+`main`, `NOSONAR`, broad exclusions, weakened quality profiles, and dashboard-only suppression of
+real findings are not permitted.
 
 ## Commit messages
 
@@ -37,9 +51,11 @@ Example: `feat(gateway): add tag subscription support`.
   coverage input locally with `cargo llvm-cov --workspace --locked --lcov --output-path lcov.info`,
   then run `sonar-scanner` with `SONAR_TOKEN` exported. The workflow runs for relevant pull
   requests and pushes to `main`, plus a Wednesday 04:47 UTC weekly scan; fork pull requests
-  intentionally skip the secret-bearing analysis. A post-upload scan failure also prints the
-  Compute Engine response and the projects visible to the analysis token in the workflow log,
-  which helps distinguish project identity errors from server-side processing failures.
+  intentionally skip the secret-bearing analysis. Applicable pull requests also require zero
+  `OPEN`/`CONFIRMED` issues; Accepted and False Positive findings require a durable rationale and
+  related link. A post-upload scan failure also prints the Compute Engine response and the projects
+  visible to the analysis token in the workflow log, which helps distinguish project identity
+  errors from server-side processing failures.
 
 ## Testing
 
@@ -50,12 +66,12 @@ Example: `feat(gateway): add tag subscription support`.
   on any OS: tests exercise a hand-written `MockOpcClient` instead of a live COM connection.
 - Hardware-in-the-loop tests (against a real Windows host + OPC DA server) aren't part of CI;
   note manual verification steps in the PR description when a change needs them.
-
 - Cross-version protocol checks run from the isolated `compatibility-tests/` workspace:
   `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`.
   The workflow regenerates that workspace's lockfile when package manifests change because path
-  dependencies carry the branch's package versions, and release automation commits the matching
-  lockfile after a package release.
+  dependencies carry the branch's package versions. After a package release, release automation
+  proposes the matching lockfile as a separate `release-plz-*` pull request, where it runs the
+  normal checks before auto-merge.
 
 ## CI
 
@@ -94,7 +110,9 @@ enforces those requirements.
 
 - Keep PRs small and focused — one logical change each.
 - Describe what changed and why; link an issue if one exists.
-- Squash-merge once CI is green.
+- Include the targeted validation performed and any manual verification needed for the change.
+- Squash-merge only after every applicable required check and the PR SonarQube zero-issue check
+  pass. Do not use `NOSONAR` or a dashboard status change to hide a real unresolved code issue.
 
 ## Releases
 
@@ -112,6 +130,9 @@ dependency order. `changelog_include` entries cascade a reusable library or prot
 the dependent packages that must be rebuilt, without restoring workspace-wide lockstep versions.
 The generated release metadata must pass the package-aware `release-integrity` check, while the
 release commit filter and crates.io rate limit provide additional safeguards.
+The release workflow proposes a separate `release-plz-*` pull request for any generated
+compatibility-test lockfile update; that change follows the normal checks and auto-merge path
+instead of being pushed directly to `main`.
 
 Every publishable package version must fall within exactly one catalog release line. Client and
 gateway binary Releases include `COMPATIBILITY.md` and `compatibility.json` so operators can inspect

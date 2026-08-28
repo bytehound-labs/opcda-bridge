@@ -107,8 +107,20 @@ target for early gateway development.
   merges, no `develop`/release branches, releases tagged directly off `main`. Contrast with the
   author's FalconTune/AccuTune repos, which use a `dev`-branch + `--no-ff` merge model — do not
   carry that convention over here.
-- **Agent workflow**: Always work on a feature branch, open a pull request, and merge only after
-  all required CI/CD checks pass. Never commit directly to `main`.
+- **Standard change protocol**: Start from a clean checkout with local `main` synchronized to
+  `origin/main`, then create a short-lived `<type>/<short-description>` branch. Keep each pull
+  request to one logical change group, run the smallest targeted checks followed by every
+  applicable repository gate, and update the relevant user-facing documentation in the same
+  change. Commit with Conventional Commits, push the branch, and open a focused pull request.
+  Monitor every required CI/CD and SonarQube status; repair failures on the same branch and
+  repeat until all checks pass. If branch protection reports the branch behind `main`, update it
+  before merging. A merge is allowed only when the applicable PR Sonar analysis reports zero
+  `OPEN`/`CONFIRMED` issues; intentional Accepted or False Positive findings must have a durable
+  rationale and related PR or documentation link. Squash-merge only after the complete green
+  result, wait for the resulting `main` workflows and Sonar analysis, and verify the intended
+  findings disappeared without introducing new ones before starting dependent work. Never commit
+  or push directly to `main`, bypass branch protection, use `NOSONAR`, or silence a real finding
+  merely to clean a dashboard.
 - **Commits**: [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`,
   `chore:`, etc.).
 - **Formatting/linting**: `cargo fmt` (default settings) and
@@ -152,9 +164,11 @@ and historical gateway services backed by mock `OpcClient` implementations. An e
 does not need prior CI evidence when its negotiated protocol ranges overlap, but the CLI reports
 such pairings as `unverified`. Release-plz pull requests regenerate the isolated test workspace's
 lockfile before running the same locked test command when package manifests change, because path
-package versions change in the release branch. The release workflow commits the matching lockfile
-after a release commit so the main branch remains runnable with `--locked`. Historical clients
-must keep an exact direct dependency on the protocol crate version they originally shipped with;
+package versions change in the release branch. After a release commit, the release workflow
+proposes the matching compatibility-test lockfile as a separate `release-plz-*` pull request;
+the existing release-PR auto-merge workflow merges it only after the normal required checks pass,
+so generated repository changes never bypass the PR path. Historical clients must keep an exact
+direct dependency on the protocol crate version they originally shipped with;
 otherwise Cargo can resolve their semver range to a newer generated Rust enum whose added variants
 break compilation before the compatibility test can exercise the wire boundary.
 

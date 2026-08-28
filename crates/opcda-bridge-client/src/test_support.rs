@@ -19,6 +19,7 @@ use tonic::{Request, Response, Status};
 pub(crate) struct MockBridgeService {
     pub(crate) gateway_info_response: GetGatewayInfoResponse,
     pub(crate) capabilities_response: GetCapabilitiesResponse,
+    pub(crate) capabilities_requests: Arc<Mutex<Vec<GetCapabilitiesRequest>>>,
     pub(crate) list_servers_response: ListServersResponse,
     pub(crate) browse_responses: Vec<BrowsePage>,
     pub(crate) browse_requests: Arc<Mutex<Vec<BrowseRequest>>>,
@@ -35,7 +36,9 @@ pub(crate) struct MockBridgeService {
     pub(crate) search_index_response: SearchIndexResponse,
     pub(crate) search_index_requests: Arc<Mutex<Vec<SearchIndexRequest>>>,
     pub(crate) read_response: ReadResponse,
+    pub(crate) read_requests: Arc<Mutex<Vec<ReadRequest>>>,
     pub(crate) write_response: WriteResponse,
+    pub(crate) write_requests: Arc<Mutex<Vec<WriteRequest>>>,
     pub(crate) server_shutdown: Arc<Notify>,
     pub(crate) server_stopped: Arc<Notify>,
 }
@@ -45,6 +48,7 @@ impl Default for MockBridgeService {
         Self {
             gateway_info_response: GetGatewayInfoResponse::default(),
             capabilities_response: GetCapabilitiesResponse::default(),
+            capabilities_requests: Arc::default(),
             list_servers_response: ListServersResponse::default(),
             browse_responses: vec![BrowsePage {
                 complete: true,
@@ -67,7 +71,9 @@ impl Default for MockBridgeService {
             },
             search_index_requests: Arc::default(),
             read_response: ReadResponse::default(),
+            read_requests: Arc::default(),
             write_response: WriteResponse::default(),
+            write_requests: Arc::default(),
             server_shutdown: Arc::default(),
             server_stopped: Arc::default(),
         }
@@ -85,8 +91,12 @@ impl Bridge for MockBridgeService {
 
     async fn get_capabilities(
         &self,
-        _request: Request<GetCapabilitiesRequest>,
+        request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
+        self.capabilities_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
         Ok(Response::new(self.capabilities_response.clone()))
     }
 
@@ -99,8 +109,10 @@ impl Bridge for MockBridgeService {
             .unwrap()
             .push(request.into_inner());
         let index = self.browse_calls.fetch_add(1, Ordering::Relaxed);
-        let last = self.browse_responses.len().saturating_sub(1);
-        let page = self.browse_responses[index.min(last)].clone();
+        let page =
+            self.browse_responses.get(index).cloned().ok_or_else(|| {
+                Status::resource_exhausted("mock browse response sequence exhausted")
+            })?;
         Ok(Response::new(page))
     }
 
@@ -186,14 +198,22 @@ impl Bridge for MockBridgeService {
         Ok(Response::new(self.search_index_response.clone()))
     }
 
-    async fn read(&self, _request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
+    async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
+        self.read_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
         Ok(Response::new(self.read_response.clone()))
     }
 
     async fn write(
         &self,
-        _request: Request<WriteRequest>,
+        request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
+        self.write_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
         Ok(Response::new(self.write_response.clone()))
     }
 }
