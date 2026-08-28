@@ -50,7 +50,9 @@ a working opcda-bridge, not a redesign of it.
 - **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
   limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
   OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
-  start a replacement build.
+  start a replacement build. Persisted retry deadlines take precedence over the normal refresh
+  cadence after a restart, so a failed server is not retried immediately just because the
+  gateway restarted.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
@@ -75,7 +77,9 @@ a working opcda-bridge, not a redesign of it.
   active builds before and after acquiring the gate, yields it between bounded batches, and keeps
   deferred requests pending until the final active build has completed, including when the request
   and build belong to different manager instances sharing that file. Deferred workers must observe
-  shutdown even if it races with notification subscription. Build finalization must release
+  shutdown even if it races with notification subscription; cleanup must stop before opening a
+  new write batch after shutdown and treat a batch with no remaining obsolete rows as no progress.
+  Build finalization must release
   ownership before publishing build capacity and resume pending cleanup on every terminal path,
   including startup failure, cancellation, spawn rejection, shutdown, and unexpected unwinding.
   Coordination keys and persistent build-lock paths must use the canonical identity of an existing

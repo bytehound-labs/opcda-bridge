@@ -1722,6 +1722,19 @@ struct CleanupStats {
     deferred_for_build: bool,
 }
 
+struct CleanupBatch {
+    entries: u64,
+    fts_entries: u64,
+    generations: u64,
+}
+
+enum CleanupBatchResult {
+    Shutdown,
+    Deferred,
+    NoObsoleteGenerations,
+    Deleted(CleanupBatch),
+}
+
 #[cfg(test)]
 fn cleanup_obsolete_generations(
     path: &Path,
@@ -1768,6 +1781,128 @@ fn cleanup_checkpoint(
     result
 }
 
+fn cleanup_build_is_active(active_builds: &Mutex<HashSet<String>>) -> bool {
+    active_builds
+        .lock()
+        .map(|builds| !builds.is_empty())
+        .unwrap_or(true)
+}
+
+fn delete_cleanup_batch(
+    transaction: &rusqlite::Transaction<'_>,
+    server: &str,
+) -> rusqlite::Result<CleanupBatch> {
+    let fts_entries = transaction.execute(
+        "DELETE FROM entries_fts
+         WHERE rowid IN (
+             SELECT f.rowid
+             FROM entries_fts f
+             INNER JOIN generations g
+               ON g.server = f.server AND g.generation = f.generation
+             WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
+             LIMIT ?2
+         )",
+        params![server, CLEANUP_BATCH_SIZE as i64],
+    )?;
+    let entries = transaction.execute(
+        "DELETE FROM entries
+         WHERE rowid IN (
+             SELECT e.rowid
+             FROM entries e
+             INNER JOIN generations g
+               ON g.server = e.server AND g.generation = e.generation
+             WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
+             LIMIT ?2
+         )",
+        params![server, CLEANUP_BATCH_SIZE as i64],
+    )?;
+    let generations = transaction.execute(
+        "DELETE FROM generations
+         WHERE rowid IN (
+             SELECT g.rowid
+             FROM generations g
+             WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
+               AND NOT EXISTS (
+                   SELECT 1 FROM entries e
+                   WHERE e.server = g.server AND e.generation = g.generation
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM entries_fts f
+                   WHERE f.server = g.server AND f.generation = g.generation
+               )
+             LIMIT ?2
+         )",
+        params![server, CLEANUP_BATCH_SIZE as i64],
+    )?;
+    Ok(CleanupBatch {
+        entries: entries as u64,
+        fts_entries: fts_entries as u64,
+        generations: generations as u64,
+    })
+}
+
+fn cleanup_one_batch(
+    read_only: &IndexDb,
+    connection: &mut Option<Connection>,
+    path: &Path,
+    server: &str,
+    background_tasks: &BackgroundTasks,
+    writer_gate: &Mutex<()>,
+    active_builds: &Mutex<HashSet<String>>,
+) -> anyhow::Result<CleanupBatchResult> {
+    if background_tasks.is_shutting_down() {
+        return Ok(CleanupBatchResult::Shutdown);
+    }
+    if cleanup_build_is_active(active_builds) {
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %path.display(),
+            server,
+            "deferring namespace index cleanup while an index build is active"
+        );
+        return Ok(CleanupBatchResult::Deferred);
+    }
+    if !read_only.has_obsolete_generations(server)? {
+        return Ok(CleanupBatchResult::NoObsoleteGenerations);
+    }
+    #[cfg(test)]
+    background_tasks.wait_for_cleanup_writer_gate_hook();
+    let writer_guard = writer_gate
+        .lock()
+        .map_err(|_| anyhow::anyhow!("index writer gate poisoned"))?;
+    if cleanup_build_is_active(active_builds) {
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %path.display(),
+            server,
+            "deferring namespace index cleanup after waiting for the writer gate"
+        );
+        drop(writer_guard);
+        return Ok(CleanupBatchResult::Deferred);
+    }
+    if !read_only.has_obsolete_generations(server)? {
+        drop(writer_guard);
+        return Ok(CleanupBatchResult::NoObsoleteGenerations);
+    }
+    #[cfg(test)]
+    background_tasks.wait_for_cleanup_batch_hook();
+    if connection.is_none() {
+        let opened = Connection::open(path)?;
+        opened.pragma_update(None, "foreign_keys", true)?;
+        opened.pragma_update(None, "journal_mode", "WAL")?;
+        opened.busy_timeout(Duration::from_secs(5))?;
+        *connection = Some(opened);
+    }
+    let transaction = connection
+        .as_mut()
+        .expect("cleanup connection initialized")
+        .transaction()?;
+    let batch = delete_cleanup_batch(&transaction, server)?;
+    transaction.commit()?;
+    drop(writer_guard);
+    Ok(CleanupBatchResult::Deleted(batch))
+}
+
 fn cleanup_obsolete_generations_coordinated(
     path: &Path,
     server: &str,
@@ -1789,115 +1924,35 @@ fn cleanup_obsolete_generations_coordinated(
     let mut connection = None;
     let mut stats = CleanupStats::default();
     loop {
-        if background_tasks.is_shutting_down() {
-            stats.stopped_for_shutdown = true;
-            break;
+        match cleanup_one_batch(
+            &read_only,
+            &mut connection,
+            path,
+            server,
+            background_tasks,
+            writer_gate.as_ref(),
+            active_builds.as_ref(),
+        )? {
+            CleanupBatchResult::Shutdown => {
+                stats.stopped_for_shutdown = true;
+                break;
+            }
+            CleanupBatchResult::Deferred => {
+                stats.deferred_for_build = true;
+                break;
+            }
+            CleanupBatchResult::NoObsoleteGenerations => break,
+            CleanupBatchResult::Deleted(batch) => {
+                stats.batches = stats.batches.saturating_add(1);
+                stats.fts_entries = stats.fts_entries.saturating_add(batch.fts_entries);
+                stats.entries = stats.entries.saturating_add(batch.entries);
+                stats.generations = stats.generations.saturating_add(batch.generations);
+                if batch.fts_entries == 0 && batch.entries == 0 && batch.generations == 0 {
+                    break;
+                }
+                std::thread::sleep(CLEANUP_BATCH_PAUSE);
+            }
         }
-        let build_active = || {
-            active_builds
-                .lock()
-                .map(|builds| !builds.is_empty())
-                .unwrap_or(true)
-        };
-        if build_active() {
-            stats.deferred_for_build = true;
-            tracing::info!(
-                process_id = std::process::id(),
-                database = %path.display(),
-                server,
-                "deferring namespace index cleanup while an index build is active"
-            );
-            break;
-        }
-        if !read_only.has_obsolete_generations(server)? {
-            break;
-        }
-        #[cfg(test)]
-        background_tasks.wait_for_cleanup_writer_gate_hook();
-        let writer_guard = writer_gate
-            .lock()
-            .map_err(|_| anyhow::anyhow!("index writer gate poisoned"))?;
-        if build_active() {
-            stats.deferred_for_build = true;
-            tracing::info!(
-                process_id = std::process::id(),
-                database = %path.display(),
-                server,
-                "deferring namespace index cleanup after waiting for the writer gate"
-            );
-            drop(writer_guard);
-            break;
-        }
-        if !read_only.has_obsolete_generations(server)? {
-            drop(writer_guard);
-            break;
-        }
-        #[cfg(test)]
-        background_tasks.wait_for_cleanup_batch_hook();
-        if connection.is_none() {
-            let opened = Connection::open(path)?;
-            opened.pragma_update(None, "foreign_keys", true)?;
-            opened.pragma_update(None, "journal_mode", "WAL")?;
-            opened.busy_timeout(Duration::from_secs(5))?;
-            connection = Some(opened);
-        }
-        let transaction = connection
-            .as_mut()
-            .expect("cleanup connection initialized")
-            .transaction()?;
-        let fts_entries = transaction.execute(
-            "DELETE FROM entries_fts
-             WHERE rowid IN (
-                 SELECT f.rowid
-                 FROM entries_fts f
-                 INNER JOIN generations g
-                   ON g.server = f.server AND g.generation = f.generation
-                 WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
-                 LIMIT ?2
-             )",
-            params![server, CLEANUP_BATCH_SIZE as i64],
-        )?;
-        let entries = transaction.execute(
-            "DELETE FROM entries
-             WHERE rowid IN (
-                 SELECT e.rowid
-                 FROM entries e
-                 INNER JOIN generations g
-                   ON g.server = e.server AND g.generation = e.generation
-                 WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
-                 LIMIT ?2
-             )",
-            params![server, CLEANUP_BATCH_SIZE as i64],
-        )?;
-        let generations = transaction.execute(
-            "DELETE FROM generations
-             WHERE rowid IN (
-                 SELECT g.rowid
-                 FROM generations g
-                 WHERE g.server = ?1 AND g.state IN ('superseded', 'failed')
-                   AND NOT EXISTS (
-                       SELECT 1 FROM entries e
-                       WHERE e.server = g.server AND e.generation = g.generation
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1 FROM entries_fts f
-                       WHERE f.server = g.server AND f.generation = g.generation
-                   )
-                 LIMIT ?2
-             )",
-            params![server, CLEANUP_BATCH_SIZE as i64],
-        )?;
-        transaction.commit()?;
-
-        stats.batches = stats.batches.saturating_add(1);
-        stats.fts_entries = stats.fts_entries.saturating_add(fts_entries as u64);
-        stats.entries = stats.entries.saturating_add(entries as u64);
-        stats.generations = stats.generations.saturating_add(generations as u64);
-        drop(writer_guard);
-        if fts_entries == 0 && entries == 0 && generations == 0 {
-            break;
-        }
-        std::thread::sleep(CLEANUP_BATCH_PAUSE);
     }
     let checkpoint = connection.as_ref().map(|connection| {
         cleanup_checkpoint(
@@ -1925,6 +1980,150 @@ fn cleanup_obsolete_generations_coordinated(
     Ok(stats)
 }
 
+fn cleanup_task_should_run(
+    server: &str,
+    background_tasks: &BackgroundTasks,
+    cleanup_tasks: &Mutex<HashMap<String, CleanupTaskState>>,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    cleanup_tasks
+        .lock()
+        .map(|mut tasks| {
+            let task = tasks.entry(server.to_string()).or_default();
+            task.requested = false;
+            !background_tasks.is_shutting_down() && !*shutdown.borrow()
+        })
+        .unwrap_or(false)
+}
+
+fn clear_finished_cleanup_task(
+    server: &str,
+    background_tasks: &BackgroundTasks,
+    cleanup_tasks: &Mutex<HashMap<String, CleanupTaskState>>,
+) -> bool {
+    cleanup_tasks
+        .lock()
+        .map(|mut tasks| {
+            let rerun = tasks
+                .get(server)
+                .is_some_and(|task| task.requested && !background_tasks.is_shutting_down());
+            if !rerun {
+                tasks.remove(server);
+            }
+            rerun
+        })
+        .unwrap_or(false)
+}
+
+async fn run_cleanup_worker(
+    path: &Path,
+    server: &str,
+    background_tasks: &Arc<BackgroundTasks>,
+    coordination: &Arc<DatabaseCoordination>,
+) -> anyhow::Result<CleanupStats> {
+    let cleanup_path = path.to_path_buf();
+    let cleanup_server = server.to_owned();
+    let background_tasks_for_blocking = Arc::clone(background_tasks);
+    let coordination_for_blocking = Arc::clone(coordination);
+    match tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if background_tasks_for_blocking
+            .panic_next_cleanup_worker
+            .swap(false, Ordering::AcqRel)
+        {
+            panic!("injected namespace index cleanup worker panic");
+        }
+        cleanup_obsolete_generations_coordinated(
+            &cleanup_path,
+            &cleanup_server,
+            background_tasks_for_blocking.as_ref(),
+            Arc::clone(&coordination_for_blocking.writer_gate),
+            Arc::clone(&coordination_for_blocking.active_builds),
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!(
+            "namespace index cleanup worker failed: {error}"
+        )),
+    }
+}
+
+async fn wait_for_deferred_cleanup(
+    path: &Path,
+    server: &str,
+    _background_tasks: &Arc<BackgroundTasks>,
+    coordination: &Arc<DatabaseCoordination>,
+    cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if let Ok(mut tasks) = cleanup_tasks.lock()
+        && let Some(task) = tasks.get_mut(server)
+    {
+        task.requested = true;
+    }
+    tracing::debug!(
+        process_id = std::process::id(),
+        database = %path.display(),
+        server,
+        "namespace index cleanup remains pending until builds terminate"
+    );
+    let notified = coordination.build_changed.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let build_active = coordination
+        .active_builds
+        .lock()
+        .map(|builds| !builds.is_empty())
+        .unwrap_or(true);
+    if !build_active {
+        return true;
+    }
+    #[cfg(test)]
+    _background_tasks.wait_for_cleanup_notification_hook().await;
+    if *shutdown.borrow() {
+        return false;
+    }
+    tokio::select! {
+        _ = &mut notified => true,
+        _ = shutdown.changed() => false,
+    }
+}
+
+async fn retry_cleanup_after_failure(
+    path: &Path,
+    server: &str,
+    background_tasks: &Arc<BackgroundTasks>,
+    _cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    consecutive_failures: &mut u32,
+    error: &anyhow::Error,
+) -> bool {
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    #[cfg(test)]
+    if let Ok(mut tasks) = _cleanup_tasks.lock()
+        && let Some(task) = tasks.get_mut(server)
+    {
+        task.failures = task.failures.saturating_add(1);
+    }
+    let retry =
+        *consecutive_failures <= CLEANUP_RETRY_LIMIT && !background_tasks.is_shutting_down();
+    tracing::warn!(
+        process_id = std::process::id(),
+        database = %path.display(),
+        server,
+        error = %error,
+        attempt = *consecutive_failures,
+        retry,
+        "namespace index obsolete-generation cleanup failed"
+    );
+    if retry {
+        let multiplier = 2_u32.pow(consecutive_failures.saturating_sub(1));
+        tokio::time::sleep(CLEANUP_RETRY_INITIAL_BACKOFF.saturating_mul(multiplier)).await;
+    }
+    retry
+}
+
 async fn run_scheduled_cleanup(
     path: PathBuf,
     server: String,
@@ -1935,125 +2134,53 @@ async fn run_scheduled_cleanup(
     let mut shutdown = background_tasks.subscribe();
     let mut consecutive_failures = 0_u32;
     loop {
-        let should_run = cleanup_tasks
-            .lock()
-            .map(|mut tasks| {
-                let task = tasks.entry(server.clone()).or_default();
-                task.requested = false;
-                !background_tasks.is_shutting_down() && !*shutdown.borrow()
-            })
-            .unwrap_or(false);
-        if !should_run {
+        if !cleanup_task_should_run(
+            &server,
+            background_tasks.as_ref(),
+            cleanup_tasks.as_ref(),
+            &shutdown,
+        ) {
             if let Ok(mut tasks) = cleanup_tasks.lock() {
                 tasks.remove(&server);
             }
             return;
         }
 
-        let cleanup_path = path.clone();
-        let cleanup_server = server.clone();
-        let background_tasks_for_blocking = Arc::clone(&background_tasks);
-        let coordination_for_blocking = Arc::clone(&coordination);
-        let result = match tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            if background_tasks_for_blocking
-                .panic_next_cleanup_worker
-                .swap(false, Ordering::AcqRel)
-            {
-                panic!("injected namespace index cleanup worker panic");
-            }
-            cleanup_obsolete_generations_coordinated(
-                &cleanup_path,
-                &cleanup_server,
-                background_tasks_for_blocking.as_ref(),
-                Arc::clone(&coordination_for_blocking.writer_gate),
-                Arc::clone(&coordination_for_blocking.active_builds),
-            )
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => Err(anyhow::anyhow!(
-                "namespace index cleanup worker failed: {error}"
-            )),
-        };
-        match result {
+        match run_cleanup_worker(&path, &server, &background_tasks, &coordination).await {
             Ok(stats) if stats.deferred_for_build => {
-                if let Ok(mut tasks) = cleanup_tasks.lock()
-                    && let Some(task) = tasks.get_mut(&server)
+                if !wait_for_deferred_cleanup(
+                    &path,
+                    &server,
+                    &background_tasks,
+                    &coordination,
+                    &cleanup_tasks,
+                    &mut shutdown,
+                )
+                .await
                 {
-                    task.requested = true;
-                }
-                tracing::debug!(
-                    process_id = std::process::id(),
-                    database = %path.display(),
-                    server,
-                    "namespace index cleanup remains pending until builds terminate"
-                );
-                let notified = coordination.build_changed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                let build_active = coordination
-                    .active_builds
-                    .lock()
-                    .map(|builds| !builds.is_empty())
-                    .unwrap_or(true);
-                if !build_active {
-                    continue;
-                }
-                #[cfg(test)]
-                background_tasks.wait_for_cleanup_notification_hook().await;
-                if *shutdown.borrow() {
                     return;
-                }
-                tokio::select! {
-                    _ = &mut notified => {}
-                    _ = shutdown.changed() => return,
                 }
                 continue;
             }
             Ok(_) => {}
             Err(error) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                #[cfg(test)]
-                if let Ok(mut tasks) = cleanup_tasks.lock()
-                    && let Some(task) = tasks.get_mut(&server)
+                if retry_cleanup_after_failure(
+                    &path,
+                    &server,
+                    &background_tasks,
+                    &cleanup_tasks,
+                    &mut consecutive_failures,
+                    &error,
+                )
+                .await
                 {
-                    task.failures = task.failures.saturating_add(1);
-                }
-                let retry = consecutive_failures <= CLEANUP_RETRY_LIMIT
-                    && !background_tasks.is_shutting_down();
-                tracing::warn!(
-                    process_id = std::process::id(),
-                    database = %path.display(),
-                    server,
-                    error = %error,
-                    attempt = consecutive_failures,
-                    retry,
-                    "namespace index obsolete-generation cleanup failed"
-                );
-                if retry {
-                    let multiplier = 2_u32.pow(consecutive_failures.saturating_sub(1));
-                    tokio::time::sleep(CLEANUP_RETRY_INITIAL_BACKOFF.saturating_mul(multiplier))
-                        .await;
                     continue;
                 }
             }
         }
 
-        let rerun = cleanup_tasks
-            .lock()
-            .map(|mut tasks| {
-                let rerun = tasks
-                    .get(&server)
-                    .is_some_and(|task| task.requested && !background_tasks.is_shutting_down());
-                if !rerun {
-                    tasks.remove(&server);
-                }
-                rerun
-            })
-            .unwrap_or(false);
-        if !rerun {
+        if !clear_finished_cleanup_task(&server, background_tasks.as_ref(), cleanup_tasks.as_ref())
+        {
             return;
         }
         consecutive_failures = 0;
@@ -2469,61 +2596,72 @@ impl<C: OpcClient> IndexManager<C> {
         self.background_tasks.wait_for_idle().await;
     }
 
-    async fn background_refresh_delay(&self, server: &str) -> Duration {
-        if let Ok(runtime) = self.runtime.lock()
-            && let Some(retry_after) = runtime.get(server).and_then(|state| state.retry_after)
-            && let Ok(remaining) = retry_after.duration_since(SystemTime::now())
-        {
-            return remaining.max(Duration::from_secs(1));
-        }
+    fn persisted_refresh_retry_delay(&self, server: &str) -> Option<Duration> {
+        self.runtime
+            .lock()
+            .ok()
+            .and_then(|runtime| runtime.get(server).and_then(|state| state.retry_after))
+            .and_then(|retry_after| retry_after.duration_since(SystemTime::now()).ok())
+            .map(|remaining| remaining.max(Duration::from_secs(1)))
+    }
 
+    fn ready_refresh_delay(&self, server: &str, status: &IndexStatus) -> Duration {
+        if status.state == IndexState::Stale && !self.maintenance_window_is_open() {
+            return if self.settings.maintenance_windows.is_empty() {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(60)
+            };
+        }
+        let scheduled =
+            Duration::from_secs(self.settings.refresh_interval_seconds.max(1)).saturating_add(
+                deterministic_jitter(server, self.settings.schedule_jitter_seconds),
+            );
+        status
+            .completed_at
+            .as_deref()
+            .and_then(parse_timestamp)
+            .and_then(|completed| {
+                SystemTime::now()
+                    .duration_since(completed)
+                    .ok()
+                    .map(|elapsed| scheduled.saturating_sub(elapsed))
+            })
+            .unwrap_or(Duration::from_secs(1))
+    }
+
+    fn not_indexed_refresh_delay(&self, server: &str) -> Duration {
+        match self.settings.initial_build_policy {
+            InitialBuildPolicy::Immediate => {
+                retry_delay(server, 1, false, self.settings.circuit_open_seconds)
+            }
+            InitialBuildPolicy::MaintenanceWindow
+                if !self.settings.maintenance_windows.is_empty() =>
+            {
+                Duration::from_secs(60)
+            }
+            InitialBuildPolicy::MaintenanceWindow | InitialBuildPolicy::Manual => {
+                Duration::from_secs(3600)
+            }
+        }
+    }
+
+    fn refresh_delay_for_status(&self, server: &str, status: &IndexStatus) -> Duration {
+        match status.state {
+            IndexState::Ready | IndexState::Stale => self.ready_refresh_delay(server, status),
+            IndexState::Refreshing | IndexState::Partial => Duration::from_secs(30),
+            IndexState::Promoting => Duration::from_secs(1),
+            IndexState::Failed => retry_delay(server, 1, false, self.settings.circuit_open_seconds),
+            IndexState::NotIndexed => self.not_indexed_refresh_delay(server),
+        }
+    }
+
+    async fn background_refresh_delay(&self, server: &str) -> Duration {
+        if let Some(delay) = self.persisted_refresh_retry_delay(server) {
+            return delay;
+        }
         match self.status(server).await {
-            Ok(status) => match status.state {
-                IndexState::Ready | IndexState::Stale => {
-                    if status.state == IndexState::Stale && !self.maintenance_window_is_open() {
-                        return if self.settings.maintenance_windows.is_empty() {
-                            Duration::from_secs(1)
-                        } else {
-                            Duration::from_secs(60)
-                        };
-                    }
-                    let scheduled =
-                        Duration::from_secs(self.settings.refresh_interval_seconds.max(1))
-                            .saturating_add(deterministic_jitter(
-                                server,
-                                self.settings.schedule_jitter_seconds,
-                            ));
-                    status
-                        .completed_at
-                        .as_deref()
-                        .and_then(parse_timestamp)
-                        .and_then(|completed| {
-                            SystemTime::now()
-                                .duration_since(completed)
-                                .ok()
-                                .map(|elapsed| scheduled.saturating_sub(elapsed))
-                        })
-                        .unwrap_or(Duration::from_secs(1))
-                }
-                IndexState::Refreshing | IndexState::Partial => Duration::from_secs(30),
-                IndexState::Promoting => Duration::from_secs(1),
-                IndexState::Failed => {
-                    retry_delay(server, 1, false, self.settings.circuit_open_seconds)
-                }
-                IndexState::NotIndexed => match self.settings.initial_build_policy {
-                    InitialBuildPolicy::Immediate => {
-                        retry_delay(server, 1, false, self.settings.circuit_open_seconds)
-                    }
-                    InitialBuildPolicy::MaintenanceWindow
-                        if !self.settings.maintenance_windows.is_empty() =>
-                    {
-                        Duration::from_secs(60)
-                    }
-                    InitialBuildPolicy::MaintenanceWindow | InitialBuildPolicy::Manual => {
-                        Duration::from_secs(3600)
-                    }
-                },
-            },
+            Ok(status) => self.refresh_delay_for_status(server, &status),
             Err(_) => retry_delay(server, 1, false, self.settings.circuit_open_seconds),
         }
     }
@@ -2562,80 +2700,103 @@ impl<C: OpcClient> IndexManager<C> {
         ))
     }
 
-    async fn refresh_if_due(self: &Arc<Self>, server: &str) {
-        match self.status(server).await {
-            Ok(status)
-                if status.active_generation > 0 && status.state != IndexState::Refreshing =>
-            {
-                let profile_changed = match self.active_profile_changed(server).await {
-                    Ok(profile_changed) => profile_changed,
-                    Err(error) => {
-                        tracing::warn!(
-                            server = %server,
-                            error = %error,
-                            "unable to inspect namespace index profile before refresh"
-                        );
-                        return;
-                    }
-                };
-                if profile_changed {
-                    if !self.automatic_refresh_allowed(&status) {
-                        tracing::debug!(
-                            server = %server,
-                            "automatic namespace index rebuild is waiting for a maintenance window"
-                        );
-                    } else {
-                        if let Err(error) = self.with_database_write(|db| db.clear_server(server)) {
-                            tracing::warn!(
-                                server = %server,
-                                error = %error,
-                                "unable to invalidate namespace index after profile change"
-                            );
-                            return;
-                        }
-                        if let Ok(mut cache) = self.cache.lock() {
-                            cache.clear_server(server);
-                        }
-                        if let Err(error) = self.refresh(server, true).await {
-                            tracing::warn!(
-                                server = %server,
-                                error = %error,
-                                "automatic namespace index rebuild after profile change failed"
-                            );
-                        }
-                    }
-                } else if matches!(
-                    status.state,
-                    IndexState::Stale | IndexState::Failed | IndexState::NotIndexed
-                ) && self.automatic_refresh_allowed(&status)
-                    && let Err(error) = self.refresh(server, false).await
-                {
-                    tracing::warn!(
-                        server = %server,
-                        error = %error,
-                        "automatic namespace index refresh failed"
-                    );
-                }
-            }
-            Ok(status)
-                if matches!(
-                    status.state,
-                    IndexState::NotIndexed
-                        | IndexState::Partial
-                        | IndexState::Stale
-                        | IndexState::Failed
-                ) =>
-            {
-                if self.automatic_refresh_allowed(&status)
-                    && let Err(error) = self.refresh(server, false).await
-                {
-                    tracing::warn!(server = %server, error = %error, "automatic namespace index refresh failed");
-                }
-            }
-            Ok(_) => {}
+    async fn refresh_active_generation_if_due(
+        self: &Arc<Self>,
+        server: &str,
+        status: &IndexStatus,
+    ) {
+        if matches!(
+            status.state,
+            IndexState::Stale | IndexState::Failed | IndexState::NotIndexed
+        ) && self.automatic_refresh_allowed(status)
+            && let Err(error) = self.refresh(server, false).await
+        {
+            tracing::warn!(
+                server = %server,
+                error = %error,
+                "automatic namespace index refresh failed"
+            );
+        }
+    }
+
+    async fn refresh_after_profile_change(self: &Arc<Self>, server: &str, status: &IndexStatus) {
+        if !self.automatic_refresh_allowed(status) {
+            tracing::debug!(
+                server = %server,
+                "automatic namespace index rebuild is waiting for a maintenance window"
+            );
+            return;
+        }
+        if let Err(error) = self.with_database_write(|db| db.clear_server(server)) {
+            tracing::warn!(
+                server = %server,
+                error = %error,
+                "unable to invalidate namespace index after profile change"
+            );
+            return;
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear_server(server);
+        }
+        if let Err(error) = self.refresh(server, true).await {
+            tracing::warn!(
+                server = %server,
+                error = %error,
+                "automatic namespace index rebuild after profile change failed"
+            );
+        }
+    }
+
+    async fn refresh_existing_index_if_due(self: &Arc<Self>, server: &str, status: &IndexStatus) {
+        let profile_changed = match self.active_profile_changed(server).await {
+            Ok(profile_changed) => profile_changed,
             Err(error) => {
-                tracing::warn!(server = %server, error = %error, "unable to inspect namespace index before refresh");
+                tracing::warn!(
+                    server = %server,
+                    error = %error,
+                    "unable to inspect namespace index profile before refresh"
+                );
+                return;
             }
+        };
+        if profile_changed {
+            self.refresh_after_profile_change(server, status).await;
+        } else {
+            self.refresh_active_generation_if_due(server, status).await;
+        }
+    }
+
+    async fn refresh_unindexed_index_if_due(self: &Arc<Self>, server: &str, status: &IndexStatus) {
+        if self.automatic_refresh_allowed(status)
+            && let Err(error) = self.refresh(server, false).await
+        {
+            tracing::warn!(
+                server = %server,
+                error = %error,
+                "automatic namespace index refresh failed"
+            );
+        }
+    }
+
+    async fn refresh_if_due(self: &Arc<Self>, server: &str) {
+        let status = match self.status(server).await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(
+                    server = %server,
+                    error = %error,
+                    "unable to inspect namespace index before refresh"
+                );
+                return;
+            }
+        };
+        if status.active_generation > 0 && status.state != IndexState::Refreshing {
+            self.refresh_existing_index_if_due(server, &status).await;
+        } else if matches!(
+            status.state,
+            IndexState::NotIndexed | IndexState::Partial | IndexState::Stale | IndexState::Failed
+        ) {
+            self.refresh_unindexed_index_if_due(server, &status).await;
         }
     }
 
@@ -6658,6 +6819,75 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(stats.batches, 0);
         drop(blocker);
+    }
+
+    #[test]
+    fn cleanup_stops_before_writing_when_shutdown_is_requested() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-shutdown.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.fail_generation("S", generation, "obsolete").unwrap();
+        drop(db);
+
+        let background_tasks = BackgroundTasks::new();
+        background_tasks.request_shutdown();
+        let stats = cleanup_obsolete_generations(&path, "S", &background_tasks).unwrap();
+
+        assert!(stats.stopped_for_shutdown);
+        assert_eq!(stats.batches, 0);
+        assert_eq!(
+            IndexDb::open(&path)
+                .unwrap()
+                .status_rows("S")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn cleanup_stops_when_obsolete_data_disappears_before_batch_delete() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("cleanup-no-progress.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.fail_generation("S", generation, "obsolete").unwrap();
+        drop(db);
+
+        let background_tasks = Arc::new(BackgroundTasks::new());
+        let (started, release) = background_tasks.install_cleanup_batch_hook();
+        let cleanup_path = path.clone();
+        let cleanup_tasks = Arc::clone(&background_tasks);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_obsolete_generations(&cleanup_path, "S", cleanup_tasks.as_ref())
+        });
+
+        started.recv().unwrap();
+        let remover = Connection::open(&path).unwrap();
+        remover
+            .execute("DELETE FROM generations WHERE server = 'S'", [])
+            .unwrap();
+        drop(remover);
+        release.send(()).unwrap();
+
+        let stats = cleanup.join().unwrap().unwrap();
+        assert_eq!(stats.batches, 1);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.fts_entries, 0);
+        assert_eq!(stats.generations, 0);
+        assert!(
+            IndexDb::open(&path)
+                .unwrap()
+                .status_rows("S")
+                .unwrap()
+                .is_empty()
+        );
+        background_tasks.wait_for_cleanup_batch_hook();
     }
 
     #[test]

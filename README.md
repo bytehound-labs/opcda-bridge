@@ -220,8 +220,11 @@ config file — see [Configuration](#configuration) below.
   different manager instance sharing the same database file, so indexing maintenance does not
   interrupt indexed search requests or compete with progress/failure writes. Deferred cleanup also
   exits cleanly if gateway shutdown begins before it starts waiting for build completion. Transient
-  cleanup failures
-  are retried with bounded backoff. A refresh interrupted by restart is superseded when a complete
+  cleanup stops before starting another write batch once shutdown is requested, and a batch that
+  finds no remaining obsolete rows makes no write. Transient cleanup failures are retried with
+  bounded backoff. Persisted retry deadlines take precedence
+  after a restart, so a failed server is not retried immediately just because the gateway was
+  restarted. A refresh interrupted by restart is superseded when a complete
   active generation remains available, so the durable snapshot stays ready while cleanup runs;
   interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
   generations do not make a newer active generation appear failed. If relational index rows and
