@@ -227,6 +227,9 @@ config file — see [Configuration](#configuration) below.
   after a restart, so a failed server is not retried immediately just because the gateway was
   restarted. A refresh interrupted by restart is superseded when a complete
   active generation remains available, so the durable snapshot stays ready while cleanup runs;
+  foreground operations are reference-counted per server; indexing stays paused while any
+  foreground user is active and remains paused through the configured quiet period after the last
+  foreground operation ends.
   interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
   generations do not make a newer active generation appear failed. If relational index rows and
   the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache

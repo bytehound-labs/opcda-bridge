@@ -3031,79 +3031,80 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    fn decrement_foreground_users(&self, server: &str) {
+        if let Ok(mut users) = self.foreground_users.lock() {
+            let remaining = users
+                .get_mut(server)
+                .map(|count| {
+                    *count = count.saturating_sub(1);
+                    *count
+                })
+                .unwrap_or(0);
+            if remaining == 0 {
+                users.remove(server);
+            }
+        }
+    }
+
+    fn update_runtime_after_foreground_end(&self, server: &str, quiet_period: Duration) {
+        if let Ok(mut states) = self.runtime.lock()
+            && let Some(build) = states
+                .get_mut(server)
+                .and_then(|state| state.build.as_mut())
+        {
+            build.foreground_users = self
+                .foreground_users
+                .lock()
+                .ok()
+                .and_then(|users| users.get(server).copied())
+                .unwrap_or(0);
+            if build.foreground_users == 0 {
+                build.quiet_until = Some(Instant::now() + quiet_period);
+            }
+        }
+    }
+
+    fn clear_expired_foreground_quiet_period(
+        runtime: &Mutex<HashMap<String, RuntimeState>>,
+        server: &str,
+    ) -> bool {
+        if let Ok(mut states) = runtime.lock()
+            && let Some(build) = states
+                .get_mut(server)
+                .and_then(|state| state.build.as_mut())
+            && build.foreground_users == 0
+            && build
+                .quiet_until
+                .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            build.quiet_until = None;
+            true
+        } else {
+            false
+        }
+    }
+
     fn foreground_end(self: &Arc<Self>, server: &str) {
         let quiet_period = Duration::from_secs(self.settings.quiet_period_seconds);
+        self.decrement_foreground_users(server);
+        self.update_runtime_after_foreground_end(server, quiet_period);
+        self.reconcile_pause_state(server);
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            Self::clear_expired_foreground_quiet_period(&self.runtime, server);
+            self.reconcile_pause_state(server);
+            return;
+        };
+
         let runtime = Arc::clone(&self.runtime);
-        let foreground_users = Arc::clone(&self.foreground_users);
         let manager = Arc::clone(self);
         let server_name = server.to_string();
-        let resume_server_name = server_name.clone();
-        let decrement_runtime = Arc::clone(&runtime);
-        let decrement = move || {
-            if let Ok(mut users) = foreground_users.lock() {
-                let remaining = users
-                    .get_mut(&server_name)
-                    .map(|count| {
-                        *count = count.saturating_sub(1);
-                        *count
-                    })
-                    .unwrap_or(0);
-                if remaining == 0 {
-                    users.remove(&server_name);
-                }
+        handle.spawn(async move {
+            tokio::time::sleep(quiet_period).await;
+            if Self::clear_expired_foreground_quiet_period(&runtime, &server_name) {
+                manager.reconcile_pause_state(&server_name);
             }
-            if let Ok(mut states) = decrement_runtime.lock()
-                && let Some(build) = states
-                    .get_mut(&server_name)
-                    .and_then(|state| state.build.as_mut())
-            {
-                build.foreground_users = foreground_users
-                    .lock()
-                    .ok()
-                    .and_then(|users| users.get(&server_name).copied())
-                    .unwrap_or(0);
-                if build.foreground_users == 0 {
-                    build.quiet_until = Some(Instant::now() + quiet_period);
-                }
-            }
-        };
-        decrement();
-        self.reconcile_pause_state(server);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                tokio::time::sleep(quiet_period).await;
-                let should_reconcile = if let Ok(mut states) = runtime.lock()
-                    && let Some(build) = states
-                        .get_mut(&resume_server_name)
-                        .and_then(|state| state.build.as_mut())
-                    && build.foreground_users == 0
-                    && build
-                        .quiet_until
-                        .is_some_and(|deadline| deadline <= Instant::now())
-                {
-                    build.quiet_until = None;
-                    true
-                } else {
-                    false
-                };
-                if should_reconcile {
-                    manager.reconcile_pause_state(&resume_server_name);
-                }
-            });
-        } else {
-            if let Ok(mut states) = runtime.lock()
-                && let Some(build) = states
-                    .get_mut(&resume_server_name)
-                    .and_then(|state| state.build.as_mut())
-                && build.foreground_users == 0
-                && build
-                    .quiet_until
-                    .is_some_and(|deadline| deadline <= Instant::now())
-            {
-                build.quiet_until = None;
-            }
-            self.reconcile_pause_state(server);
-        }
+        });
     }
 
     pub async fn status(&self, server: &str) -> anyhow::Result<IndexStatus> {
