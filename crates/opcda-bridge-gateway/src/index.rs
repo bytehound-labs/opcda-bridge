@@ -6,9 +6,9 @@ use crate::controller::{
     HostMetricsProvider, InventoryLimits, default_host_metrics_provider,
 };
 use crate::opc::{
-    BrowseSource, InventoryControl, InventoryEntry, InventoryEvent, InventoryHandle,
-    InventoryNodeKind, InventoryPacing, InventoryProgress, InventorySliceObservation,
-    MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization, OpcClient,
+    BrowseSource, InventoryCompleted, InventoryControl, InventoryEntry, InventoryEvent,
+    InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress,
+    InventorySliceObservation, MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization, OpcClient,
 };
 use chrono::{DateTime, Local, Timelike};
 use fs2::FileExt;
@@ -240,6 +240,115 @@ struct RuntimeStatus {
 struct PauseOverlayState {
     maintenance: bool,
     health: bool,
+}
+
+struct HealthProbeObservation {
+    healthy: bool,
+    failure_reason: String,
+    sentinel_configured: bool,
+}
+
+struct HealthSentinelObservation {
+    healthy: bool,
+    failure_reason: Option<String>,
+}
+
+struct BuildRunState {
+    pending: Vec<InventoryEntry>,
+    last_progress: InventoryProgress,
+    completed: bool,
+    cancelled: bool,
+    failed: Option<String>,
+    completion_warning: Option<String>,
+    completion_profile: Option<(NamespaceOrganization, BrowseSource)>,
+    terminal: bool,
+    accounted_active_time_ms: u64,
+    persisted_item_count: u64,
+    rate_limiter: ItemRateLimiter,
+    controller: Option<AdaptiveIndexController>,
+    effective_duty_cycle_percent: u8,
+    last_commit_at: Instant,
+    next_health_probe: Instant,
+    health_backoff: Duration,
+}
+
+impl BuildRunState {
+    fn new(settings: &ResolvedIndexConfig, controller: Option<AdaptiveIndexController>) -> Self {
+        Self {
+            pending: Vec::new(),
+            last_progress: InventoryProgress {
+                branches_visited: 0,
+                entries_seen: 0,
+                unique_items: 0,
+                active_time_ms: 0,
+                paused_time_ms: 0,
+                items_per_second: 0.0,
+                estimated_remaining_ms: None,
+            },
+            completed: false,
+            cancelled: false,
+            failed: None,
+            completion_warning: None,
+            completion_profile: None,
+            terminal: false,
+            accounted_active_time_ms: 0,
+            persisted_item_count: 0,
+            rate_limiter: ItemRateLimiter::new(settings.item_rate_limit, settings.burst_size),
+            controller,
+            effective_duty_cycle_percent: settings.duty_cycle_percent,
+            last_commit_at: Instant::now(),
+            next_health_probe: Instant::now(),
+            health_backoff: Duration::from_secs(1),
+        }
+    }
+
+    fn record_completion(&mut self, result: InventoryCompleted) {
+        self.terminal = true;
+        self.completed = result.complete;
+        self.cancelled = result.cancelled;
+        self.completion_profile = Some((result.organization, result.source));
+        if result.truncated {
+            self.failed = Some(
+                result
+                    .warning
+                    .unwrap_or_else(|| "inventory was truncated".to_string()),
+            );
+        } else {
+            self.completion_warning = result.warning;
+        }
+    }
+}
+
+struct BuildFinalizationContext<'a> {
+    server: &'a str,
+    generation: u64,
+    handle: &'a InventoryHandle,
+    ownership: &'a Arc<()>,
+    build_started: Instant,
+}
+
+enum BuildReadiness {
+    Ready,
+    Cancelled,
+    Failed(String),
+}
+
+enum HealthProbeAction {
+    Ready,
+    Wait(Duration),
+    Probe,
+}
+
+enum BuildEventOutcome {
+    Continue,
+    Stop,
+    Cancelled,
+    Failed(String),
+}
+
+enum BuildLoopOutcome {
+    Finished,
+    Failed(String),
 }
 
 struct BackgroundTasks {
@@ -4115,87 +4224,63 @@ impl<C: OpcClient> IndexManager<C> {
                     return;
                 }
             };
-        let mut pending = Vec::new();
-        let mut last_progress = InventoryProgress {
-            branches_visited: 0,
-            entries_seen: 0,
-            unique_items: 0,
-            active_time_ms: 0,
-            paused_time_ms: 0,
-            items_per_second: 0.0,
-            estimated_remaining_ms: None,
-        };
-        let mut completed = false;
-        let mut cancelled = false;
-        let mut failed = None;
-        let mut completion_warning = None;
-        let mut completion_profile = None;
-        let mut terminal = false;
-        let mut accounted_active_time_ms = 0_u64;
-        let mut persisted_item_count = 0_u64;
-        let mut rate_limiter =
-            ItemRateLimiter::new(self.settings.item_rate_limit, self.settings.burst_size);
-        let mut controller = self
+        let controller = self
             .settings
             .adaptive
             .then(|| AdaptiveIndexController::new(self.controller_config(), build_started));
-        let mut effective_duty_cycle_percent = self.settings.duty_cycle_percent;
-        let mut last_commit_at = Instant::now();
-        if let Some(controller) = controller.as_ref() {
+        let mut state = BuildRunState::new(&self.settings, controller);
+        if let Some(controller) = state.controller.as_ref() {
             self.update_runtime_controller(&server, controller.limits(), controller.state(), None);
         }
-        let mut next_health_probe = Instant::now();
-        let mut health_backoff = Duration::from_secs(1);
+        state.next_health_probe = Instant::now();
+        let outcome = self
+            .run_build_loop(
+                &server,
+                generation,
+                &mut handle,
+                &maintenance_windows,
+                &mut state,
+            )
+            .await;
+        self.finalize_build(
+            BuildFinalizationContext {
+                server: &server,
+                generation,
+                handle: &handle,
+                ownership: &ownership,
+                build_started,
+            },
+            state,
+            outcome,
+        );
+        finalization.disarm();
+    }
+
+    async fn run_build_loop(
+        &self,
+        server: &str,
+        generation: u64,
+        handle: &mut InventoryHandle,
+        maintenance_windows: &[MaintenanceWindow],
+        state: &mut BuildRunState,
+    ) -> BuildLoopOutcome {
         loop {
-            if !pending.is_empty()
-                && last_commit_at.elapsed()
-                    >= Duration::from_millis(self.settings.commit_interval_ms.max(1))
+            if let Some(error) = self.commit_pending_if_due(server, generation, state) {
+                state.failed = Some(error);
+                break;
+            }
+            match self
+                .wait_for_build_readiness(&handle.control, server, maintenance_windows, state)
+                .await
             {
-                match self.commit_pending_entries(&server, generation, &mut pending) {
-                    Ok(inserted) => {
-                        persisted_item_count = persisted_item_count.saturating_add(inserted);
-                        last_commit_at = Instant::now();
-                    }
-                    Err(error) => {
-                        failed = Some(error.to_string());
-                        break;
-                    }
+                BuildReadiness::Ready => {}
+                BuildReadiness::Cancelled => {
+                    state.cancelled = true;
+                    break;
                 }
-            }
-            if !self
-                .wait_for_maintenance(&handle.control, &server, &maintenance_windows)
-                .await
-            {
-                cancelled = true;
-                break;
-            }
-            if !self
-                .wait_for_health(
-                    &handle.control,
-                    &server,
-                    &mut next_health_probe,
-                    &mut health_backoff,
-                )
-                .await
-            {
-                cancelled = true;
-                break;
-            }
-            if let Some(controller) = controller.as_mut() {
-                match self
-                    .wait_for_controller_recovery(&handle.control, &server, controller)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        cancelled = true;
-                        break;
-                    }
-                    Err(error) => {
-                        handle.control.cancel();
-                        failed = Some(error.to_string());
-                        break;
-                    }
+                BuildReadiness::Failed(error) => {
+                    state.failed = Some(error);
+                    break;
                 }
             }
             let event = match tokio::time::timeout(
@@ -4207,7 +4292,7 @@ impl<C: OpcClient> IndexManager<C> {
                 Ok(event) => event,
                 Err(_) => {
                     handle.control.cancel();
-                    failed = Some(format!(
+                    state.failed = Some(format!(
                         "inventory event timed out after {} seconds",
                         self.settings.operation_timeout_seconds.max(1)
                     ));
@@ -4217,265 +4302,497 @@ impl<C: OpcClient> IndexManager<C> {
             let Some(event) = event else {
                 break;
             };
-            match event {
-                Ok(InventoryEvent::Entry(entry)) => {
-                    if !rate_limiter.acquire(&handle.control).await {
-                        cancelled = true;
-                        break;
-                    }
-                    pending.push(entry);
-                    if pending.len() >= self.settings.commit_batch_size as usize {
-                        match self.commit_pending_entries(&server, generation, &mut pending) {
-                            Ok(inserted) => {
-                                persisted_item_count =
-                                    persisted_item_count.saturating_add(inserted);
-                                last_commit_at = Instant::now();
-                            }
-                            Err(error) => {
-                                failed = Some(error.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(InventoryEvent::Progress(progress)) => {
-                    let active_time_delta_ms = progress
-                        .active_time_ms
-                        .saturating_sub(accounted_active_time_ms);
-                    accounted_active_time_ms = progress.active_time_ms;
-                    last_progress = progress.clone();
-                    if let Err(error) = self.with_database_write(|db| {
-                        db.update_progress(&server, generation, &progress)
-                    }) {
-                        tracing::error!(
-                            process_id = std::process::id(),
-                            database = %self.settings.database_path.display(),
-                            server = %server,
-                            generation,
-                            operation = "update_progress",
-                            entries_seen = progress.entries_seen,
-                            unique_items = progress.unique_items,
-                            error = %error,
-                            "namespace index database operation failed"
-                        );
-                        failed = Some(error.to_string());
-                        break;
-                    }
-                    self.update_runtime_progress(&server, progress);
-                    if active_time_delta_ms > 0
-                        && !self
-                            .enforce_duty_cycle(
-                                &handle.control,
-                                &server,
-                                Duration::from_millis(active_time_delta_ms),
-                                effective_duty_cycle_percent,
-                            )
-                            .await
-                    {
-                        cancelled = true;
-                        break;
-                    }
-                }
-                Ok(InventoryEvent::Slice(slice)) => {
-                    if let Some(controller) = controller.as_mut() {
-                        let decision = controller.observe(
-                            Instant::now(),
-                            self.controller_observation_for_slice(&server, &slice),
-                        );
-                        effective_duty_cycle_percent = decision.limits.duty_cycle_percent;
-                        self.update_runtime_controller(
-                            &server,
-                            decision.limits,
-                            decision.state,
-                            decision.recovery_at,
-                        );
-                        if let Err(error) = handle
-                            .control
-                            .set_pacing(pacing_for_limits(decision.limits))
-                        {
-                            let message = format!(
-                                "unable to update adaptive inventory pacing after slice {}: {error}",
-                                slice.sequence
-                            );
-                            tracing::error!(
-                                server = %server,
-                                generation,
-                                sequence = slice.sequence,
-                                error = %error,
-                                "namespace index pacing update failed"
-                            );
-                            handle.control.cancel();
-                            failed = Some(message);
-                            break;
-                        }
-                        tracing::debug!(
-                            server = %server,
-                            sequence = slice.sequence,
-                            backend = ?slice.backend,
-                            nodes_returned = slice.nodes_returned,
-                            native_operations = slice.native_operations,
-                            elapsed_ms = slice.elapsed_ms,
-                            state = ?decision.state,
-                            item_rate_per_second = decision.limits.item_rate_per_second,
-                            batch_size = decision.limits.batch_size,
-                            duty_cycle_percent = decision.limits.duty_cycle_percent,
-                            "updated adaptive namespace inventory pacing"
-                        );
-                    }
-                }
-                Ok(InventoryEvent::Completed(result)) => {
-                    terminal = true;
-                    completed = result.complete;
-                    cancelled = result.cancelled;
-                    completion_profile = Some((result.organization, result.source));
-                    if result.truncated {
-                        failed = Some(
-                            result
-                                .warning
-                                .unwrap_or_else(|| "inventory was truncated".to_string()),
-                        );
-                    } else {
-                        completion_warning = result.warning;
-                    }
+            match self
+                .handle_inventory_event(server, generation, &handle.control, state, event)
+                .await
+            {
+                BuildEventOutcome::Continue => {}
+                BuildEventOutcome::Stop => break,
+                BuildEventOutcome::Cancelled => {
+                    state.cancelled = true;
                     break;
                 }
-                Err(error) => {
-                    tracing::error!(
-                        process_id = std::process::id(),
-                        database = %self.settings.database_path.display(),
-                        server = %server,
-                        generation,
-                        operation = "insert_entries",
-                        batch_size = pending.len(),
-                        error = %error,
-                        "namespace index database operation failed"
-                    );
-                    failed = Some(error.to_string());
+                BuildEventOutcome::Failed(error) => {
+                    state.failed = Some(error);
                     break;
                 }
             }
         }
-        if !terminal && failed.is_none() {
-            failed = Some("inventory stream ended before completion".to_string());
+        if !state.terminal && state.failed.is_none() {
+            state.failed = Some("inventory stream ended before completion".to_string());
         }
-        if !pending.is_empty() && failed.is_none() {
-            match self.commit_pending_entries(&server, generation, &mut pending) {
+        if !state.pending.is_empty() && state.failed.is_none() {
+            match self.commit_pending_entries(server, generation, &mut state.pending) {
                 Ok(inserted) => {
-                    persisted_item_count = persisted_item_count.saturating_add(inserted);
+                    state.persisted_item_count =
+                        state.persisted_item_count.saturating_add(inserted);
                 }
                 Err(error) => {
-                    tracing::error!(
-                        process_id = std::process::id(),
-                        database = %self.settings.database_path.display(),
-                        server = %server,
-                        generation,
-                        operation = "insert_entries",
-                        batch_size = pending.len(),
-                        error = %error,
-                        "namespace index database operation failed"
-                    );
-                    failed = Some(error.to_string());
+                    self.log_entry_commit_failure(server, generation, state.pending.len(), &error);
+                    state.failed = Some(error.to_string());
                 }
             }
         }
+        state
+            .failed
+            .take()
+            .map_or(BuildLoopOutcome::Finished, BuildLoopOutcome::Failed)
+    }
 
-        if let Some(error) = failed {
-            self.fail_generation_and_schedule_cleanup(&server, generation, &error);
+    async fn wait_for_build_readiness(
+        &self,
+        control: &Arc<dyn InventoryControl>,
+        server: &str,
+        maintenance_windows: &[MaintenanceWindow],
+        state: &mut BuildRunState,
+    ) -> BuildReadiness {
+        if !self
+            .wait_for_maintenance(control, server, maintenance_windows)
+            .await
+        {
+            return BuildReadiness::Cancelled;
+        }
+        if !self
+            .wait_for_health(
+                control,
+                server,
+                &mut state.next_health_probe,
+                &mut state.health_backoff,
+            )
+            .await
+        {
+            return BuildReadiness::Cancelled;
+        }
+        let Some(controller) = state.controller.as_mut() else {
+            return BuildReadiness::Ready;
+        };
+        match self
+            .wait_for_controller_recovery(control, server, controller)
+            .await
+        {
+            Ok(true) => BuildReadiness::Ready,
+            Ok(false) => BuildReadiness::Cancelled,
+            Err(error) => {
+                control.cancel();
+                BuildReadiness::Failed(error.to_string())
+            }
+        }
+    }
+
+    async fn handle_inventory_event(
+        &self,
+        server: &str,
+        generation: u64,
+        control: &Arc<dyn InventoryControl>,
+        state: &mut BuildRunState,
+        event: anyhow::Result<InventoryEvent>,
+    ) -> BuildEventOutcome {
+        match event {
+            Ok(InventoryEvent::Entry(entry)) => {
+                self.handle_entry_event(server, generation, control, state, entry)
+                    .await
+            }
+            Ok(InventoryEvent::Progress(progress)) => {
+                self.handle_progress_event(server, generation, control, state, progress)
+                    .await
+            }
+            Ok(InventoryEvent::Slice(slice)) => {
+                self.handle_slice_event(server, generation, control, state, slice)
+            }
+            Ok(InventoryEvent::Completed(result)) => {
+                state.record_completion(result);
+                BuildEventOutcome::Stop
+            }
+            Err(error) => {
+                tracing::error!(
+                    process_id = std::process::id(),
+                    database = %self.settings.database_path.display(),
+                    server = %server,
+                    generation,
+                    operation = "insert_entries",
+                    batch_size = state.pending.len(),
+                    error = %error,
+                    "namespace index database operation failed"
+                );
+                BuildEventOutcome::Failed(error.to_string())
+            }
+        }
+    }
+
+    async fn handle_entry_event(
+        &self,
+        server: &str,
+        generation: u64,
+        control: &Arc<dyn InventoryControl>,
+        state: &mut BuildRunState,
+        entry: InventoryEntry,
+    ) -> BuildEventOutcome {
+        if !state.rate_limiter.acquire(control).await {
+            return BuildEventOutcome::Cancelled;
+        }
+        state.pending.push(entry);
+        if state.pending.len() < self.settings.commit_batch_size as usize {
+            return BuildEventOutcome::Continue;
+        }
+        match self.commit_pending_entries(server, generation, &mut state.pending) {
+            Ok(inserted) => {
+                state.persisted_item_count = state.persisted_item_count.saturating_add(inserted);
+                state.last_commit_at = Instant::now();
+                BuildEventOutcome::Continue
+            }
+            Err(error) => {
+                self.log_entry_commit_failure(server, generation, state.pending.len(), &error);
+                BuildEventOutcome::Failed(error.to_string())
+            }
+        }
+    }
+
+    async fn handle_progress_event(
+        &self,
+        server: &str,
+        generation: u64,
+        control: &Arc<dyn InventoryControl>,
+        state: &mut BuildRunState,
+        progress: InventoryProgress,
+    ) -> BuildEventOutcome {
+        let active_time_delta_ms = progress
+            .active_time_ms
+            .saturating_sub(state.accounted_active_time_ms);
+        state.accounted_active_time_ms = progress.active_time_ms;
+        state.last_progress = progress.clone();
+        if let Err(error) =
+            self.with_database_write(|db| db.update_progress(server, generation, &progress))
+        {
             tracing::error!(
                 process_id = std::process::id(),
                 database = %self.settings.database_path.display(),
                 server = %server,
                 generation,
-                duration_ms = build_started.elapsed().as_millis() as u64,
+                operation = "update_progress",
+                entries_seen = progress.entries_seen,
+                unique_items = progress.unique_items,
                 error = %error,
-                "namespace index build failed"
+                "namespace index database operation failed"
             );
-            self.finish_build_for_control_owned(&server, &handle.control, &ownership, Some(error));
-        } else if completed && !cancelled && !handle.control.is_cancelled() {
-            let result = match self.mark_promoting(&server) {
-                Ok(()) => {
-                    let completed_at = timestamp_now();
-                    let result = self.with_database_write(|db| {
-                        db.promote_with_profile(
-                            &server,
-                            generation,
-                            &completed_at,
-                            persisted_item_count,
-                            completion_profile,
-                            completion_warning.as_deref(),
-                        )
-                    });
-                    self.clear_promoting(&server);
-                    result
-                }
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(()) => {
-                    self.schedule_cleanup(&server);
-                    if let Ok(mut cache) = self.cache.lock() {
-                        cache.clear_server(&server);
-                    }
-                    tracing::info!(
-                        process_id = std::process::id(),
-                        database = %self.settings.database_path.display(),
-                        server = %server,
-                        generation,
-                        duration_ms = build_started.elapsed().as_millis() as u64,
-                        entries_seen = last_progress.entries_seen,
-                        unique_items = last_progress.unique_items,
-                        persisted_items = persisted_item_count,
-                        "namespace index build completed"
-                    );
-                    if let Some(warning) = completion_warning {
-                        tracing::warn!(
-                            process_id = std::process::id(),
-                            database = %self.settings.database_path.display(),
-                            server = %server,
-                            generation,
-                            warning = %warning,
-                            "namespace index completed with warning"
-                        );
-                    }
-                    self.finish_build_for_control_owned(&server, &handle.control, &ownership, None);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        process_id = std::process::id(),
-                        database = %self.settings.database_path.display(),
-                        server = %server,
-                        generation,
-                        operation = "promote",
-                        error = %error,
-                        "namespace index database operation failed"
-                    );
-                    self.fail_generation_and_schedule_cleanup(
-                        &server,
-                        generation,
-                        &error.to_string(),
-                    );
-                    self.finish_build_for_control_owned(
-                        &server,
-                        &handle.control,
-                        &ownership,
-                        Some(error.to_string()),
-                    );
-                }
+            return BuildEventOutcome::Failed(error.to_string());
+        }
+        self.update_runtime_progress(server, progress);
+        if active_time_delta_ms > 0
+            && !self
+                .enforce_duty_cycle(
+                    control,
+                    server,
+                    Duration::from_millis(active_time_delta_ms),
+                    state.effective_duty_cycle_percent,
+                )
+                .await
+        {
+            return BuildEventOutcome::Cancelled;
+        }
+        BuildEventOutcome::Continue
+    }
+
+    fn handle_slice_event(
+        &self,
+        server: &str,
+        generation: u64,
+        control: &Arc<dyn InventoryControl>,
+        state: &mut BuildRunState,
+        slice: InventorySliceObservation,
+    ) -> BuildEventOutcome {
+        let Some(controller) = state.controller.as_mut() else {
+            return BuildEventOutcome::Continue;
+        };
+        let decision = controller.observe(
+            Instant::now(),
+            self.controller_observation_for_slice(server, &slice),
+        );
+        state.effective_duty_cycle_percent = decision.limits.duty_cycle_percent;
+        self.update_runtime_controller(
+            server,
+            decision.limits,
+            decision.state,
+            decision.recovery_at,
+        );
+        if let Err(error) = control.set_pacing(pacing_for_limits(decision.limits)) {
+            let message = format!(
+                "unable to update adaptive inventory pacing after slice {}: {error}",
+                slice.sequence
+            );
+            tracing::error!(
+                server = %server,
+                generation,
+                sequence = slice.sequence,
+                error = %error,
+                "namespace index pacing update failed"
+            );
+            control.cancel();
+            return BuildEventOutcome::Failed(message);
+        }
+        tracing::debug!(
+            server = %server,
+            sequence = slice.sequence,
+            backend = ?slice.backend,
+            nodes_returned = slice.nodes_returned,
+            native_operations = slice.native_operations,
+            elapsed_ms = slice.elapsed_ms,
+            state = ?decision.state,
+            item_rate_per_second = decision.limits.item_rate_per_second,
+            batch_size = decision.limits.batch_size,
+            duty_cycle_percent = decision.limits.duty_cycle_percent,
+            "updated adaptive namespace inventory pacing"
+        );
+        BuildEventOutcome::Continue
+    }
+
+    fn commit_pending_if_due(
+        &self,
+        server: &str,
+        generation: u64,
+        state: &mut BuildRunState,
+    ) -> Option<String> {
+        if state.pending.is_empty()
+            || state.last_commit_at.elapsed()
+                < Duration::from_millis(self.settings.commit_interval_ms.max(1))
+        {
+            return None;
+        }
+        match self.commit_pending_entries(server, generation, &mut state.pending) {
+            Ok(inserted) => {
+                state.persisted_item_count = state.persisted_item_count.saturating_add(inserted);
+                state.last_commit_at = Instant::now();
+                None
             }
-        } else {
-            self.abandon_generation(&server, generation, "namespace index build cancelled");
+            Err(error) => {
+                self.log_entry_commit_failure(server, generation, state.pending.len(), &error);
+                Some(error.to_string())
+            }
+        }
+    }
+
+    fn log_entry_commit_failure(
+        &self,
+        server: &str,
+        generation: u64,
+        batch_size: usize,
+        error: &anyhow::Error,
+    ) {
+        tracing::error!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server = %server,
+            generation,
+            operation = "insert_entries",
+            batch_size,
+            error = %error,
+            "namespace index database operation failed"
+        );
+    }
+
+    fn finalize_build(
+        &self,
+        context: BuildFinalizationContext<'_>,
+        state: BuildRunState,
+        outcome: BuildLoopOutcome,
+    ) {
+        match outcome {
+            BuildLoopOutcome::Failed(error) => {
+                self.finish_failed_build(
+                    context.server,
+                    context.generation,
+                    context.handle,
+                    context.ownership,
+                    context.build_started,
+                    error,
+                );
+            }
+            BuildLoopOutcome::Finished
+                if state.completed
+                    && !state.cancelled
+                    && !context.handle.control.is_cancelled() =>
+            {
+                self.finish_completed_build(
+                    context.server,
+                    context.generation,
+                    context.handle,
+                    context.ownership,
+                    context.build_started,
+                    state,
+                );
+            }
+            BuildLoopOutcome::Finished => {
+                self.finish_cancelled_build(
+                    context.server,
+                    context.generation,
+                    context.handle,
+                    context.ownership,
+                    context.build_started,
+                    state.cancelled,
+                );
+            }
+        }
+    }
+
+    fn finish_failed_build(
+        &self,
+        server: &str,
+        generation: u64,
+        handle: &InventoryHandle,
+        ownership: &Arc<()>,
+        build_started: Instant,
+        error: String,
+    ) {
+        self.fail_generation_and_schedule_cleanup(server, generation, &error);
+        tracing::error!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server = %server,
+            generation,
+            duration_ms = build_started.elapsed().as_millis() as u64,
+            error = %error,
+            "namespace index build failed"
+        );
+        self.finish_build_for_control_owned(server, &handle.control, ownership, Some(error));
+    }
+
+    fn finish_completed_build(
+        &self,
+        server: &str,
+        generation: u64,
+        handle: &InventoryHandle,
+        ownership: &Arc<()>,
+        build_started: Instant,
+        state: BuildRunState,
+    ) {
+        let result = self.promote_completed_build(
+            server,
+            generation,
+            state.persisted_item_count,
+            state.completion_profile,
+            state.completion_warning.as_deref(),
+        );
+        match result {
+            Ok(()) => self.finish_promoted_build(
+                server,
+                generation,
+                handle,
+                ownership,
+                build_started,
+                state,
+            ),
+            Err(error) => {
+                self.finish_promotion_failure(server, generation, handle, ownership, error)
+            }
+        }
+    }
+
+    fn promote_completed_build(
+        &self,
+        server: &str,
+        generation: u64,
+        persisted_item_count: u64,
+        completion_profile: Option<(NamespaceOrganization, BrowseSource)>,
+        completion_warning: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.mark_promoting(server)?;
+        let completed_at = timestamp_now();
+        let result = self.with_database_write(|db| {
+            db.promote_with_profile(
+                server,
+                generation,
+                &completed_at,
+                persisted_item_count,
+                completion_profile,
+                completion_warning,
+            )
+        });
+        self.clear_promoting(server);
+        result
+    }
+
+    fn finish_promoted_build(
+        &self,
+        server: &str,
+        generation: u64,
+        handle: &InventoryHandle,
+        ownership: &Arc<()>,
+        build_started: Instant,
+        state: BuildRunState,
+    ) {
+        self.schedule_cleanup(server);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear_server(server);
+        }
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server = %server,
+            generation,
+            duration_ms = build_started.elapsed().as_millis() as u64,
+            entries_seen = state.last_progress.entries_seen,
+            unique_items = state.last_progress.unique_items,
+            persisted_items = state.persisted_item_count,
+            "namespace index build completed"
+        );
+        if let Some(warning) = state.completion_warning {
             tracing::warn!(
                 process_id = std::process::id(),
                 database = %self.settings.database_path.display(),
                 server = %server,
                 generation,
-                duration_ms = build_started.elapsed().as_millis() as u64,
-                cancelled,
-                "namespace index build cancelled"
+                warning = %warning,
+                "namespace index completed with warning"
             );
-            self.finish_build_for_control_owned(&server, &handle.control, &ownership, None);
         }
-        finalization.disarm();
+        self.finish_build_for_control_owned(server, &handle.control, ownership, None);
+    }
+
+    fn finish_promotion_failure(
+        &self,
+        server: &str,
+        generation: u64,
+        handle: &InventoryHandle,
+        ownership: &Arc<()>,
+        error: anyhow::Error,
+    ) {
+        tracing::error!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server = %server,
+            generation,
+            operation = "promote",
+            error = %error,
+            "namespace index database operation failed"
+        );
+        self.fail_generation_and_schedule_cleanup(server, generation, &error.to_string());
+        self.finish_build_for_control_owned(
+            server,
+            &handle.control,
+            ownership,
+            Some(error.to_string()),
+        );
+    }
+
+    fn finish_cancelled_build(
+        &self,
+        server: &str,
+        generation: u64,
+        handle: &InventoryHandle,
+        ownership: &Arc<()>,
+        build_started: Instant,
+        cancelled: bool,
+    ) {
+        self.abandon_generation(server, generation, "namespace index build cancelled");
+        tracing::warn!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server = %server,
+            generation,
+            duration_ms = build_started.elapsed().as_millis() as u64,
+            cancelled,
+            "namespace index build cancelled"
+        );
+        self.finish_build_for_control_owned(server, &handle.control, ownership, None);
     }
 
     fn commit_pending_entries(
@@ -4576,81 +4893,30 @@ impl<C: OpcClient> IndexManager<C> {
                 self.set_pause_overlay(server, None, Some(false));
                 return false;
             }
-            let now = Instant::now();
-            let sentinel_due = self.settings.sentinel_tag.is_some()
-                && self
-                    .runtime
-                    .lock()
-                    .ok()
-                    .and_then(|runtime| {
-                        runtime
-                            .get(server)
-                            .and_then(|state| state.sentinel_checked_at)
-                    })
-                    .is_none_or(|checked| {
-                        now.duration_since(checked)
-                            >= Duration::from_secs(self.settings.sentinel_probe_interval_seconds)
-                    });
-            if now < *next_probe && !sentinel_due {
-                if self.health_overlay_active(server) {
-                    if !wait_with_cancellation(control, next_probe.saturating_duration_since(now))
-                        .await
-                    {
+            match self.health_probe_action(server, *next_probe, Instant::now()) {
+                HealthProbeAction::Ready => return true,
+                HealthProbeAction::Wait(delay) => {
+                    if !wait_with_cancellation(control, delay).await {
                         self.set_pause_overlay(server, None, Some(false));
                         return false;
                     }
                     continue;
                 }
-                return true;
+                HealthProbeAction::Probe => {}
             }
-            let started = Instant::now();
             self.set_pause_overlay(server, None, Some(true));
-            let result = self
-                .with_opc_timeout(
-                    "health capability probe",
-                    self.client.get_capabilities(server),
-                )
-                .await;
-            let elapsed = started.elapsed();
-            let sentinel = if let Some(tag) = self.settings.sentinel_tag.as_deref() {
-                match self
-                    .with_opc_timeout(
-                        "health sentinel read",
-                        self.client.read_tag_values(server, vec![tag.to_string()]),
-                    )
-                    .await
-                {
-                    Ok(values) if values.len() == 1 => {
-                        let healthy = values[0].quality.eq_ignore_ascii_case("good");
-                        Some((
-                            healthy,
-                            if healthy {
-                                None
-                            } else {
-                                Some("sentinel quality is not Good".to_string())
-                            },
-                        ))
-                    }
-                    Ok(_) => Some((false, Some("sentinel read returned no value".to_string()))),
-                    Err(error) => Some((false, Some(error.to_string()))),
-                }
-            } else {
-                None
-            };
-            let healthy = result.is_ok()
-                && elapsed <= Duration::from_millis(self.settings.health_latency_threshold_ms);
-            let healthy = healthy && sentinel.as_ref().is_none_or(|(healthy, _)| *healthy);
+            let observation = self.probe_health(server).await;
             self.update_health_state(
                 server,
-                if self.settings.sentinel_tag.is_none() {
+                if !observation.sentinel_configured {
                     HealthProbeState::Unavailable
-                } else if healthy {
+                } else if observation.healthy {
                     HealthProbeState::Healthy
                 } else {
                     HealthProbeState::Unhealthy
                 },
             );
-            if healthy {
+            if observation.healthy {
                 self.set_pause_overlay(server, None, Some(false));
                 *backoff = Duration::from_secs(1);
                 *next_probe = Instant::now()
@@ -4658,28 +4924,118 @@ impl<C: OpcClient> IndexManager<C> {
                 return true;
             }
 
-            let reason = match result {
-                Ok(_) => sentinel.and_then(|(_, reason)| reason).unwrap_or_else(|| {
-                    format!(
-                        "health probe exceeded {} ms ({} ms)",
-                        self.settings.health_latency_threshold_ms,
-                        elapsed.as_millis()
-                    )
-                }),
-                Err(error) => format!("health probe failed: {error}"),
-            };
-            tracing::warn!(server = %server, reason = %reason, "deferring namespace inventory");
+            tracing::warn!(
+                server = %server,
+                reason = %observation.failure_reason,
+                "deferring namespace inventory"
+            );
             let delay = (*backoff).min(Duration::from_secs(300));
-            *backoff = backoff
-                .checked_mul(2)
-                .unwrap_or(Duration::from_secs(300))
-                .min(Duration::from_secs(300));
+            *backoff = next_health_backoff(*backoff);
             *next_probe = Instant::now() + delay;
             if !wait_with_cancellation(control, delay).await {
                 self.set_pause_overlay(server, None, Some(false));
                 return false;
             }
         }
+    }
+
+    fn health_probe_action(
+        &self,
+        server: &str,
+        next_probe: Instant,
+        now: Instant,
+    ) -> HealthProbeAction {
+        let sentinel_due = self.sentinel_probe_due(server, now);
+        if now >= next_probe || sentinel_due {
+            return HealthProbeAction::Probe;
+        }
+        if self.health_overlay_active(server) {
+            HealthProbeAction::Wait(next_probe.saturating_duration_since(now))
+        } else {
+            HealthProbeAction::Ready
+        }
+    }
+
+    fn sentinel_probe_due(&self, server: &str, now: Instant) -> bool {
+        self.settings.sentinel_tag.is_some()
+            && self
+                .runtime
+                .lock()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .get(server)
+                        .and_then(|state| state.sentinel_checked_at)
+                })
+                .is_none_or(|checked| {
+                    now.duration_since(checked)
+                        >= Duration::from_secs(self.settings.sentinel_probe_interval_seconds)
+                })
+    }
+
+    async fn probe_health(&self, server: &str) -> HealthProbeObservation {
+        let started = Instant::now();
+        let capability = self
+            .with_opc_timeout(
+                "health capability probe",
+                self.client.get_capabilities(server),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        let sentinel = self.read_health_sentinel(server).await;
+        let sentinel_healthy = sentinel.as_ref().is_none_or(|value| value.healthy);
+        let healthy = capability.is_ok()
+            && elapsed <= Duration::from_millis(self.settings.health_latency_threshold_ms)
+            && sentinel_healthy;
+        let failure_reason = if let Err(error) = capability.as_ref() {
+            format!("health probe failed: {error}")
+        } else if let Some(sentinel) = sentinel.as_ref().filter(|value| !value.healthy) {
+            sentinel
+                .failure_reason
+                .clone()
+                .unwrap_or_else(|| "sentinel read was unhealthy".to_string())
+        } else {
+            format!(
+                "health probe exceeded {} ms ({} ms)",
+                self.settings.health_latency_threshold_ms,
+                elapsed.as_millis()
+            )
+        };
+        HealthProbeObservation {
+            healthy,
+            failure_reason,
+            sentinel_configured: self.settings.sentinel_tag.is_some(),
+        }
+    }
+
+    async fn read_health_sentinel(&self, server: &str) -> Option<HealthSentinelObservation> {
+        let tag = self.settings.sentinel_tag.as_deref()?;
+        Some(
+            match self
+                .with_opc_timeout(
+                    "health sentinel read",
+                    self.client.read_tag_values(server, vec![tag.to_string()]),
+                )
+                .await
+            {
+                Ok(values) if values.len() == 1 => {
+                    let healthy = values[0].quality.eq_ignore_ascii_case("good");
+                    HealthSentinelObservation {
+                        healthy,
+                        failure_reason: (!healthy)
+                            .then(|| "sentinel quality is not Good".to_string()),
+                    }
+                }
+                Ok(_) => HealthSentinelObservation {
+                    healthy: false,
+                    failure_reason: Some("sentinel read returned no value".to_string()),
+                },
+                Err(error) => HealthSentinelObservation {
+                    healthy: false,
+                    failure_reason: Some(error.to_string()),
+                },
+            },
+        )
     }
 
     async fn wait_for_controller_recovery(
@@ -5439,6 +5795,13 @@ fn pacing_for_limits(limits: InventoryLimits) -> InventoryPacing {
             .then_some(limits.item_rate_per_second),
         batch_size: Some(limits.batch_size.clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE)),
     }
+}
+
+fn next_health_backoff(backoff: Duration) -> Duration {
+    backoff
+        .checked_mul(2)
+        .unwrap_or(Duration::from_secs(300))
+        .min(Duration::from_secs(300))
 }
 
 fn stable_server_hash(server: &str) -> String {
@@ -10391,6 +10754,11 @@ mod tests {
         manager.update_runtime_controller("S", paused.limits, paused.state, paused.recovery_at);
         assert!(control.paused.load(Ordering::Acquire));
 
+        let subscriber = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
         tokio::time::timeout(
             Duration::from_secs(2),
             manager.wait_for_controller_recovery(&trait_control, "S", &mut controller),
@@ -10402,6 +10770,30 @@ mod tests {
         .expect("controller recovery was cancelled");
         assert!(!control.paused.load(Ordering::Acquire));
         assert!(control.resume_count.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn health_wait_rechecks_after_a_delayed_probe_becomes_due() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("delayed-health.sqlite3")),
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, Arc::clone(&trait_control));
+        manager.set_pause_overlay("S", None, Some(true));
+
+        let mut next_probe = Instant::now() + Duration::from_millis(25);
+        let mut backoff = Duration::from_secs(1);
+        assert!(
+            manager
+                .wait_for_health(&trait_control, "S", &mut next_probe, &mut backoff,)
+                .await
+        );
+
+        assert!(!manager.health_overlay_active("S"));
+        assert_eq!(backoff, Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -10482,6 +10874,92 @@ mod tests {
             )
         );
         assert!(control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn build_readiness_failure_stops_the_loop_and_cancels_control() {
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("readiness-failure.sqlite3"));
+        config.adaptive = true;
+        config.adaptive_recovery_delay_seconds = 0;
+        config.adaptive_healthy_window_seconds = 1;
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config,
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.fail_pacing_on_call(1);
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        let _ownership = insert_runtime_build(&manager, Arc::clone(&trait_control));
+
+        let started = Instant::now() - Duration::from_secs(2);
+        let mut controller = AdaptiveIndexController::new(manager.controller_config(), started);
+        let paused = controller.observe(
+            started,
+            ControllerObservation {
+                foreground_bad_quality: true,
+                ..ControllerObservation::default()
+            },
+        );
+        manager.update_runtime_controller("S", paused.limits, paused.state, paused.recovery_at);
+        let mut state = BuildRunState::new(&manager.settings, Some(controller));
+        let mut handle = InventoryHandle {
+            stream: Box::new(VecInventoryStream {
+                events: VecDeque::new(),
+            }),
+            control: Arc::clone(&trait_control),
+        };
+
+        let outcome = manager
+            .run_build_loop("S", 1, &mut handle, &[], &mut state)
+            .await;
+
+        match outcome {
+            BuildLoopOutcome::Failed(error) => {
+                assert!(error.contains("unable to update inventory pacing while recovering"));
+            }
+            BuildLoopOutcome::Finished => panic!("readiness failure unexpectedly finished"),
+        }
+        assert!(control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn build_readiness_reports_controller_recovery_cancellation() {
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("readiness-cancelled.sqlite3"));
+        config.adaptive = true;
+        config.adaptive_recovery_delay_seconds = 1;
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config,
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, Arc::clone(&trait_control));
+
+        let mut controller =
+            AdaptiveIndexController::new(manager.controller_config(), Instant::now());
+        let paused = controller.observe(
+            Instant::now(),
+            ControllerObservation {
+                foreground_bad_quality: true,
+                ..ControllerObservation::default()
+            },
+        );
+        manager.update_runtime_controller("S", paused.limits, paused.state, paused.recovery_at);
+        let mut state = BuildRunState::new(&manager.settings, Some(controller));
+        let cancel_control = Arc::clone(&control);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel_control.cancel();
+        });
+
+        assert!(matches!(
+            manager
+                .wait_for_build_readiness(&trait_control, "S", &[], &mut state)
+                .await,
+            BuildReadiness::Cancelled
+        ));
     }
 
     #[tokio::test]
@@ -11325,6 +11803,32 @@ mod tests {
         );
         assert_eq!(
             sentinel_manager.status("S").await.unwrap().health,
+            HealthProbeState::Unhealthy
+        );
+    }
+
+    #[tokio::test]
+    async fn sentinel_read_errors_are_reported_as_unhealthy() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(MockOpcClient::default());
+        *client.read_tag_values_result.lock().unwrap() = Err("sentinel transport failed".into());
+        let mut config = settings(directory.path().join("sentinel-error.sqlite3"));
+        config.sentinel_tag = Some("Health.PV".into());
+        let manager = Arc::new(IndexManager::new(client, config));
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.cancel_on_pause();
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, Arc::clone(&trait_control));
+
+        let mut next_probe = Instant::now();
+        let mut backoff = Duration::ZERO;
+        assert!(
+            !manager
+                .wait_for_health(&trait_control, "S", &mut next_probe, &mut backoff)
+                .await
+        );
+        assert_eq!(
+            manager.status("S").await.unwrap().health,
             HealthProbeState::Unhealthy
         );
     }
