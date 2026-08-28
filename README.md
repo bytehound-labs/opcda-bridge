@@ -254,6 +254,13 @@ config file — see [Configuration](#configuration) below.
   If refresh setup fails or shutdown wins before the background build task starts, the provisional
   generation is abandoned and the build reservation is released without disturbing the last
   complete active generation.
+  Before each inventory event, a build passes its maintenance-window, health, and adaptive
+  recovery gates. Health probes check server capabilities, latency, and the optional sentinel
+  tag; an unhealthy server pauses the build with bounded exponential backoff, while a healthy
+  recovery resumes it with the configured pacing. Cancellation, probe failure, or a rejected
+  pacing update stops the build and preserves the last complete generation. Pending entries are
+  flushed before terminal state is recorded, and successful completion or a non-fatal inventory
+  warning remains distinct from a failed or cancelled build.
   Matching is case-insensitive with exact/prefix/contains ranking, and responses report
   `has_more` when the requested result window is exceeded. This preserves status, discovery,
   reads, writes, and lazy browse responsiveness during search.

@@ -42,6 +42,13 @@ operation ends.
 An inventory can complete successfully with a non-fatal warning when the OPC server rejects
 specific namespace branches; the generation remains active and usable, and the status diagnostic
 is reported as a warning unless the index state is `failed`.
+Each build checks its maintenance-window, health, and adaptive recovery gates before requesting
+the next inventory event. Health readiness combines capability and latency checks with the
+optional sentinel tag; unhealthy targets pause inventory with bounded exponential backoff and
+healthy recovery resumes it with the configured pacing. Cancellation, health failure, or a
+rejected pacing update terminates the build without replacing the last complete generation.
+Pending entries are flushed before terminal state is recorded, and successful completion with a
+non-fatal inventory warning remains searchable while the warning is exposed in status.
 Completed active generations are durable across gateway restarts. Activation is an atomic metadata
 transition, and promotion status uses a read-only SQLite connection plus filesystem diagnostics, so
 status remains responsive even while the writer is in the promotion critical section.
