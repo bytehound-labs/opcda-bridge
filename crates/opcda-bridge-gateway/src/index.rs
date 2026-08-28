@@ -1439,10 +1439,13 @@ impl IndexDb {
         limit: u32,
     ) -> anyhow::Result<Vec<IndexedMatch>> {
         let normalized_query = normalize_query(query);
+        if mode == 1 {
+            return self.search_exact(server, generation, &normalized_query, limit);
+        }
         let fts_compatible = normalized_query
             .split_whitespace()
             .all(|term| term.chars().count() >= 3);
-        if normalized_query.chars().count() >= 3 && fts_compatible && mode != 1 && mode != 2 {
+        if normalized_query.chars().count() >= 3 && fts_compatible && mode != 2 {
             return self.search_full_text(server, generation, &normalized_query, limit);
         }
         let mut sql = format!(
@@ -1451,10 +1454,6 @@ impl IndexDb {
         );
         let mut values = vec![server.to_string()];
         match mode {
-            1 => {
-                sql.push_str(" AND (e.display_name_norm = ? OR e.item_id_norm = ?)");
-                values.extend([normalized_query.clone(), normalized_query.clone()]);
-            }
             2 => {
                 let pattern = format!("{}%", escape_like(&normalized_query));
                 sql.push_str(
@@ -1520,6 +1519,71 @@ impl IndexDb {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn search_exact(
+        &self,
+        server: &str,
+        generation: u64,
+        normalized_query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<IndexedMatch>> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
+        let candidate_limit = i64::from(limit.saturating_add(1));
+        let mut candidates: HashMap<String, (SearchCandidate, IndexedMatch)> = HashMap::new();
+
+        for column in ["display_name_norm", "item_id_norm"] {
+            let sql = format!(
+                "SELECT e.item_id, e.display_name, e.display_name_norm,
+                        e.item_id_norm, e.kind, e.breadcrumbs
+                 FROM entries e
+                 WHERE e.server = ?1 AND e.generation = ?2 AND e.{column} = ?3
+                 ORDER BY length(e.display_name_norm), e.display_name_norm,
+                          e.item_id_norm, e.item_id
+                 LIMIT ?4"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let query_params = params![server, generation, normalized_query, candidate_limit];
+            let row_mapper = |row: &rusqlite::Row<'_>| {
+                let item_id = row.get::<_, String>(0)?;
+                let display_name = row.get::<_, String>(1)?;
+                let display_name_norm = row.get::<_, String>(2)?;
+                let item_id_norm = row.get::<_, String>(3)?;
+                let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
+                let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
+                let candidate = SearchCandidate {
+                    rank: SearchRank {
+                        tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
+                        display_name_len: display_name_norm.chars().count(),
+                        display_name_norm,
+                        item_id_norm,
+                    },
+                    item_id: item_id.clone(),
+                };
+                Ok((
+                    candidate,
+                    IndexedMatch {
+                        item_id,
+                        display_name,
+                        kind,
+                        breadcrumbs,
+                    },
+                ))
+            };
+            let rows = statement.query_map(query_params, row_mapper)?;
+            let rows = rows.collect::<Result<Vec<_>, _>>()?;
+            for (candidate, value) in rows {
+                candidates
+                    .entry(value.item_id.clone())
+                    .or_insert((candidate, value));
+            }
+        }
+
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
+        Ok(candidates.into_iter().map(|(_, value)| value).collect())
     }
 
     fn search_full_text(
@@ -8083,6 +8147,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.search("S", generation, "219", 3, 10).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn exact_search_uses_ranked_equality_matches_without_duplicates() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("exact-search.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries(
+            "S",
+            generation,
+            &[
+                inventory_entry("PUMP", "z-display"),
+                inventory_entry("pump", "a-display"),
+                inventory_entry("Pump output", "PUMP"),
+                inventory_entry("PUMP", "pump"),
+                inventory_entry("unrelated", "other"),
+            ],
+        )
+        .unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+
+        let matches = db.search("S", generation, "PuMp", 1, 10).unwrap();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-display", "pump", "z-display", "PUMP"]
+        );
+        assert_eq!(
+            db.search("S", generation, "pump", 1, 2)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-display", "pump", "z-display"]
+        );
     }
 
     #[test]
