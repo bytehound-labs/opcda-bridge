@@ -36,6 +36,9 @@ query operations for explicitly configured OPC servers. Capability responses adv
 search support, its protocol version, the configured result limit, and the server's index state.
 Indexed results contain exact ItemIDs and breadcrumb labels, never browse-session node keys.
 Refreshes run asynchronously, and gateway shutdown cancels active indexing before the process exits.
+Foreground operations are reference-counted per server; indexing stays paused while any foreground
+user is active and remains paused through the configured quiet period after the last foreground
+operation ends.
 An inventory can complete successfully with a non-fatal warning when the OPC server rejects
 specific namespace branches; the generation remains active and usable, and the status diagnostic
 is reported as a warning unless the index state is `failed`.
