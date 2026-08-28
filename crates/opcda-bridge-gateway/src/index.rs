@@ -1544,37 +1544,36 @@ impl IndexDb {
                  LIMIT ?4"
             );
             let mut statement = self.connection.prepare(&sql)?;
-            let rows = statement.query_map(
-                params![server, generation, normalized_query, candidate_limit],
-                |row| {
-                    let item_id = row.get::<_, String>(0)?;
-                    let display_name = row.get::<_, String>(1)?;
-                    let display_name_norm = row.get::<_, String>(2)?;
-                    let item_id_norm = row.get::<_, String>(3)?;
-                    let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
-                    let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
-                    let candidate = SearchCandidate {
-                        rank: SearchRank {
-                            tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
-                            display_name_len: display_name_norm.chars().count(),
-                            display_name_norm,
-                            item_id_norm,
-                        },
-                        item_id: item_id.clone(),
-                    };
-                    Ok((
-                        candidate,
-                        IndexedMatch {
-                            item_id,
-                            display_name,
-                            kind,
-                            breadcrumbs,
-                        },
-                    ))
-                },
-            )?;
-            for row in rows {
-                let (candidate, value) = row?;
+            let query_params = params![server, generation, normalized_query, candidate_limit];
+            let row_mapper = |row: &rusqlite::Row<'_>| {
+                let item_id = row.get::<_, String>(0)?;
+                let display_name = row.get::<_, String>(1)?;
+                let display_name_norm = row.get::<_, String>(2)?;
+                let item_id_norm = row.get::<_, String>(3)?;
+                let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
+                let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
+                let candidate = SearchCandidate {
+                    rank: SearchRank {
+                        tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
+                        display_name_len: display_name_norm.chars().count(),
+                        display_name_norm,
+                        item_id_norm,
+                    },
+                    item_id: item_id.clone(),
+                };
+                Ok((
+                    candidate,
+                    IndexedMatch {
+                        item_id,
+                        display_name,
+                        kind,
+                        breadcrumbs,
+                    },
+                ))
+            };
+            let rows = statement.query_map(query_params, row_mapper)?;
+            let rows = rows.collect::<Result<Vec<_>, _>>()?;
+            for (candidate, value) in rows {
                 candidates
                     .entry(value.item_id.clone())
                     .or_insert((candidate, value));
