@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "anyhow",
  "async-trait",
