@@ -79,7 +79,9 @@ inventory_batch_size = 100
 commit_batch_size = 100
 commit_interval_ms = 1000
 
-# Maximum native inventory entries requested per bounded operation.
+# Maximum native inventory entries requested per bounded DA3 page. The
+# item-rate limit is charged by native operation cost; this value does not add
+# a separate delay before every DA2 operation.
 batch_size = 100
 
 # Average inventory item rate and initial burst allowance.

@@ -6173,15 +6173,12 @@ fn parse_timestamp(value: &str) -> Option<SystemTime> {
 }
 
 fn pacing_for_limits(limits: InventoryLimits) -> InventoryPacing {
-    let min_interval = if limits.item_rate_per_second == 0 {
-        Duration::ZERO
-    } else {
-        let numerator = u128::from(limits.batch_size.max(1)) * 1_000_000_000;
-        let denominator = u128::from(limits.item_rate_per_second);
-        Duration::from_nanos(numerator.div_ceil(denominator) as u64)
-    };
     InventoryPacing {
-        min_interval,
+        // The client charges each native operation by cost: one for DA2
+        // operations and the requested page size for DA3. Adding a
+        // batch-size-derived minimum here would delay every DA2 operation as
+        // though it returned a full page and throttle the same work twice.
+        min_interval: Duration::ZERO,
         item_rate_per_second: (limits.item_rate_per_second > 0)
             .then_some(limits.item_rate_per_second),
         batch_size: Some(limits.batch_size.clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE)),
@@ -6521,13 +6518,13 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_limits_translate_to_native_operation_pacing() {
+    fn adaptive_limits_translate_to_item_cost_pacing() {
         let pacing = pacing_for_limits(InventoryLimits {
             item_rate_per_second: 100,
             batch_size: 10,
             duty_cycle_percent: 50,
         });
-        assert_eq!(pacing.min_interval, Duration::from_millis(100));
+        assert_eq!(pacing.min_interval, Duration::ZERO);
         assert_eq!(pacing.item_rate_per_second, Some(100));
         assert_eq!(pacing.batch_size, Some(10));
         assert_eq!(
@@ -6537,7 +6534,7 @@ mod tests {
                 duty_cycle_percent: 1,
             })
             .min_interval,
-            Duration::from_nanos(333_333_334)
+            Duration::ZERO
         );
         assert_eq!(
             pacing_for_limits(InventoryLimits {

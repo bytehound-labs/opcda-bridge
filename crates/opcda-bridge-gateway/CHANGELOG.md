@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by the configured operation timeout and label timeout-triggered cancellation as
   `inventory_event_timeout`.
 
+### Fixed
+
+- Native inventory item-rate pacing no longer derives a per-operation delay from the configured
+  batch size. DA2 operations and DA3 pages are now paced once by the native client's operation
+  cost, avoiding an unintended second throttle during hierarchical traversal.
+
 ## [0.4.21](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.20...opcda-bridge-gateway-v0.4.21) - 2026-08-28
 
 ### Other

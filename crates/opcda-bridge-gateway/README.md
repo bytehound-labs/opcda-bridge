@@ -115,8 +115,10 @@ the explicit `servers` allow-list and uses a service-writable SQLite database, c
 batch/rate/duty-cycle defaults, a two-second foreground quiet period, and one build at a time.
 Native inventory batches are bounded to 1,000 entries by the OPC DA client contract.
 Native inventory slicing and SQLite commit batching are independently bounded, and adaptive
-controller decisions update both the native slice batch size and pacing interval; the commit
-interval provides a time limit for low-volume inventories. Runtime status includes rolling
+controller decisions update the native slice batch size and item-rate limit; native operation
+cost applies the rate once (one item for DA2 operations and the requested page size for DA3),
+without an additional batch-size delay before every operation. The commit interval provides a
+time limit for low-volume inventories. Runtime status includes rolling
 foreground latency/error/quality metrics, host/storage availability, and persisted scheduler
 backoff diagnostics.
 If the native client rejects an initial or adaptive pacing update, the build fails visibly and
