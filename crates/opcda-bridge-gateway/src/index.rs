@@ -3052,11 +3052,8 @@ impl<C: OpcClient> IndexManager<C> {
                     );
                 }
             }
-            Err(_) => {
-                tracing::error!(
-                    server,
-                    "unable to update namespace index pause overlays because the overlay lock is poisoned"
-                );
+            Err(error) => {
+                tracing::error!(server, error = %error, "namespace index pause overlay lock poisoned");
                 return;
             }
         }
@@ -3129,11 +3126,8 @@ impl<C: OpcClient> IndexManager<C> {
                         build.controller_state,
                     )
                 }
-                Err(_) => {
-                    tracing::error!(
-                        server,
-                        "unable to reconcile namespace index pause state because the runtime lock is poisoned"
-                    );
+                Err(error) => {
+                    tracing::error!(server, error = %error, "namespace index runtime lock poisoned");
                     return;
                 }
             };
@@ -4383,6 +4377,83 @@ impl<C: OpcClient> IndexManager<C> {
         finalization.disarm();
     }
 
+    fn log_inventory_event_wait(&self, server: &str, generation: u64, state: &BuildRunState) {
+        tracing::info!(
+            server,
+            generation,
+            entries_seen = state.last_progress.entries_seen,
+            unique_items = state.last_progress.unique_items,
+            paused_time_ms = state.last_progress.paused_time_ms,
+            controller_state = ?state.controller.as_ref().map(AdaptiveIndexController::state),
+            pause_reason = ?self
+                .runtime
+                .lock()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .get(server)
+                        .and_then(|value| value.build.as_ref())
+                        .and_then(|build| build.pause_reason)
+                }),
+            "waiting for next native inventory event"
+        );
+    }
+
+    fn log_inventory_event_return(
+        &self,
+        server: &str,
+        generation: u64,
+        event_wait_started: Instant,
+    ) {
+        tracing::info!(
+            server,
+            generation,
+            event_wait_elapsed_ms = event_wait_started.elapsed().as_millis(),
+            "native inventory event wait returned"
+        );
+    }
+
+    async fn wait_for_inventory_event(
+        &self,
+        server: &str,
+        generation: u64,
+        handle: &mut InventoryHandle,
+        state: &BuildRunState,
+        event_wait_logs: &mut u8,
+        event_wait_return_logs: &mut u8,
+    ) -> Result<Option<anyhow::Result<InventoryEvent>>, String> {
+        let should_log_wait = *event_wait_logs < 3;
+        let _ = should_log_wait.then(|| self.log_inventory_event_wait(server, generation, state));
+        *event_wait_logs = (*event_wait_logs).saturating_add(u8::from(should_log_wait));
+        let event_wait_started = Instant::now();
+        let event = match tokio::time::timeout(
+            Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
+            handle.stream.next(),
+        )
+        .await
+        {
+            Ok(event) => event,
+            Err(_) => {
+                self.request_inventory_cancel(
+                    server,
+                    Some(generation),
+                    &handle.control,
+                    "inventory_event_timeout",
+                );
+                return Err(format!(
+                    "inventory event timed out after {} seconds",
+                    self.settings.operation_timeout_seconds.max(1)
+                ));
+            }
+        };
+        let should_log_return = *event_wait_return_logs < 3;
+        let _ = should_log_return
+            .then(|| self.log_inventory_event_return(server, generation, event_wait_started));
+        *event_wait_return_logs =
+            (*event_wait_return_logs).saturating_add(u8::from(should_log_return));
+        Ok(event)
+    }
+
     async fn run_build_loop(
         &self,
         server: &str,
@@ -4412,61 +4483,23 @@ impl<C: OpcClient> IndexManager<C> {
                     break;
                 }
             }
-            if event_wait_logs < 3 {
-                tracing::info!(
+            let event = match self
+                .wait_for_inventory_event(
                     server,
                     generation,
-                    entries_seen = state.last_progress.entries_seen,
-                    unique_items = state.last_progress.unique_items,
-                    paused_time_ms = state.last_progress.paused_time_ms,
-                    controller_state = ?state.controller.as_ref().map(AdaptiveIndexController::state),
-                    pause_reason = ?self
-                        .runtime
-                        .lock()
-                        .ok()
-                        .and_then(|runtime| {
-                            runtime
-                                .get(server)
-                                .and_then(|value| value.build.as_ref())
-                                .and_then(|build| build.pause_reason)
-                        }),
-                    "waiting for next native inventory event"
-                );
-                event_wait_logs = event_wait_logs.saturating_add(1);
-            }
-            let event_wait_started = Instant::now();
-            let event = match tokio::time::timeout(
-                Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
-                handle.stream.next(),
-            )
-            .await
+                    handle,
+                    state,
+                    &mut event_wait_logs,
+                    &mut event_wait_return_logs,
+                )
+                .await
             {
-                Ok(event) => event,
-                Err(_) => {
-                    self.request_inventory_cancel(
-                        server,
-                        Some(generation),
-                        &handle.control,
-                        "inventory_event_timeout",
-                    );
-                    state.failed = Some(format!(
-                        "inventory event timed out after {} seconds",
-                        self.settings.operation_timeout_seconds.max(1)
-                    ));
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    state.failed = Some(error);
                     break;
                 }
-            };
-            if event_wait_return_logs < 3 {
-                tracing::info!(
-                    server,
-                    generation,
-                    event_wait_elapsed_ms = event_wait_started.elapsed().as_millis(),
-                    "native inventory event wait returned"
-                );
-                event_wait_return_logs = event_wait_return_logs.saturating_add(1);
-            }
-            let Some(event) = event else {
-                break;
             };
             match self
                 .handle_inventory_event(server, generation, &handle.control, state, event)

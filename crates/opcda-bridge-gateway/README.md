@@ -47,7 +47,9 @@ the next inventory event. Health readiness combines capability and latency check
 optional sentinel tag; unhealthy targets pause inventory with bounded exponential backoff and
 healthy recovery resumes it with the configured pacing. Without a sentinel tag, the health
 status is reported as `Unavailable` while capability and latency checks can still permit the
-build. Cancellation, health failure, or a rejected pacing update terminates the build without
+build. The event wait is bounded by the configured operation timeout; an expired wait requests
+native cancellation with the `inventory_event_timeout` source before the generation is marked
+failed. Cancellation, health failure, or a rejected pacing update terminates the build without
 replacing the last complete generation.
 Pending entries are flushed before terminal state is recorded, and successful completion with a
 non-fatal inventory warning remains searchable while the warning is exposed in status.

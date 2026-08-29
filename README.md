@@ -256,6 +256,9 @@ config file — see [Configuration](#configuration) below.
   maintenance and pacing waits, and bounded native operation entry/return details. These records
   distinguish gateway scheduling and cancellation cleanup from a native browse or event-delivery
   stall without changing protocol behavior.
+  Event-delivery waits use the configured operation timeout; when that deadline expires, the
+  gateway requests native cancellation with an `inventory_event_timeout` source label before
+  recording the build failure.
   If refresh setup fails or shutdown wins before the background build task starts, the provisional
   generation is abandoned and the build reservation is released without disturbing the last
   complete active generation.
