@@ -236,7 +236,7 @@ struct RuntimeStatus {
     health: HealthProbeState,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct PauseOverlayState {
     maintenance: bool,
     health: bool,
@@ -2537,7 +2537,12 @@ impl<C: OpcClient> Drop for BuildFinalizationGuard<C> {
         if !self.armed {
             return;
         }
-        self.control.cancel();
+        self.manager.request_inventory_cancel(
+            &self.server,
+            Some(self.generation),
+            &self.control,
+            "build_unwind",
+        );
         self.manager.fail_generation_and_schedule_cleanup(
             &self.server,
             self.generation,
@@ -2764,13 +2769,13 @@ impl<C: OpcClient> IndexManager<C> {
     pub async fn shutdown_background_indexing(&self) {
         self.background_tasks.request_shutdown();
         if let Ok(runtime) = self.runtime.lock() {
-            for state in runtime.values() {
+            for (server, state) in runtime.iter() {
                 if let Some(control) = state
                     .build
                     .as_ref()
                     .and_then(|build| build.control.as_ref())
                 {
-                    control.cancel();
+                    self.request_inventory_cancel(server, None, control, "gateway_shutdown");
                 }
             }
         }
@@ -3021,22 +3026,39 @@ impl<C: OpcClient> IndexManager<C> {
     fn set_pause_overlay(&self, server: &str, maintenance: Option<bool>, health: Option<bool>) {
         let update_result = self.pause_overlays.lock().map(|mut overlays| {
             let state = overlays.entry(server.to_string()).or_default();
+            let previous = *state;
             if let Some(value) = maintenance {
                 state.maintenance = value;
             }
             if let Some(value) = health {
                 state.health = value;
             }
+            let current = *state;
             if !state.maintenance && !state.health {
                 overlays.remove(server);
             }
+            (previous, current)
         });
-        if update_result.is_err() {
-            tracing::error!(
-                server,
-                "unable to update namespace index pause overlays because the overlay lock is poisoned"
-            );
-            return;
+        match update_result {
+            Ok((previous, current)) => {
+                if previous != current {
+                    tracing::info!(
+                        server,
+                        previous_maintenance = previous.maintenance,
+                        previous_health = previous.health,
+                        maintenance = current.maintenance,
+                        health = current.health,
+                        "namespace index pause overlay changed"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::error!(
+                    server,
+                    "unable to update namespace index pause overlays because the overlay lock is poisoned"
+                );
+                return;
+            }
         }
         self.reconcile_pause_state(server);
     }
@@ -3068,44 +3090,66 @@ impl<C: OpcClient> IndexManager<C> {
                 return;
             }
         };
-        let (control, reason) = match self.runtime.lock() {
-            Ok(mut runtime) => {
-                let Some(build) = runtime
-                    .get_mut(server)
-                    .and_then(|state| state.build.as_mut())
-                else {
+        let (control, reason, previous_reason, foreground_users, operator_paused, controller_state) =
+            match self.runtime.lock() {
+                Ok(mut runtime) => {
+                    let Some(build) = runtime
+                        .get_mut(server)
+                        .and_then(|state| state.build.as_mut())
+                    else {
+                        return;
+                    };
+                    let foreground = build.foreground_users > 0
+                        || build
+                            .quiet_until
+                            .is_some_and(|deadline| deadline > Instant::now());
+                    let reason = if build.operator_paused {
+                        Some(crate::controller::PauseReason::Operator)
+                    } else if foreground {
+                        Some(crate::controller::PauseReason::Foreground)
+                    } else if overlay.maintenance {
+                        Some(crate::controller::PauseReason::Maintenance)
+                    } else if overlay.health {
+                        Some(crate::controller::PauseReason::OpcHealth)
+                    } else if let Some(crate::controller::ControllerState::Paused(reason)) =
+                        build.controller_state
+                    {
+                        Some(reason)
+                    } else {
+                        None
+                    };
+                    let previous_reason = build.pause_reason;
+                    build.pause_reason = reason;
+                    (
+                        build.control.clone(),
+                        reason,
+                        previous_reason,
+                        build.foreground_users,
+                        build.operator_paused,
+                        build.controller_state,
+                    )
+                }
+                Err(_) => {
+                    tracing::error!(
+                        server,
+                        "unable to reconcile namespace index pause state because the runtime lock is poisoned"
+                    );
                     return;
-                };
-                let foreground = build.foreground_users > 0
-                    || build
-                        .quiet_until
-                        .is_some_and(|deadline| deadline > Instant::now());
-                let reason = if build.operator_paused {
-                    Some(crate::controller::PauseReason::Operator)
-                } else if foreground {
-                    Some(crate::controller::PauseReason::Foreground)
-                } else if overlay.maintenance {
-                    Some(crate::controller::PauseReason::Maintenance)
-                } else if overlay.health {
-                    Some(crate::controller::PauseReason::OpcHealth)
-                } else if let Some(crate::controller::ControllerState::Paused(reason)) =
-                    build.controller_state
-                {
-                    Some(reason)
-                } else {
-                    None
-                };
-                build.pause_reason = reason;
-                (build.control.clone(), reason)
-            }
-            Err(_) => {
-                tracing::error!(
-                    server,
-                    "unable to reconcile namespace index pause state because the runtime lock is poisoned"
-                );
-                return;
-            }
-        };
+                }
+            };
+        if previous_reason != reason {
+            tracing::info!(
+                server,
+                previous_reason = previous_reason.map(|value| value.as_str()),
+                reason = reason.map(|value| value.as_str()),
+                foreground_users,
+                operator_paused,
+                controller_state = ?controller_state,
+                maintenance_overlay = overlay.maintenance,
+                health_overlay = overlay.health,
+                "namespace index pause reason changed"
+            );
+        }
         if let Some(control) = control {
             if reason.is_some() {
                 control.pause();
@@ -3133,6 +3177,11 @@ impl<C: OpcClient> IndexManager<C> {
             build.foreground_users = foreground_users;
             build.quiet_until = None;
         }
+        tracing::info!(
+            server,
+            foreground_users,
+            "namespace index foreground activity started"
+        );
         self.reconcile_pause_state(server);
         ForegroundGuard {
             manager: Arc::clone(self),
@@ -3152,6 +3201,11 @@ impl<C: OpcClient> IndexManager<C> {
             if remaining == 0 {
                 users.remove(server);
             }
+            tracing::info!(
+                server,
+                foreground_users = remaining,
+                "namespace index foreground activity ended"
+            );
         }
     }
 
@@ -3595,7 +3649,12 @@ impl<C: OpcClient> IndexManager<C> {
             "started namespace index inventory"
         );
         if self.background_tasks.is_shutting_down() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "gateway_shutdown_before_capability_probe",
+            );
             self.finish_build_owned(server, &build_ownership, None);
             return self.status(server).await;
         }
@@ -3737,7 +3796,12 @@ impl<C: OpcClient> IndexManager<C> {
             let message = format!("unable to apply initial inventory pacing: {error}");
             let cancelled = self.take_pending_cancel(server)
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "startup_pacing_failure_cleanup",
+            );
             if cancelled {
                 self.finish_build_owned(server, build_ownership, None);
                 return Ok(None);
@@ -3760,7 +3824,12 @@ impl<C: OpcClient> IndexManager<C> {
         if let Err(error) = control_result {
             let cancelled = self.take_pending_cancel(server)
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "startup_runtime_attach_failure_cleanup",
+            );
             if cancelled {
                 self.finish_build_owned(server, build_ownership, None);
                 return Ok(None);
@@ -3769,7 +3838,12 @@ impl<C: OpcClient> IndexManager<C> {
             return Err(error);
         }
         if self.take_pending_cancel(server) {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "pending_cancel_after_attach",
+            );
             self.finish_build_for_control_owned(server, &handle.control, build_ownership, None);
             return Ok(None);
         }
@@ -3793,7 +3867,12 @@ impl<C: OpcClient> IndexManager<C> {
             Ok(capabilities) => (capabilities.organization, capabilities.source),
             Err(error) => {
                 let cancelled = !control_was_cancelled_before_attach && control.is_cancelled();
-                control.cancel();
+                self.request_inventory_cancel(
+                    server,
+                    None,
+                    control,
+                    "capability_probe_failure_cleanup",
+                );
                 if cancelled {
                     self.finish_build_for_control_owned(server, control, build_ownership, None);
                     return Ok(None);
@@ -3817,7 +3896,12 @@ impl<C: OpcClient> IndexManager<C> {
                     "namespace index database operation failed"
                 );
                 let cancelled = !control_was_cancelled_before_attach && control.is_cancelled();
-                control.cancel();
+                self.request_inventory_cancel(
+                    server,
+                    None,
+                    control,
+                    "start_generation_failure_cleanup",
+                );
                 if cancelled {
                     self.finish_build_for_control_owned(server, control, build_ownership, None);
                     return Ok(None);
@@ -3859,7 +3943,12 @@ impl<C: OpcClient> IndexManager<C> {
             });
         if let Err(error) = control_result {
             let cancelled = handle.control.is_cancelled();
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "startup_runtime_validation_failure_cleanup",
+            );
             self.abandon_generation(server, generation, &error.to_string());
             if cancelled {
                 self.finish_build_owned(server, &build_ownership, None);
@@ -3869,14 +3958,24 @@ impl<C: OpcClient> IndexManager<C> {
             return Err(error);
         }
         if !control_was_cancelled_before_attach && handle.control.is_cancelled() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "startup_cancelled",
+            );
             self.abandon_generation(server, generation, "index build cancelled during startup");
             self.finish_build_for_control_owned(server, &handle.control, &build_ownership, None);
             return Ok(());
         }
         self.reconcile_pause_state(server);
         if self.background_tasks.is_shutting_down() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "gateway_shutdown_before_build_spawn",
+            );
             self.abandon_generation(server, generation, "gateway shutdown before index build");
             self.finish_build_owned(server, &build_ownership, None);
             return Ok(());
@@ -3896,7 +3995,12 @@ impl<C: OpcClient> IndexManager<C> {
                     .await;
             })
         {
-            control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &control,
+                "build_spawn_rejected",
+            );
             self.abandon_generation(server, generation, "index build task was not started");
             self.finish_build_for_control_owned(server, &control, &build_ownership, None);
         }
@@ -4023,6 +4127,24 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    fn request_inventory_cancel(
+        &self,
+        server: &str,
+        generation: Option<u64>,
+        control: &Arc<dyn InventoryControl>,
+        source: &str,
+    ) {
+        tracing::warn!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server,
+            generation = ?generation,
+            cancellation_source = %source,
+            "requesting namespace inventory cancellation"
+        );
+        control.cancel_with_reason(source);
+    }
+
     fn clear_pending_cancel(&self, server: &str) {
         if let Err(error) = self.pending_cancels.lock().map(|mut pending| {
             pending.remove(server);
@@ -4082,7 +4204,7 @@ impl<C: OpcClient> IndexManager<C> {
 
     fn cancel_build(&self, server: &str, build: &RuntimeBuild) -> anyhow::Result<()> {
         if let Some(control) = &build.control {
-            control.cancel();
+            self.request_inventory_cancel(server, None, control, "grpc_control_cancel");
         } else {
             self.pending_cancels
                 .lock()
@@ -4211,7 +4333,12 @@ impl<C: OpcClient> IndexManager<C> {
             match parse_maintenance_windows(&self.settings.maintenance_windows) {
                 Ok(windows) => windows,
                 Err(error) => {
-                    handle.control.cancel();
+                    self.request_inventory_cancel(
+                        &server,
+                        Some(generation),
+                        &handle.control,
+                        "maintenance_window_parse_failure_cleanup",
+                    );
                     let message = error.to_string();
                     self.fail_generation_and_schedule_cleanup(&server, generation, &message);
                     self.finish_build_for_control_owned(
@@ -4264,6 +4391,8 @@ impl<C: OpcClient> IndexManager<C> {
         maintenance_windows: &[MaintenanceWindow],
         state: &mut BuildRunState,
     ) -> BuildLoopOutcome {
+        let mut event_wait_logs = 0_u8;
+        let mut event_wait_return_logs = 0_u8;
         loop {
             if let Some(error) = self.commit_pending_if_due(server, generation, state) {
                 state.failed = Some(error);
@@ -4283,6 +4412,29 @@ impl<C: OpcClient> IndexManager<C> {
                     break;
                 }
             }
+            if event_wait_logs < 3 {
+                tracing::info!(
+                    server,
+                    generation,
+                    entries_seen = state.last_progress.entries_seen,
+                    unique_items = state.last_progress.unique_items,
+                    paused_time_ms = state.last_progress.paused_time_ms,
+                    controller_state = ?state.controller.as_ref().map(AdaptiveIndexController::state),
+                    pause_reason = ?self
+                        .runtime
+                        .lock()
+                        .ok()
+                        .and_then(|runtime| {
+                            runtime
+                                .get(server)
+                                .and_then(|value| value.build.as_ref())
+                                .and_then(|build| build.pause_reason)
+                        }),
+                    "waiting for next native inventory event"
+                );
+                event_wait_logs = event_wait_logs.saturating_add(1);
+            }
+            let event_wait_started = Instant::now();
             let event = match tokio::time::timeout(
                 Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
                 handle.stream.next(),
@@ -4291,7 +4443,12 @@ impl<C: OpcClient> IndexManager<C> {
             {
                 Ok(event) => event,
                 Err(_) => {
-                    handle.control.cancel();
+                    self.request_inventory_cancel(
+                        server,
+                        Some(generation),
+                        &handle.control,
+                        "inventory_event_timeout",
+                    );
                     state.failed = Some(format!(
                         "inventory event timed out after {} seconds",
                         self.settings.operation_timeout_seconds.max(1)
@@ -4299,6 +4456,15 @@ impl<C: OpcClient> IndexManager<C> {
                     break;
                 }
             };
+            if event_wait_return_logs < 3 {
+                tracing::info!(
+                    server,
+                    generation,
+                    event_wait_elapsed_ms = event_wait_started.elapsed().as_millis(),
+                    "native inventory event wait returned"
+                );
+                event_wait_return_logs = event_wait_return_logs.saturating_add(1);
+            }
             let Some(event) = event else {
                 break;
             };
@@ -4373,7 +4539,12 @@ impl<C: OpcClient> IndexManager<C> {
             Ok(true) => BuildReadiness::Ready,
             Ok(false) => BuildReadiness::Cancelled,
             Err(error) => {
-                control.cancel();
+                self.request_inventory_cancel(
+                    server,
+                    None,
+                    control,
+                    "controller_recovery_failure_cleanup",
+                );
                 BuildReadiness::Failed(error.to_string())
             }
         }
@@ -4526,7 +4697,12 @@ impl<C: OpcClient> IndexManager<C> {
                 error = %error,
                 "namespace index pacing update failed"
             );
-            control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                control,
+                "adaptive_pacing_update_failure_cleanup",
+            );
             return BuildEventOutcome::Failed(message);
         }
         tracing::debug!(
@@ -4871,12 +5047,22 @@ impl<C: OpcClient> IndexManager<C> {
         let mut outside_window =
             !windows.is_empty() && !maintenance_window_active(windows, Local::now());
         self.set_pause_overlay(server, Some(outside_window), None);
+        if outside_window {
+            tracing::info!(
+                server,
+                windows = windows.len(),
+                "namespace inventory waiting for an active maintenance window"
+            );
+        }
         while outside_window {
             if !wait_with_cancellation(control, Duration::from_secs(1)).await {
                 return false;
             }
             outside_window = !maintenance_window_active(windows, Local::now());
             self.set_pause_overlay(server, Some(outside_window), None);
+        }
+        if !windows.is_empty() {
+            tracing::info!(server, "namespace inventory maintenance window is active");
         }
         true
     }
@@ -4893,6 +5079,7 @@ impl<C: OpcClient> IndexManager<C> {
                 self.set_pause_overlay(server, None, Some(false));
                 return false;
             }
+            let sentinel_due = self.sentinel_probe_due(server, Instant::now());
             match self.health_probe_action(server, *next_probe, Instant::now()) {
                 HealthProbeAction::Ready => return true,
                 HealthProbeAction::Wait(delay) => {
@@ -4904,8 +5091,20 @@ impl<C: OpcClient> IndexManager<C> {
                 }
                 HealthProbeAction::Probe => {}
             }
+            tracing::info!(
+                server,
+                sentinel_due,
+                "starting namespace inventory health probe"
+            );
             self.set_pause_overlay(server, None, Some(true));
             let observation = self.probe_health(server).await;
+            tracing::info!(
+                server,
+                healthy = observation.healthy,
+                sentinel_configured = observation.sentinel_configured,
+                failure_reason = %observation.failure_reason,
+                "namespace inventory health probe completed"
+            );
             self.update_health_state(server, Self::health_state(&observation));
             if observation.healthy {
                 self.set_pause_overlay(server, None, Some(false));
@@ -5112,10 +5311,23 @@ impl<C: OpcClient> IndexManager<C> {
                 .get_mut(server)
                 .and_then(|state| state.build.as_mut())
         {
+            let previous_state = build.controller_state;
             build.effective_limits = Some(limits);
             build.controller_state = Some(state);
             build.recovery_deadline = recovery_deadline;
             drop(runtime);
+            if previous_state != Some(state) {
+                tracing::info!(
+                    server,
+                    previous_state = ?previous_state,
+                    state = ?state,
+                    item_rate_per_second = limits.item_rate_per_second,
+                    batch_size = limits.batch_size,
+                    duty_cycle_percent = limits.duty_cycle_percent,
+                    recovery_deadline = ?recovery_deadline.map(instant_timestamp),
+                    "namespace index controller state changed"
+                );
+            }
             self.reconcile_pause_state(server);
         }
     }
@@ -12415,6 +12627,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_cancel_forwards_a_diagnostic_source_to_attached_control() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("control-cancel-reason.sqlite3")),
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, trait_control);
+
+        let status = manager
+            .control("S", IndexControlAction::Cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(status.state, IndexState::Partial);
+        assert!(control.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            control.cancellation_reasons(),
+            vec!["grpc_control_cancel".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn health_and_recovery_cancellation_edges_are_bounded() {
         let directory = tempdir().unwrap();
         let mut config = settings(directory.path().join("health-wait.sqlite3"));
@@ -13098,6 +13334,7 @@ mod tests {
         resume_count: AtomicUsize,
         pacing_calls: AtomicUsize,
         fail_pacing_on_call: AtomicUsize,
+        cancel_reasons: Mutex<Vec<String>>,
     }
 
     impl InventoryControl for RecordingInventoryControl {
@@ -13116,6 +13353,11 @@ mod tests {
 
         fn cancel(&self) {
             self.cancelled.store(true, Ordering::Release);
+        }
+
+        fn cancel_with_reason(&self, reason: &str) {
+            self.cancel();
+            self.cancel_reasons.lock().unwrap().push(reason.to_owned());
         }
 
         fn is_cancelled(&self) -> bool {
@@ -13146,6 +13388,10 @@ mod tests {
 
         fn fail_pacing_on_call(&self, call: usize) {
             self.fail_pacing_on_call.store(call, Ordering::Release);
+        }
+
+        fn cancellation_reasons(&self) -> Vec<String> {
+            self.cancel_reasons.lock().unwrap().clone()
         }
     }
 

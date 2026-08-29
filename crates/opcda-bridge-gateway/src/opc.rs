@@ -152,6 +152,13 @@ pub trait InventoryControl: Send + Sync {
     fn pause(&self);
     fn resume(&self);
     fn cancel(&self);
+    /// Request cancellation with a diagnostic source label.
+    ///
+    /// Implementations that do not support source propagation retain the
+    /// original cancellation behavior through this default method.
+    fn cancel_with_reason(&self, _reason: &str) {
+        self.cancel();
+    }
     /// Applies limits to subsequent native inventory calls.
     ///
     /// A failure is terminal for the active build because continuing with stale
@@ -233,6 +240,7 @@ pub type SharedOpcClient<C> = Arc<C>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct DefaultInventoryControl;
 
@@ -258,5 +266,67 @@ mod tests {
         control.cancel();
         assert!(!control.is_cancelled());
         control.set_pacing(InventoryPacing::default()).unwrap();
+    }
+
+    #[derive(Default)]
+    struct ReasonRecordingControl {
+        cancelled: AtomicBool,
+        reason: std::sync::Mutex<Option<String>>,
+    }
+
+    impl InventoryControl for ReasonRecordingControl {
+        fn pause(&self) {}
+
+        fn resume(&self) {}
+
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::Release);
+        }
+
+        fn cancel_with_reason(&self, reason: &str) {
+            *self.reason.lock().unwrap() = Some(reason.to_owned());
+            self.cancelled.store(true, Ordering::Release);
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn inventory_control_can_record_cancellation_reason() {
+        let control = ReasonRecordingControl::default();
+        control.cancel_with_reason("gateway_shutdown");
+        assert!(control.is_cancelled());
+        assert_eq!(
+            control.reason.lock().unwrap().as_deref(),
+            Some("gateway_shutdown")
+        );
+    }
+
+    #[derive(Default)]
+    struct LegacyInventoryControl {
+        cancelled: AtomicBool,
+    }
+
+    impl InventoryControl for LegacyInventoryControl {
+        fn pause(&self) {}
+
+        fn resume(&self) {}
+
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::Release);
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn cancellation_reason_defaults_to_legacy_cancel_behavior() {
+        let control = LegacyInventoryControl::default();
+        control.cancel_with_reason("timeout_cleanup");
+        assert!(control.is_cancelled());
     }
 }

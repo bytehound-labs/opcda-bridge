@@ -53,6 +53,12 @@ a working opcda-bridge, not a redesign of it.
   start a replacement build. Persisted retry deadlines take precedence over the normal refresh
   cadence after a restart, so a failed server is not retried immediately just because the
   gateway restarted.
+- **Native inventory diagnostics are boundary-aware.** Gateway inventory logs identify pause
+  overlays, health probes, controller and foreground transitions, maintenance-window and pacing
+  waits, event-wait boundaries, and cancellation sources. The native client records the first
+  bounded operations with browse paths, item names, durations, iterator results, and failures,
+  allowing scheduler admission delays to be distinguished from native browse or event-delivery
+  stalls without changing the public protocol.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate

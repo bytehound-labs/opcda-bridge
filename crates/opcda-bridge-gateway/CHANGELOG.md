@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Diagnostic inventory tracing records startup and event-wait boundaries, pause/foreground/
+  health/controller transitions, bounded native operation details, and source-labelled
+  cancellation requests without changing the public protocol.
+
 ## [0.4.21](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.20...opcda-bridge-gateway-v0.4.21) - 2026-08-28
 
 ### Other
