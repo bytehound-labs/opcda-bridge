@@ -1692,32 +1692,8 @@ impl IndexDb {
             }
             let mut statement = self.connection.prepare(sql)?;
             let query_params = params![server, generation, normalized_query, candidate_limit];
-            let row_mapper = |row: &rusqlite::Row<'_>| {
-                let item_id = row.get::<_, String>(0)?;
-                let display_name = row.get::<_, String>(1)?;
-                let display_name_norm = row.get::<_, String>(2)?;
-                let item_id_norm = row.get::<_, String>(3)?;
-                let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
-                let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
-                let candidate = SearchCandidate {
-                    rank: SearchRank {
-                        tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
-                        display_name_len: display_name_norm.chars().count(),
-                        display_name_norm,
-                        item_id_norm,
-                    },
-                    item_id: item_id.clone(),
-                };
-                Ok((
-                    candidate,
-                    IndexedMatch {
-                        item_id,
-                        display_name,
-                        kind,
-                        breadcrumbs,
-                    },
-                ))
-            };
+            let row_mapper =
+                |row: &rusqlite::Row<'_>| indexed_candidate_from_row(row, normalized_query);
             let rows = statement.query_map(query_params, row_mapper)?;
             let rows = rows.collect::<Result<Vec<_>, _>>()?;
             for (candidate, value) in rows {
@@ -1727,10 +1703,7 @@ impl IndexDb {
             }
         }
 
-        let mut candidates = candidates.into_values().collect::<Vec<_>>();
-        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
-        Ok(candidates.into_iter().map(|(_, value)| value).collect())
+        Ok(finish_indexed_candidates(candidates, limit))
     }
 
     fn search_indexed(
@@ -1786,32 +1759,8 @@ impl IndexDb {
                  LIMIT ?{limit_parameter}"
             );
             let mut statement = self.connection.prepare(&sql)?;
-            let row_mapper = |row: &rusqlite::Row<'_>| {
-                let item_id = row.get::<_, String>(0)?;
-                let display_name = row.get::<_, String>(1)?;
-                let display_name_norm = row.get::<_, String>(2)?;
-                let item_id_norm = row.get::<_, String>(3)?;
-                let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
-                let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
-                let candidate = SearchCandidate {
-                    rank: SearchRank {
-                        tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
-                        display_name_len: display_name_norm.chars().count(),
-                        display_name_norm,
-                        item_id_norm,
-                    },
-                    item_id: item_id.clone(),
-                };
-                Ok((
-                    candidate,
-                    IndexedMatch {
-                        item_id,
-                        display_name,
-                        kind,
-                        breadcrumbs,
-                    },
-                ))
-            };
+            let row_mapper =
+                |row: &rusqlite::Row<'_>| indexed_candidate_from_row(row, normalized_query);
             let rows = match kind {
                 IndexedSearchKind::Prefix(Some(upper_bound)) => statement.query_map(
                     params![
@@ -1837,10 +1786,7 @@ impl IndexDb {
             }
         }
 
-        let mut candidates = candidates.into_values().collect::<Vec<_>>();
-        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
-        Ok(candidates.into_iter().map(|(_, value)| value).collect())
+        Ok(finish_indexed_candidates(candidates, limit))
     }
 
     fn search_full_text(
@@ -1990,6 +1936,46 @@ fn parse_indexed_breadcrumbs(value: String) -> rusqlite::Result<Vec<String>> {
     serde_json::from_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
     })
+}
+
+fn indexed_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+    normalized_query: &str,
+) -> rusqlite::Result<(SearchCandidate, IndexedMatch)> {
+    let item_id = row.get::<_, String>(0)?;
+    let display_name = row.get::<_, String>(1)?;
+    let display_name_norm = row.get::<_, String>(2)?;
+    let item_id_norm = row.get::<_, String>(3)?;
+    let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
+    let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
+    let candidate = SearchCandidate {
+        rank: SearchRank {
+            tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
+            display_name_len: display_name_norm.chars().count(),
+            display_name_norm,
+            item_id_norm,
+        },
+        item_id: item_id.clone(),
+    };
+    Ok((
+        candidate,
+        IndexedMatch {
+            item_id,
+            display_name,
+            kind,
+            breadcrumbs,
+        },
+    ))
+}
+
+fn finish_indexed_candidates(
+    candidates: HashMap<String, (SearchCandidate, IndexedMatch)>,
+    limit: u32,
+) -> Vec<IndexedMatch> {
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
+    candidates.into_iter().map(|(_, value)| value).collect()
 }
 
 #[derive(Default)]
