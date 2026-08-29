@@ -1561,10 +1561,13 @@ impl IndexDb {
         if mode == 1 {
             return self.search_exact(server, generation, &normalized_query, limit);
         }
+        if mode == 2 {
+            return self.search_prefix(server, generation, &normalized_query, limit);
+        }
         let fts_compatible = normalized_query
             .split_whitespace()
             .all(|term| term.chars().count() >= 3);
-        if normalized_query.chars().count() >= 3 && fts_compatible && mode != 2 {
+        if normalized_query.chars().count() >= 3 && fts_compatible {
             return self.search_full_text(server, generation, &normalized_query, limit);
         }
         let mut sql = format!(
@@ -1572,25 +1575,13 @@ impl IndexDb {
              WHERE e.server = ? AND e.generation = {generation}"
         );
         let mut values = vec![server.to_string()];
-        match mode {
-            2 => {
-                let pattern = format!("{}%", escape_like(&normalized_query));
-                sql.push_str(
-                    " AND (e.display_name_norm LIKE ? ESCAPE '\\'
-                        OR e.item_id_norm LIKE ? ESCAPE '\\')",
-                );
-                values.extend([pattern.clone(), pattern]);
-            }
-            _ => {
-                let pattern = format!("%{}%", escape_like(&normalized_query));
-                sql.push_str(
-                    " AND (e.display_name_norm LIKE ? ESCAPE '\\'
-                        OR e.item_id_norm LIKE ? ESCAPE '\\'
-                        OR e.breadcrumbs LIKE ? ESCAPE '\\')",
-                );
-                values.extend([pattern.clone(), pattern.clone(), pattern]);
-            }
-        }
+        let pattern = format!("%{}%", escape_like(&normalized_query));
+        sql.push_str(
+            " AND (e.display_name_norm LIKE ? ESCAPE '\\'
+                OR e.item_id_norm LIKE ? ESCAPE '\\'
+                OR e.breadcrumbs LIKE ? ESCAPE '\\')",
+        );
+        values.extend([pattern.clone(), pattern.clone(), pattern]);
         sql.push_str(
             " ORDER BY CASE
                  WHEN e.display_name_norm = ? THEN 0
@@ -1638,6 +1629,108 @@ impl IndexDb {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn search_prefix(
+        &self,
+        server: &str,
+        generation: u64,
+        normalized_query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<IndexedMatch>> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
+        let candidate_limit = i64::from(limit.saturating_add(1));
+        let upper_bound = prefix_upper_bound(normalized_query);
+        let mut candidates: HashMap<String, (SearchCandidate, IndexedMatch)> = HashMap::new();
+
+        for column in ["display_name_norm", "item_id_norm"] {
+            let (range, display_prefix_condition, item_prefix_condition, limit_parameter) =
+                match upper_bound.as_deref() {
+                    Some(_) => (
+                        format!("e.{column} >= ?3 AND e.{column} < ?4"),
+                        "e.display_name_norm >= ?3 AND e.display_name_norm < ?4".to_string(),
+                        "e.item_id_norm >= ?3 AND e.item_id_norm < ?4".to_string(),
+                        5,
+                    ),
+                    None => (
+                        format!("e.{column} >= ?3"),
+                        "substr(e.display_name_norm, 1, length(?3)) = ?3".to_string(),
+                        "substr(e.item_id_norm, 1, length(?3)) = ?3".to_string(),
+                        4,
+                    ),
+                };
+            let sql = format!(
+                "SELECT e.item_id, e.display_name, e.display_name_norm,
+                        e.item_id_norm, e.kind, e.breadcrumbs
+                 FROM entries e
+                 WHERE e.server = ?1 AND e.generation = ?2 AND {range}
+                 ORDER BY CASE
+                            WHEN e.display_name_norm = ?3 THEN 0
+                            WHEN e.item_id_norm = ?3 THEN 1
+                            WHEN {display_prefix_condition} THEN 2
+                            WHEN {item_prefix_condition} THEN 3
+                            ELSE 6
+                          END,
+                          length(e.display_name_norm), e.display_name_norm,
+                          e.item_id_norm, e.item_id
+                 LIMIT ?{limit_parameter}"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let row_mapper = |row: &rusqlite::Row<'_>| {
+                let item_id = row.get::<_, String>(0)?;
+                let display_name = row.get::<_, String>(1)?;
+                let display_name_norm = row.get::<_, String>(2)?;
+                let item_id_norm = row.get::<_, String>(3)?;
+                let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
+                let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
+                let candidate = SearchCandidate {
+                    rank: SearchRank {
+                        tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
+                        display_name_len: display_name_norm.chars().count(),
+                        display_name_norm,
+                        item_id_norm,
+                    },
+                    item_id: item_id.clone(),
+                };
+                Ok((
+                    candidate,
+                    IndexedMatch {
+                        item_id,
+                        display_name,
+                        kind,
+                        breadcrumbs,
+                    },
+                ))
+            };
+            let rows = match upper_bound.as_deref() {
+                Some(upper_bound) => statement.query_map(
+                    params![
+                        server,
+                        generation,
+                        normalized_query,
+                        upper_bound,
+                        candidate_limit
+                    ],
+                    &row_mapper,
+                )?,
+                None => statement.query_map(
+                    params![server, generation, normalized_query, candidate_limit],
+                    &row_mapper,
+                )?,
+            };
+            for row in rows {
+                let (candidate, value) = row?;
+                candidates
+                    .entry(value.item_id.clone())
+                    .or_insert((candidate, value));
+            }
+        }
+
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
+        Ok(candidates.into_iter().map(|(_, value)| value).collect())
     }
 
     fn search_exact(
@@ -1805,6 +1898,24 @@ fn search_rank(query: &str, display_name_norm: &str, item_id_norm: &str) -> u8 {
     } else {
         6
     }
+}
+
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars = prefix.chars().collect::<Vec<_>>();
+    for index in (0..chars.len()).rev() {
+        let value = chars[index] as u32;
+        let next = match value {
+            0x10ffff => None,
+            0xd7ff => char::from_u32(0xe000),
+            _ => char::from_u32(value + 1),
+        };
+        if let Some(next) = next {
+            chars[index] = next;
+            chars.truncate(index + 1);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 fn build_fts_query(query: &str) -> String {
@@ -6274,6 +6385,9 @@ mod tests {
     fn normalization_and_timestamp_helpers_are_safe() {
         assert_eq!(normalize_query("  FCS0201   PV "), "fcs0201 pv");
         assert_eq!(escape_like(r"a%b_c\d"), r"a\%b\_c\\d");
+        assert_eq!(prefix_upper_bound("abc"), Some("abd".into()));
+        assert_eq!(prefix_upper_bound("a\u{10ffff}"), Some("b".into()));
+        assert_eq!(prefix_upper_bound("\u{10ffff}"), None);
         assert_eq!(build_fts_query("fcs0201 pv"), "\"fcs0201\" AND \"pv\"");
         assert_eq!(search_rank("219", "219", "display-exact"), 0);
         assert_eq!(search_rank("219", "ordinary", "219"), 1);
@@ -9311,6 +9425,65 @@ mod tests {
                 .map(|value| value.item_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["a-display", "pump", "z-display"]
+        );
+    }
+
+    #[test]
+    fn prefix_search_uses_indexed_ranges_and_preserves_ranking() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("prefix-search.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries(
+            "S",
+            generation,
+            &[
+                inventory_entry("219 block", "display-prefix"),
+                inventory_entry("219", "display-exact"),
+                inventory_entry("ordinary", "219.item"),
+                inventory_entry("219 both", "219.both"),
+                inventory_entry("ordinary", "x219.item"),
+                inventory_entry("ordinary", "x%219.item"),
+                inventory_entry("éclair", "unicode-display"),
+                inventory_entry("block 219", "display-contains"),
+            ],
+        )
+        .unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+
+        assert_eq!(
+            db.search("S", generation, "219", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["display-exact", "219.both", "display-prefix", "219.item"]
+        );
+        assert_eq!(
+            db.search("S", generation, "219", 2, 2)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["display-exact", "219.both", "display-prefix"]
+        );
+        assert_eq!(
+            db.search("S", generation, "x%", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x%219.item"]
+        );
+        assert_eq!(
+            db.search("S", generation, "É", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unicode-display"]
         );
     }
 

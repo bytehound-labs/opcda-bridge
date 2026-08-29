@@ -244,9 +244,10 @@ config file — see [Configuration](#configuration) below.
   build-lock sidecars.
   Indexed queries use a dedicated read-only SQLite connection and bounded candidate sets, keeping
   broad searches out of the foreground database mutex. Exact searches use separate equality
-  lookups on the normalized display-name and ItemID indexes, each bounded to `limit + 1` rows,
-  then merge and deduplicate those candidates before ranking; prefix and contains searches retain
-  their existing indexed/FTS paths.
+  lookups on the normalized display-name and ItemID indexes, and prefix searches use separate
+  lexicographic range probes over those indexes. Each probe is bounded to `limit + 1` rows, then
+  candidates are merged and deduplicated before ranking; contains searches use the trigram FTS
+  index.
   During promotion, searches reuse the active generation reported by promotion-safe status rather
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
