@@ -6,12 +6,9 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    if matches!(cli.command.as_ref(), Some(ServiceCommand::IndexPrepare)) {
-        return run::prepare_index(cli);
-    }
-
     if let Some(command) = &cli.command {
         return match command {
+            ServiceCommand::IndexPrepare => run::prepare_index(&cli),
             ServiceCommand::Install => service::install(&cli),
             ServiceCommand::Uninstall => service::uninstall(),
             ServiceCommand::Start => service::start(),

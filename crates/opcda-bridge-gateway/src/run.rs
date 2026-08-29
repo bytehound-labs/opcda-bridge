@@ -49,7 +49,7 @@ pub async fn serve_with_ready<C: OpcClient>(
 
 /// Prepare the gateway-owned namespace-index structures without starting the
 /// gateway or contacting OPC DA.
-pub fn prepare_index(cli: crate::config::Cli) -> anyhow::Result<()> {
+pub fn prepare_index(cli: &crate::config::Cli) -> anyhow::Result<()> {
     let config = crate::config::load_config(cli.config.as_deref())?;
     let index = crate::config::resolve_index_config(&config.index);
     let outcome = crate::index::prepare_index_database(&index.database_path)?;

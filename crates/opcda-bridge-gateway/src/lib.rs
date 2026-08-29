@@ -21,7 +21,7 @@ pub fn non_windows_run() -> ! {
 
     let cli = Cli::parse();
     if matches!(cli.command.as_ref(), Some(ServiceCommand::IndexPrepare)) {
-        match run::prepare_index(cli) {
+        match run::prepare_index(&cli) {
             Ok(()) => std::process::exit(0),
             Err(error) => {
                 eprintln!("index preparation failed: {error:#}");

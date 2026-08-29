@@ -94,8 +94,9 @@ When a populated database is missing required secondary indexes or the trigram f
 startup records that preparation is required instead of building those objects during ordinary
 gateway work. Refresh, control, search, and obsolete-generation cleanup remain blocked until the
 gateway is stopped and the one-shot `index-prepare` command completes:
-`opcda-bridge-gateway --config PATH index-prepare`. Preparation creates and populates the missing
-objects in one transaction, validates them before commit, and records a retryable failure marker
+`opcda-bridge-gateway --config PATH index-prepare`. The command exits after preparation without
+starting the gateway or contacting OPC DA. Preparation creates and populates the missing objects
+in one transaction, validates them before commit, and records a retryable failure marker
 if it cannot complete. Empty databases prepare automatically, and status remains inspectable while
 preparation is required. Unexpected existing index definitions or inconsistent full-text data are
 quarantined rather than served as a potentially incomplete cache.
