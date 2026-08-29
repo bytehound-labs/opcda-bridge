@@ -98,8 +98,8 @@ gateway is stopped and the one-shot `index-prepare` command completes:
 starting the gateway or contacting OPC DA. Preparation creates and populates the missing objects
 in one transaction, validates them before commit, and records a retryable failure marker
 if it cannot complete. Empty databases prepare automatically, and status remains inspectable while
-preparation is required. Unexpected existing index definitions or inconsistent full-text data are
-quarantined rather than served as a potentially incomplete cache.
+preparation is required. Unexpected existing index definitions fail initialization, and
+inconsistent full-text data is quarantined rather than served as a potentially incomplete cache.
 Refresh setup is staged before the asynchronous build task is launched. If startup, capability
 negotiation, generation creation, task launch, or shutdown fails at that boundary, the
 provisional generation is abandoned and its build reservation is released while the last

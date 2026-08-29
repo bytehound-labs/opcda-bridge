@@ -420,8 +420,8 @@ during ordinary operation. Stop the gateway and run the one-shot maintenance com
 preparation without starting the gateway or contacting OPC DA. It creates and populates the
 missing objects transactionally, validates them before commit, and records a retryable failure marker if
 preparation cannot complete. Empty databases prepare automatically, and status remains available
-while preparation is required. Unexpected index definitions or inconsistent full-text data are
-quarantined rather than served as an incomplete cache.
+while preparation is required. Unexpected index definitions fail initialization, and inconsistent
+full-text data is quarantined rather than served as an incomplete cache.
 
 | Index setting              | Config key                            | Default                        |
 | -------------------------- | ------------------------------------- | ------------------------------ |

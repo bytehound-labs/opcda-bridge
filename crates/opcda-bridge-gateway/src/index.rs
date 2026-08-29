@@ -6783,6 +6783,53 @@ mod tests {
         }
     }
 
+    struct TestDatabase {
+        path: PathBuf,
+    }
+
+    impl TestDatabase {
+        fn new(label: &str) -> Self {
+            let directory = std::env::current_dir().unwrap().join("target");
+            fs::create_dir_all(&directory).unwrap();
+            Self {
+                path: directory.join(format!(
+                    "index-preparation-{label}-{}-{}.sqlite3",
+                    std::process::id(),
+                    Uuid::new_v4()
+                )),
+            }
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            for suffix in ["-wal", "-shm"] {
+                let _ = fs::remove_file(IndexDb::sqlite_sidecar_path(&self.path, suffix));
+            }
+        }
+    }
+
+    fn populated_database_without_expensive_indexes(label: &str) -> TestDatabase {
+        let database = TestDatabase::new(label);
+        let mut db = IndexDb::open(&database.path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries("S", generation, &[inventory_entry("Tag", "S.Tag")])
+            .unwrap();
+        drop(db);
+
+        let connection = Connection::open(&database.path).unwrap();
+        for (name, _, _) in SECONDARY_INDEXES {
+            connection
+                .execute(&format!("DROP INDEX {name}"), [])
+                .unwrap();
+        }
+        connection.execute("DROP TABLE entries_fts", []).unwrap();
+        database
+    }
+
     fn completed_progress(count: u64) -> InventoryProgress {
         InventoryProgress {
             entries_seen: count,
@@ -7647,6 +7694,121 @@ mod tests {
         assert_eq!(status.state, IndexState::Ready);
         assert_eq!(status.active_generation, active);
         assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn sqlite_open_prepares_indexes_for_a_fresh_database() {
+        let database = TestDatabase::new("fresh");
+        let db = IndexDb::open(&database.path).unwrap();
+
+        assert!(!db.preparation_required);
+        assert!(db.preparation_detail.is_none());
+        assert!(
+            inspect_index_objects(&db.connection)
+                .unwrap()
+                .missing
+                .is_empty()
+        );
+        assert_eq!(
+            read_preparation_state(&db.connection).unwrap(),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn sqlite_open_defers_expensive_indexes_for_a_populated_database() {
+        let database = populated_database_without_expensive_indexes("deferred");
+        let db = IndexDb::open(&database.path).unwrap();
+        let inspection = inspect_index_objects(&db.connection).unwrap();
+
+        assert_eq!(
+            inspection.missing,
+            vec![
+                "entries_display_prefix",
+                "entries_item_prefix",
+                "entries_display_exact",
+                "entries_item_exact",
+                "entries_fts",
+            ]
+        );
+        assert!(db.preparation_required);
+        assert_eq!(
+            db.preparation_error().unwrap(),
+            "namespace index preparation required; missing namespace index objects: \
+             entries_display_prefix, entries_item_prefix, entries_display_exact, \
+             entries_item_exact, entries_fts; stop the gateway and run `opcda-bridge-gateway \
+             index-prepare`"
+        );
+        assert_eq!(
+            read_preparation_state(&db.connection).unwrap(),
+            (
+                true,
+                Some(
+                    "missing namespace index objects: entries_display_prefix, \
+                     entries_item_prefix, entries_display_exact, entries_item_exact, entries_fts"
+                        .into()
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_index_preparation_builds_missing_objects_and_is_idempotent() {
+        let database = populated_database_without_expensive_indexes("prepare");
+        let mut db = IndexDb::open(&database.path).unwrap();
+
+        assert_eq!(
+            db.prepare_indexes().unwrap(),
+            IndexPreparationOutcome::Prepared
+        );
+        assert!(!db.preparation_required);
+        assert!(
+            inspect_index_objects(&db.connection)
+                .unwrap()
+                .missing
+                .is_empty()
+        );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT COUNT(*) FROM entries_fts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_preparation_state(&db.connection).unwrap(),
+            (false, None)
+        );
+        drop(db);
+
+        assert_eq!(
+            prepare_index_database(&database.path).unwrap(),
+            IndexPreparationOutcome::AlreadyPrepared
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn populated_database_preparation_is_observable_and_blocks_refresh() {
+        let database = populated_database_without_expensive_indexes("manager");
+        let client = Arc::new(MockOpcClient::default());
+        let manager = Arc::new(IndexManager::new(
+            Arc::clone(&client),
+            settings(database.path.clone()),
+        ));
+
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::Failed);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("index-prepare"))
+        );
+
+        let error = manager.refresh("S", true).await.unwrap_err();
+        assert!(error.to_string().contains("index-prepare"));
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

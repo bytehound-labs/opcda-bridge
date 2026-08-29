@@ -47,6 +47,16 @@ a working opcda-bridge, not a redesign of it.
   generation, operation, and terminal build outcome to make this class of deployment error
   diagnosable. Build locks use OS advisory ownership, and startup recovery preserves staging
   generations whose server-specific lock is still held by another live process.
+- **Large index preparation is explicit for existing inventories.** Opening a fresh or empty index
+  database creates the secondary lookup indexes and trigram FTS table automatically, but opening a
+  populated database must never build those potentially multi-million-row objects as a side effect
+  of ordinary startup or the first write. Startup records the preparation-required state in
+  `index_meta`, exposes it through status/errors, and blocks refresh, control, search, writes, and
+  obsolete-generation cleanup until an operator stops the gateway and runs
+  `opcda-bridge-gateway --config PATH index-prepare`. The command is database-only, transactional,
+  validates the resulting objects, and leaves a retryable failure detail when preparation fails.
+  The stop-gateway requirement is the operational mitigation for the accepted point-in-time race
+  between inspection and index creation if another process opens the database after inspection.
 - **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
   limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
   OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
