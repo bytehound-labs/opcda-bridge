@@ -98,9 +98,11 @@ Cancellation
 requests received before inventory startup returns its control handle are retained and applied
 once the handle is available.
 Cancellation requests carry a source label through the gateway adapter into the native client.
-Diagnostic logs also identify inventory startup boundaries, pause and foreground transitions,
-health/controller decisions, maintenance and pacing waits, and the entry and return of bounded
-native operations, including browse paths, item names, durations, iterator results, and failures.
+Diagnostic logs identify inventory startup boundaries, pause and foreground transitions, and
+health/controller decisions at the default informational level. Maintenance and pacing waits,
+health-probe details, and bounded native-operation entry/return records — including browse paths,
+item names, durations, iterator results, and failures — are debug-level diagnostics to avoid
+high-volume production logs.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the

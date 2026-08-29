@@ -244,7 +244,7 @@ struct PauseOverlayState {
 
 struct HealthProbeObservation {
     healthy: bool,
-    failure_reason: String,
+    failure_reason: Option<String>,
     sentinel_configured: bool,
 }
 
@@ -3318,11 +3318,13 @@ impl<C: OpcClient> IndexManager<C> {
             build.foreground_users = foreground_users;
             build.quiet_until = None;
         }
-        tracing::info!(
-            server,
-            foreground_users,
-            "namespace index foreground activity started"
-        );
+        if foreground_users == 1 {
+            tracing::info!(
+                server,
+                foreground_users,
+                "namespace index foreground activity started"
+            );
+        }
         self.reconcile_pause_state(server);
         ForegroundGuard {
             manager: Arc::clone(self),
@@ -3332,21 +3334,18 @@ impl<C: OpcClient> IndexManager<C> {
 
     fn decrement_foreground_users(&self, server: &str) {
         if let Ok(mut users) = self.foreground_users.lock() {
-            let remaining = users
-                .get_mut(server)
-                .map(|count| {
-                    *count = count.saturating_sub(1);
-                    *count
-                })
-                .unwrap_or(0);
-            if remaining == 0 {
+            let ended = users.get_mut(server).is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+            if ended {
                 users.remove(server);
+                tracing::info!(
+                    server,
+                    foreground_users = 0,
+                    "namespace index foreground activity ended"
+                );
             }
-            tracing::info!(
-                server,
-                foreground_users = remaining,
-                "namespace index foreground activity ended"
-            );
         }
     }
 
@@ -4525,7 +4524,7 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn log_inventory_event_wait(&self, server: &str, generation: u64, state: &BuildRunState) {
-        tracing::info!(
+        tracing::debug!(
             server,
             generation,
             entries_seen = state.last_progress.entries_seen,
@@ -4552,7 +4551,7 @@ impl<C: OpcClient> IndexManager<C> {
         generation: u64,
         event_wait_started: Instant,
     ) {
-        tracing::info!(
+        tracing::debug!(
             server,
             generation,
             event_wait_elapsed_ms = event_wait_started.elapsed().as_millis(),
@@ -5271,18 +5270,18 @@ impl<C: OpcClient> IndexManager<C> {
                 }
                 HealthProbeAction::Probe => {}
             }
-            tracing::info!(
+            tracing::debug!(
                 server,
                 sentinel_due,
                 "starting namespace inventory health probe"
             );
             self.set_pause_overlay(server, None, Some(true));
             let observation = self.probe_health(server).await;
-            tracing::info!(
+            tracing::debug!(
                 server,
                 healthy = observation.healthy,
                 sentinel_configured = observation.sentinel_configured,
-                failure_reason = %observation.failure_reason,
+                failure_reason = ?observation.failure_reason,
                 "namespace inventory health probe completed"
             );
             self.update_health_state(server, Self::health_state(&observation));
@@ -5296,7 +5295,10 @@ impl<C: OpcClient> IndexManager<C> {
 
             tracing::warn!(
                 server = %server,
-                reason = %observation.failure_reason,
+                reason = observation
+                    .failure_reason
+                    .as_deref()
+                    .unwrap_or("health probe returned unhealthy without detail"),
                 "deferring namespace inventory"
             );
             let delay = (*backoff).min(Duration::from_secs(300));
@@ -5365,19 +5367,23 @@ impl<C: OpcClient> IndexManager<C> {
         let healthy = capability.is_ok()
             && elapsed <= Duration::from_millis(self.settings.health_latency_threshold_ms)
             && sentinel_healthy;
-        let failure_reason = if let Err(error) = capability.as_ref() {
-            format!("health probe failed: {error}")
+        let failure_reason = if healthy {
+            None
+        } else if let Err(error) = capability.as_ref() {
+            Some(format!("health probe failed: {error}"))
         } else if let Some(sentinel) = sentinel.as_ref().filter(|value| !value.healthy) {
-            sentinel
-                .failure_reason
-                .clone()
-                .unwrap_or_else(|| "sentinel read was unhealthy".to_string())
+            Some(
+                sentinel
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "sentinel read was unhealthy".to_string()),
+            )
         } else {
-            format!(
+            Some(format!(
                 "health probe exceeded {} ms ({} ms)",
                 self.settings.health_latency_threshold_ms,
                 elapsed.as_millis()
-            )
+            ))
         };
         HealthProbeObservation {
             healthy,

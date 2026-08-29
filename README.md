@@ -256,9 +256,11 @@ config file — see [Configuration](#configuration) below.
   becomes available.
   Cancellation requests carry a source label through the gateway adapter into the native client,
   and diagnostic logs cover startup boundaries, pause/foreground/health/controller transitions,
-  maintenance and pacing waits, and bounded native operation entry/return details. These records
-  distinguish gateway scheduling and cancellation cleanup from a native browse or event-delivery
-  stall without changing protocol behavior.
+  maintenance and pacing waits, and bounded native operation entry/return details. Transition
+  records are informational; maintenance, pacing, health-probe, and per-operation details use
+  debug-level logging to keep normal production logs bounded. These records distinguish gateway
+  scheduling and cancellation cleanup from a native browse or event-delivery stall without
+  changing protocol behavior.
   Event-delivery waits use the configured operation timeout; when that deadline expires, the
   gateway requests native cancellation with an `inventory_event_timeout` source label before
   recording the build failure.

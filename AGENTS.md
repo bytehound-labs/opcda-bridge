@@ -53,13 +53,15 @@ a working opcda-bridge, not a redesign of it.
   start a replacement build. Persisted retry deadlines take precedence over the normal refresh
   cadence after a restart, so a failed server is not retried immediately just because the
   gateway restarted.
-- **Native inventory diagnostics are boundary-aware.** Gateway inventory logs identify pause
-  overlays, health probes, controller and foreground transitions, maintenance-window and pacing
-  waits, event-wait boundaries, and cancellation sources. The native client records the first
-  bounded operations with browse paths, item names, durations, iterator results, and failures,
-  allowing scheduler admission delays to be distinguished from native browse or event-delivery
-  stalls without changing the public protocol. Event-delivery waits use the configured operation
-  timeout and label timeout-triggered native cancellation as `inventory_event_timeout`.
+- **Native inventory diagnostics are boundary-aware and volume-controlled.** Gateway inventory
+  logs keep startup, pause-overlay, controller, and foreground transitions at informational
+  level. Health-probe details, maintenance-window/pacing waits, event-wait boundaries, and
+  per-operation records are debug-level diagnostics; the native client records only the first
+  bounded operations with browse paths, item names, durations, iterator results, and failures.
+  This keeps normal production logs bounded while allowing scheduler admission delays to be
+  distinguished from native browse or event-delivery stalls when debug logging is enabled.
+  Event-delivery waits use the configured operation timeout and label timeout-triggered native
+  cancellation as `inventory_event_timeout`.
 - **Native inventory rate limits are charged once by operation cost.** DA2 operations cost one
   item and DA3 page operations cost the requested page size. Gateway-to-client pacing must leave
   the client's minimum interval at zero unless an independent delay is intentional; deriving a
