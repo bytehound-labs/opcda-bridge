@@ -296,6 +296,9 @@ mod tests {
     #[test]
     fn inventory_control_can_record_cancellation_reason() {
         let control = ReasonRecordingControl::default();
+        control.pause();
+        control.resume();
+        control.cancel();
         control.cancel_with_reason("gateway_shutdown");
         assert!(control.is_cancelled());
         assert_eq!(
@@ -326,6 +329,8 @@ mod tests {
     #[test]
     fn cancellation_reason_defaults_to_legacy_cancel_behavior() {
         let control = LegacyInventoryControl::default();
+        control.pause();
+        control.resume();
         control.cancel_with_reason("timeout_cleanup");
         assert!(control.is_cancelled());
     }
