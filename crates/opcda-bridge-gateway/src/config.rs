@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::opc::MAX_NATIVE_INVENTORY_BATCH_SIZE;
 
-/// Windows service management subcommands. Give flags such as `--port` or
+/// Windows service management and one-shot maintenance subcommands. Give flags such as `--port` or
 /// `--log-dir` *before* the subcommand (e.g. `--log-dir C:\logs install`) —
 /// they are only meaningful on `install`, where they're baked into the
 /// registered service's launch arguments so it starts with the same
@@ -16,6 +16,8 @@ use crate::opc::MAX_NATIVE_INVENTORY_BATCH_SIZE;
 /// `service::run_as_service`.
 #[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum ServiceCommand {
+    /// Prepare missing secondary and full-text indexes without starting the gateway
+    IndexPrepare,
     /// Register the gateway as a Windows service (does not start it)
     Install,
     /// Remove the registered Windows service
@@ -36,7 +38,7 @@ pub enum ServiceCommand {
     version
 )]
 pub struct Cli {
-    /// Windows service management command (install/uninstall/start/stop/status).
+    /// Windows service management or one-shot maintenance command.
     /// Omit entirely to run the gateway itself, whether interactively or as
     /// an already-installed service.
     #[command(subcommand)]
@@ -815,6 +817,7 @@ mod tests {
     #[test]
     fn test_cli_parses_service_subcommands() {
         for (arg, expected) in [
+            ("index-prepare", ServiceCommand::IndexPrepare),
             ("install", ServiceCommand::Install),
             ("uninstall", ServiceCommand::Uninstall),
             ("start", ServiceCommand::Start),

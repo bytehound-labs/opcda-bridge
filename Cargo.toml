@@ -20,9 +20,8 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs2 = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
-# Pin the native OPC DA client revision that provides bounded inventory diagnostics and
-# reason-aware cancellation while preserving the gateway's public protocol.
-opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "89e39bee82e577e6b56c6f962e64f0c5d4b5f71a", version = "0.2.8" }
+# Pin the focused native OPC DA client candidate while the combined change is validated.
+opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "534d72b8bbd4f0e6a22fa04921a429a5036b5416", version = "0.2.8" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
 prost = "0.14"

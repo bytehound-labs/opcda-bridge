@@ -90,6 +90,15 @@ progress. Matching is case-insensitive with exact/prefix/contains ranking, and
 responses report when additional results exist beyond the requested limit. During promotion,
 searches use the active generation already returned by the promotion-safe status path instead of
 waiting for the writable database mutex.
+When a populated database is missing required secondary indexes or the trigram full-text index,
+startup records that preparation is required instead of building those objects during ordinary
+gateway work. Refresh, control, search, and obsolete-generation cleanup remain blocked until the
+gateway is stopped and the one-shot `index-prepare` command completes:
+`opcda-bridge-gateway --config PATH index-prepare`. Preparation creates and populates the missing
+objects in one transaction, validates them before commit, and records a retryable failure marker
+if it cannot complete. Empty databases prepare automatically, and status remains inspectable while
+preparation is required. Unexpected existing index definitions or inconsistent full-text data are
+quarantined rather than served as a potentially incomplete cache.
 Refresh setup is staged before the asynchronous build task is launched. If startup, capability
 negotiation, generation creation, task launch, or shutdown fails at that boundary, the
 provisional generation is abandoned and its build reservation is released while the last
@@ -103,10 +112,6 @@ health/controller decisions at the default informational level. Maintenance and 
 health-probe details, and bounded native-operation entry/return records — including browse paths,
 item names, durations, iterator results, and failures — are debug-level diagnostics to avoid
 high-volume production logs.
-
-Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
-BSTR contents without adding display quote characters; quotes remain only when present in the
-server value.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the

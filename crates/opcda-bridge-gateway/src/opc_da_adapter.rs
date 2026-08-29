@@ -184,10 +184,6 @@ impl InventoryControl for AdapterInventoryControl {
         self.inner.cancel();
     }
 
-    fn cancel_with_reason(&self, reason: &str) {
-        self.inner.cancel_with_reason(reason);
-    }
-
     fn set_pacing(&self, pacing: InventoryPacing) -> anyhow::Result<()> {
         self.apply_pacing(pacing)
     }

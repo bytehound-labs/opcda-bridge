@@ -413,6 +413,14 @@ The persistent namespace index is opt-in by server: index operations are accepte
 in `index.servers`, and automatic indexing never scans any other server. A valid complete
 generation remains available while a refresh runs, and failed or cancelled refreshes never replace
 it.
+When an existing populated database is missing a required secondary index or the trigram full-text
+index, gateway startup records that preparation is required instead of creating large objects
+during ordinary operation. Stop the gateway and run the one-shot maintenance command
+`opcda-bridge-gateway --config PATH index-prepare`; it creates and populates the missing objects
+transactionally, validates them before commit, and records a retryable failure marker if
+preparation cannot complete. Empty databases prepare automatically, and status remains available
+while preparation is required. Unexpected index definitions or inconsistent full-text data are
+quarantined rather than served as an incomplete cache.
 
 | Index setting              | Config key                            | Default                        |
 | -------------------------- | ------------------------------------- | ------------------------------ |

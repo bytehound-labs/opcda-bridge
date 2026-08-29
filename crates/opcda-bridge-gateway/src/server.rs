@@ -89,7 +89,9 @@ fn internal(error: impl std::fmt::Display) -> Status {
 
 fn index_error(error: impl std::fmt::Display) -> Status {
     let message = error.to_string();
-    if message.contains("not configured") {
+    if message.contains("not configured")
+        || message.contains("namespace index preparation required")
+    {
         Status::failed_precondition(message)
     } else {
         internal(message)

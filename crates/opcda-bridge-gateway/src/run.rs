@@ -47,6 +47,25 @@ pub async fn serve_with_ready<C: OpcClient>(
     Ok(())
 }
 
+/// Prepare the gateway-owned namespace-index structures without starting the
+/// gateway or contacting OPC DA.
+pub fn prepare_index(cli: crate::config::Cli) -> anyhow::Result<()> {
+    let config = crate::config::load_config(cli.config.as_deref())?;
+    let index = crate::config::resolve_index_config(&config.index);
+    let outcome = crate::index::prepare_index_database(&index.database_path)?;
+    match outcome {
+        crate::index::IndexPreparationOutcome::AlreadyPrepared => println!(
+            "namespace index is already prepared: {}",
+            index.database_path.display()
+        ),
+        crate::index::IndexPreparationOutcome::Prepared => println!(
+            "namespace index prepared successfully: {}",
+            index.database_path.display()
+        ),
+    }
+    Ok(())
+}
+
 /// Resolves when the OS asks the process to stop: `Ctrl+C`, `Ctrl+Break`, a
 /// console window close, a user logoff, or a system shutdown/restart.
 ///

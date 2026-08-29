@@ -30,6 +30,68 @@ const CLEANUP_BATCH_SIZE: usize = 10_000;
 const CLEANUP_BATCH_PAUSE: Duration = Duration::from_millis(1);
 const CLEANUP_RETRY_LIMIT: u32 = 3;
 const CLEANUP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const INDEX_PREPARATION_REQUIRED_KEY: &str = "index_preparation_required";
+const INDEX_PREPARATION_DETAIL_KEY: &str = "index_preparation_detail";
+const INDEX_PREPARATION_COMMAND: &str = "opcda-bridge-gateway index-prepare";
+
+const SECONDARY_INDEXES: [(&str, &str, &str); 4] = [
+    (
+        "entries_display_prefix",
+        "CREATE INDEX entries_display_prefix
+         ON entries(server, generation, display_name_norm)",
+        "CREATE INDEX IF NOT EXISTS entries_display_prefix
+         ON entries(server, generation, display_name_norm)",
+    ),
+    (
+        "entries_item_prefix",
+        "CREATE INDEX entries_item_prefix
+         ON entries(server, generation, item_id_norm)",
+        "CREATE INDEX IF NOT EXISTS entries_item_prefix
+         ON entries(server, generation, item_id_norm)",
+    ),
+    (
+        "entries_display_exact",
+        "CREATE INDEX entries_display_exact
+         ON entries(server, generation, display_name_norm, item_id_norm, item_id)",
+        "CREATE INDEX IF NOT EXISTS entries_display_exact
+         ON entries(server, generation, display_name_norm, item_id_norm, item_id)",
+    ),
+    (
+        "entries_item_exact",
+        "CREATE INDEX entries_item_exact
+         ON entries(
+             server, generation, item_id_norm, length(display_name_norm),
+             display_name_norm, item_id
+         )",
+        "CREATE INDEX IF NOT EXISTS entries_item_exact
+         ON entries(
+             server, generation, item_id_norm, length(display_name_norm),
+             display_name_norm, item_id
+         )",
+    ),
+];
+const FTS_OBJECT_NAME: &str = "entries_fts";
+const FTS_EXPECTED_SQL: &str = "CREATE VIRTUAL TABLE entries_fts USING fts5(
+    server UNINDEXED,
+    generation UNINDEXED,
+    item_id,
+    display_name,
+    breadcrumbs,
+    tokenize = 'trigram'
+)";
+const FTS_CREATE_SQL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+    server UNINDEXED,
+    generation UNINDEXED,
+    item_id,
+    display_name,
+    breadcrumbs,
+    tokenize = 'trigram'
+)";
+const FTS_POPULATE_SQL: &str = "INSERT INTO entries_fts(
+    server, generation, item_id, display_name, breadcrumbs
+)
+SELECT server, generation, item_id, display_name, breadcrumbs
+FROM entries";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexState {
@@ -841,6 +903,19 @@ struct CacheKey {
 struct IndexDb {
     path: PathBuf,
     connection: Connection,
+    preparation_required: bool,
+    preparation_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexPreparationOutcome {
+    AlreadyPrepared,
+    Prepared,
+}
+
+struct IndexObjectInspection {
+    missing: Vec<&'static str>,
+    fts_present: bool,
 }
 
 #[derive(Debug)]
@@ -954,6 +1029,169 @@ impl Drop for BuildFileLock {
     }
 }
 
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn inspect_index_object(
+    connection: &Connection,
+    name: &str,
+    expected_type: &str,
+    expected_sql: &str,
+) -> anyhow::Result<bool> {
+    let object = connection
+        .query_row(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((object_type, sql)) = object else {
+        return Ok(false);
+    };
+    if object_type != expected_type {
+        anyhow::bail!(
+            "namespace index object {name} has type {object_type}, expected {expected_type}"
+        );
+    }
+    if sql
+        .as_deref()
+        .is_none_or(|sql| normalize_schema_sql(sql) != normalize_schema_sql(expected_sql))
+    {
+        anyhow::bail!("namespace index object {name} has an unexpected definition");
+    }
+    Ok(true)
+}
+
+fn inspect_index_objects(connection: &Connection) -> anyhow::Result<IndexObjectInspection> {
+    let mut missing = Vec::new();
+    for (name, expected_sql, _) in SECONDARY_INDEXES {
+        if !inspect_index_object(connection, name, "index", expected_sql)? {
+            missing.push(name);
+        }
+    }
+    let fts_present = inspect_index_object(connection, FTS_OBJECT_NAME, "table", FTS_EXPECTED_SQL)?;
+    if !fts_present {
+        missing.push(FTS_OBJECT_NAME);
+    }
+    Ok(IndexObjectInspection {
+        missing,
+        fts_present,
+    })
+}
+
+fn create_missing_index_objects(
+    connection: &Connection,
+    missing: &[&'static str],
+) -> anyhow::Result<()> {
+    for name in missing {
+        if let Some((_, _, create_sql)) = SECONDARY_INDEXES
+            .iter()
+            .find(|(index_name, _, _)| index_name == name)
+        {
+            connection.execute(create_sql, [])?;
+        } else if *name == FTS_OBJECT_NAME {
+            connection.execute_batch(FTS_CREATE_SQL)?;
+            connection.execute_batch(FTS_POPULATE_SQL)?;
+        } else {
+            anyhow::bail!("unknown namespace index object {name}");
+        }
+    }
+    Ok(())
+}
+
+fn relational_entries_exist(connection: &Connection) -> anyhow::Result<bool> {
+    Ok(
+        connection.query_row("SELECT EXISTS(SELECT 1 FROM entries LIMIT 1)", [], |row| {
+            row.get::<_, bool>(0)
+        })?,
+    )
+}
+
+fn full_text_entries_exist(connection: &Connection) -> anyhow::Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entries_fts LIMIT 1)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
+fn validate_full_text_consistency(
+    connection: &Connection,
+    fts_present: bool,
+) -> anyhow::Result<()> {
+    if fts_present && relational_entries_exist(connection)? != full_text_entries_exist(connection)?
+    {
+        anyhow::bail!("namespace index relational and full-text data are inconsistent");
+    }
+    Ok(())
+}
+
+fn read_preparation_state(connection: &Connection) -> anyhow::Result<(bool, Option<String>)> {
+    let value = |key: &str| -> anyhow::Result<Option<String>> {
+        Ok(connection
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    };
+    let required = match value(INDEX_PREPARATION_REQUIRED_KEY)?.as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(value) => {
+            anyhow::bail!("invalid namespace index preparation marker {value:?}");
+        }
+    };
+    Ok((required, value(INDEX_PREPARATION_DETAIL_KEY)?))
+}
+
+fn set_preparation_state(connection: &Connection, detail: &str) -> anyhow::Result<()> {
+    connection.execute(
+        "INSERT OR REPLACE INTO index_meta(key, value) VALUES (?1, '1')",
+        [INDEX_PREPARATION_REQUIRED_KEY],
+    )?;
+    connection.execute(
+        "INSERT OR REPLACE INTO index_meta(key, value) VALUES (?1, ?2)",
+        params![INDEX_PREPARATION_DETAIL_KEY, detail],
+    )?;
+    Ok(())
+}
+
+fn clear_preparation_state(connection: &Connection) -> anyhow::Result<()> {
+    connection.execute(
+        "DELETE FROM index_meta WHERE key IN (?1, ?2)",
+        params![INDEX_PREPARATION_REQUIRED_KEY, INDEX_PREPARATION_DETAIL_KEY],
+    )?;
+    Ok(())
+}
+
+fn missing_index_detail(missing: &[&str]) -> String {
+    format!("missing namespace index objects: {}", missing.join(", "))
+}
+
+fn preparation_error_message(detail: Option<&str>) -> String {
+    match detail.filter(|detail| !detail.trim().is_empty()) {
+        Some(detail) => format!(
+            "namespace index preparation required; {detail}; stop the gateway and run `{INDEX_PREPARATION_COMMAND}`"
+        ),
+        None => format!(
+            "namespace index preparation required; stop the gateway and run `{INDEX_PREPARATION_COMMAND}`"
+        ),
+    }
+}
+
+/// Prepare the secondary and full-text namespace indexes for an existing
+/// inventory without starting the gateway or contacting OPC DA.
+pub fn prepare_index_database(path: &Path) -> anyhow::Result<IndexPreparationOutcome> {
+    let mut database = IndexDb::open(path)?;
+    database.prepare_indexes()
+}
+
 impl IndexDb {
     fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path
@@ -1045,25 +1283,6 @@ impl IndexDb {
                  FOREIGN KEY (server, generation)
                    REFERENCES generations(server, generation)
                    ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS entries_display_prefix
-               ON entries(server, generation, display_name_norm);
-             CREATE INDEX IF NOT EXISTS entries_item_prefix
-               ON entries(server, generation, item_id_norm);
-             CREATE INDEX IF NOT EXISTS entries_display_exact
-               ON entries(server, generation, display_name_norm, item_id_norm, item_id);
-             CREATE INDEX IF NOT EXISTS entries_item_exact
-               ON entries(
-                   server, generation, item_id_norm, length(display_name_norm),
-                   display_name_norm, item_id
-               );
-             CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-                 server UNINDEXED,
-                 generation UNINDEXED,
-                 item_id,
-                 display_name,
-                 breadcrumbs,
-                 tokenize = 'trigram'
              );",
         )?;
         if schema_version == Some(2) {
@@ -1081,18 +1300,36 @@ impl IndexDb {
                 [SCHEMA_VERSION.to_string()],
             )?;
         }
-        let relational_entries_exist =
-            connection.query_row("SELECT EXISTS(SELECT 1 FROM entries LIMIT 1)", [], |row| {
-                row.get::<_, bool>(0)
-            })?;
-        let full_text_entries_exist = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM entries_fts LIMIT 1)",
+        let (stored_preparation_required, stored_preparation_detail) =
+            read_preparation_state(&connection)?;
+        let inspection = inspect_index_objects(&connection)?;
+        validate_full_text_consistency(&connection, inspection.fts_present)?;
+        let populated = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations LIMIT 1)
+             OR EXISTS(SELECT 1 FROM entries LIMIT 1)",
             [],
             |row| row.get::<_, bool>(0),
         )?;
-        if relational_entries_exist != full_text_entries_exist {
-            anyhow::bail!("namespace index relational and full-text data are inconsistent");
-        }
+        let (preparation_required, preparation_detail) = if inspection.missing.is_empty() {
+            clear_preparation_state(&connection)?;
+            (false, None)
+        } else if populated {
+            let had_preparation_detail = stored_preparation_detail
+                .as_deref()
+                .is_some_and(|detail| !detail.trim().is_empty());
+            let detail = stored_preparation_detail
+                .filter(|detail| !detail.trim().is_empty())
+                .unwrap_or_else(|| missing_index_detail(&inspection.missing));
+            if !stored_preparation_required || !had_preparation_detail {
+                set_preparation_state(&connection, &detail)?;
+            }
+            (true, Some(detail))
+        } else {
+            create_missing_index_objects(&connection, &inspection.missing)?;
+            validate_full_text_consistency(&connection, true)?;
+            clear_preparation_state(&connection)?;
+            (false, None)
+        };
         let staging_servers = {
             let mut statement = connection
                 .prepare("SELECT DISTINCT server FROM generations WHERE state = 'staging'")?;
@@ -1132,6 +1369,8 @@ impl IndexDb {
         Ok(Self {
             path: path.to_path_buf(),
             connection,
+            preparation_required,
+            preparation_detail,
         })
     }
 
@@ -1139,10 +1378,88 @@ impl IndexDb {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "query_only", true)?;
+        let (stored_preparation_required, stored_preparation_detail) =
+            read_preparation_state(&connection)?;
+        let inspection = inspect_index_objects(&connection)?;
+        validate_full_text_consistency(&connection, inspection.fts_present)?;
         Ok(Self {
             path: path.to_path_buf(),
             connection,
+            preparation_required: stored_preparation_required || !inspection.missing.is_empty(),
+            preparation_detail: stored_preparation_detail.or_else(|| {
+                (!inspection.missing.is_empty()).then(|| missing_index_detail(&inspection.missing))
+            }),
         })
+    }
+
+    fn preparation_error(&self) -> Option<String> {
+        self.preparation_required
+            .then(|| preparation_error_message(self.preparation_detail.as_deref()))
+    }
+
+    fn require_prepared(&self) -> anyhow::Result<()> {
+        if let Some(error) = self.preparation_error() {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+
+    fn prepare_indexes(&mut self) -> anyhow::Result<IndexPreparationOutcome> {
+        let inspection = inspect_index_objects(&self.connection)?;
+        validate_full_text_consistency(&self.connection, inspection.fts_present)?;
+        if inspection.missing.is_empty() {
+            clear_preparation_state(&self.connection)?;
+            self.preparation_required = false;
+            self.preparation_detail = None;
+            return Ok(IndexPreparationOutcome::AlreadyPrepared);
+        }
+
+        let transaction = self.connection.transaction()?;
+        let result = (|| -> anyhow::Result<()> {
+            create_missing_index_objects(&transaction, &inspection.missing)?;
+            let prepared = inspect_index_objects(&transaction)?;
+            validate_full_text_consistency(&transaction, prepared.fts_present)?;
+            if !prepared.missing.is_empty() {
+                anyhow::bail!(
+                    "namespace index preparation did not create: {}",
+                    prepared.missing.join(", ")
+                );
+            }
+            clear_preparation_state(&transaction)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => match transaction.commit() {
+                Ok(()) => {
+                    self.preparation_required = false;
+                    self.preparation_detail = None;
+                    Ok(IndexPreparationOutcome::Prepared)
+                }
+                Err(error) => {
+                    self.preparation_required = true;
+                    let detail = format!("index preparation failed: {error:#}");
+                    self.preparation_detail = Some(detail.clone());
+                    if let Err(metadata_error) = set_preparation_state(&self.connection, &detail) {
+                        return Err(anyhow::anyhow!(
+                            "{error:#}; unable to record index preparation failure: {metadata_error:#}"
+                        ));
+                    }
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = transaction.rollback();
+                self.preparation_required = true;
+                let detail = format!("index preparation failed: {error:#}");
+                self.preparation_detail = Some(detail.clone());
+                if let Err(metadata_error) = set_preparation_state(&self.connection, &detail) {
+                    return Err(anyhow::anyhow!(
+                        "{error:#}; unable to record index preparation failure: {metadata_error:#}"
+                    ));
+                }
+                Err(error)
+            }
+        }
     }
 
     fn storage_diagnostics(&self) -> StorageDiagnostics {
@@ -2178,6 +2495,15 @@ fn cleanup_obsolete_generations_coordinated(
 ) -> anyhow::Result<CleanupStats> {
     let cleanup_started = Instant::now();
     let read_only = IndexDb::open_read_only(path)?;
+    if read_only.preparation_required {
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %path.display(),
+            server,
+            "skipped namespace index cleanup because index preparation is required"
+        );
+        return Ok(CleanupStats::default());
+    }
     if !read_only.has_obsolete_generations(server)? {
         tracing::debug!(
             process_id = std::process::id(),
@@ -2620,6 +2946,7 @@ pub struct IndexManager<C: OpcClient> {
     client: Arc<C>,
     settings: ResolvedIndexConfig,
     database: Arc<Mutex<Option<IndexDb>>>,
+    database_initialized: AtomicBool,
     coordination: Arc<DatabaseCoordination>,
     writer_gate: Arc<Mutex<()>>,
     build_changed: Arc<tokio::sync::Notify>,
@@ -2748,6 +3075,7 @@ impl<C: OpcClient> IndexManager<C> {
             client,
             settings,
             database: Arc::new(Mutex::new(None)),
+            database_initialized: AtomicBool::new(false),
             coordination: Arc::clone(&coordination),
             writer_gate: Arc::clone(&coordination.writer_gate),
             build_changed: Arc::clone(&coordination.build_changed),
@@ -3448,6 +3776,10 @@ impl<C: OpcClient> IndexManager<C> {
             runtime.last_error.as_deref(),
             promotion_read_error.as_deref(),
         );
+        if let Some(error) = self.database_preparation_error(is_promoting)? {
+            status.state = IndexState::Failed;
+            status.last_error = Some(error);
+        }
         status.foreground_metrics = self.foreground_metrics_snapshot(server);
         status.host_metrics = self.host_metrics.snapshot();
         status.storage = storage;
@@ -3478,7 +3810,19 @@ impl<C: OpcClient> IndexManager<C> {
                 }
             };
         }
-        Ok((self.with_database_read(|db| db.status_rows(server))?, None))
+        Ok((
+            self.with_database_read_unchecked(|db| db.status_rows(server))?,
+            None,
+        ))
+    }
+
+    fn database_preparation_error(&self, is_promoting: bool) -> anyhow::Result<Option<String>> {
+        if is_promoting && self.settings.database_path != Path::new(":memory:") {
+            return Ok(IndexDb::open_read_only(&self.settings.database_path)
+                .ok()
+                .and_then(|database| database.preparation_error()));
+        }
+        self.with_database_read_unchecked(|database| Ok(database.preparation_error()))
     }
 
     fn runtime_status(&self, server: &str) -> anyhow::Result<RuntimeStatus> {
@@ -3743,6 +4087,7 @@ impl<C: OpcClient> IndexManager<C> {
         force: bool,
     ) -> anyhow::Result<IndexStatus> {
         self.require_configured(server)?;
+        self.ensure_database_prepared()?;
         if self.background_tasks.is_shutting_down() {
             return self.status(server).await;
         }
@@ -4305,6 +4650,7 @@ impl<C: OpcClient> IndexManager<C> {
         action: IndexControlAction,
     ) -> anyhow::Result<IndexStatus> {
         self.require_configured(server)?;
+        self.ensure_database_prepared()?;
         self.apply_control_action(server, action)?;
         if !matches!(action, IndexControlAction::Cancel) {
             self.reconcile_pause_state(server);
@@ -4371,6 +4717,9 @@ impl<C: OpcClient> IndexManager<C> {
                 status: empty_status(server, false, IndexState::NotIndexed),
             });
         }
+        if self.settings.database_path == Path::new(":memory:") {
+            self.ensure_database_prepared()?;
+        }
         let limit = limit.max(1).min(self.settings.max_results);
         let status = self.status(server).await?;
         let normalized_query = normalize_query(query);
@@ -4422,6 +4771,7 @@ impl<C: OpcClient> IndexManager<C> {
                     let _ = release.blocking_recv();
                 }
                 let db = IndexDb::open_read_only(&database_path)?;
+                db.require_prepared()?;
                 db.search(&server_name, generation, &query_name, mode, limit)
             })
             .await??
@@ -5924,6 +6274,16 @@ impl<C: OpcClient> IndexManager<C> {
         Ok(())
     }
 
+    fn ensure_database_prepared(&self) -> anyhow::Result<()> {
+        if self.database_initialized.load(Ordering::Acquire)
+            && self.settings.database_path != Path::new(":memory:")
+        {
+            return IndexDb::open_read_only(&self.settings.database_path)
+                .and_then(|database| database.require_prepared());
+        }
+        self.with_database_read_unchecked(|database| database.require_prepared())
+    }
+
     #[cfg(test)]
     fn with_database<F, R>(&self, operation: F) -> anyhow::Result<R>
     where
@@ -5933,6 +6293,16 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn with_database_read<F, R>(&self, operation: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut IndexDb) -> anyhow::Result<R>,
+    {
+        self.with_database_read_unchecked(|database| {
+            database.require_prepared()?;
+            operation(database)
+        })
+    }
+
+    fn with_database_read_unchecked<F, R>(&self, operation: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut IndexDb) -> anyhow::Result<R>,
     {
@@ -5981,10 +6351,18 @@ impl<C: OpcClient> IndexManager<C> {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
             let cleanup_servers = self.initialize_database(&mut database)?;
-            (
-                operation(database.as_mut().expect("database initialized")),
-                cleanup_servers,
-            )
+            let result = database
+                .as_ref()
+                .expect("database initialized")
+                .require_prepared();
+            if let Err(error) = result {
+                (Err(error), cleanup_servers)
+            } else {
+                (
+                    operation(database.as_mut().expect("database initialized")),
+                    cleanup_servers,
+                )
+            }
         };
         for server in cleanup_servers {
             self.schedule_cleanup(&server);
@@ -6000,6 +6378,7 @@ impl<C: OpcClient> IndexManager<C> {
                 "initializing namespace index database handle"
             );
             *database = Some(IndexDb::open(&self.settings.database_path)?);
+            self.database_initialized.store(true, Ordering::Release);
             Ok(database
                 .as_ref()
                 .expect("database initialized")
@@ -7322,6 +7701,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .compatibility_fallback
+        );
+        assert_eq!(
+            migrated.prepare_indexes().unwrap(),
+            IndexPreparationOutcome::Prepared
         );
 
         let generation = migrated
