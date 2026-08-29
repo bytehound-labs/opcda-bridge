@@ -22,7 +22,7 @@ fs2 = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 # Pin the native OPC DA client revision that provides bounded inventory diagnostics and
 # reason-aware cancellation while preserving the gateway's public protocol.
-opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "6f68b7bdbb95232e9dfb75dfeaf1a25bdcf88179", version = "0.2.8" }
+opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "89e39bee82e577e6b56c6f962e64f0c5d4b5f71a", version = "0.2.8" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
 prost = "0.14"
