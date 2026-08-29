@@ -1050,6 +1050,13 @@ impl IndexDb {
                ON entries(server, generation, display_name_norm);
              CREATE INDEX IF NOT EXISTS entries_item_prefix
                ON entries(server, generation, item_id_norm);
+             CREATE INDEX IF NOT EXISTS entries_display_exact
+               ON entries(server, generation, display_name_norm, item_id_norm, item_id);
+             CREATE INDEX IF NOT EXISTS entries_item_exact
+               ON entries(
+                   server, generation, item_id_norm, length(display_name_norm),
+                   display_name_norm, item_id
+               );
              CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
                  server UNINDEXED,
                  generation UNINDEXED,
@@ -1655,13 +1662,75 @@ impl IndexDb {
         normalized_query: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<IndexedMatch>> {
-        self.search_indexed(
-            server,
-            generation,
-            normalized_query,
-            limit,
-            IndexedSearchKind::Exact,
-        )
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
+        let candidate_limit = i64::from(limit.saturating_add(1));
+        let candidate_limit_usize = usize::try_from(candidate_limit).unwrap_or(usize::MAX);
+        let mut candidates: HashMap<String, (SearchCandidate, IndexedMatch)> = HashMap::new();
+
+        let exact_queries = [
+            "SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.display_name_norm = ?3
+             ORDER BY e.item_id_norm, e.item_id
+             LIMIT ?4",
+            "SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.item_id_norm = ?3
+               AND e.display_name_norm <> ?3
+             ORDER BY length(e.display_name_norm), e.display_name_norm,
+                      e.item_id_norm, e.item_id
+             LIMIT ?4",
+        ];
+        for (query_index, sql) in exact_queries.iter().enumerate() {
+            if query_index == 1 && candidates.len() >= candidate_limit_usize {
+                break;
+            }
+            let mut statement = self.connection.prepare(sql)?;
+            let query_params = params![server, generation, normalized_query, candidate_limit];
+            let row_mapper = |row: &rusqlite::Row<'_>| {
+                let item_id = row.get::<_, String>(0)?;
+                let display_name = row.get::<_, String>(1)?;
+                let display_name_norm = row.get::<_, String>(2)?;
+                let item_id_norm = row.get::<_, String>(3)?;
+                let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
+                let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
+                let candidate = SearchCandidate {
+                    rank: SearchRank {
+                        tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
+                        display_name_len: display_name_norm.chars().count(),
+                        display_name_norm,
+                        item_id_norm,
+                    },
+                    item_id: item_id.clone(),
+                };
+                Ok((
+                    candidate,
+                    IndexedMatch {
+                        item_id,
+                        display_name,
+                        kind,
+                        breadcrumbs,
+                    },
+                ))
+            };
+            let rows = statement.query_map(query_params, row_mapper)?;
+            let rows = rows.collect::<Result<Vec<_>, _>>()?;
+            for (candidate, value) in rows {
+                candidates
+                    .entry(value.item_id.clone())
+                    .or_insert((candidate, value));
+            }
+        }
+
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
+        Ok(candidates.into_iter().map(|(_, value)| value).collect())
     }
 
     fn search_indexed(
@@ -1679,13 +1748,6 @@ impl IndexDb {
 
         for column in ["display_name_norm", "item_id_norm"] {
             let (range, order, limit_parameter) = match kind {
-                IndexedSearchKind::Exact => (
-                    format!("e.{column} = ?3"),
-                    "length(e.display_name_norm), e.display_name_norm,
-                     e.item_id_norm, e.item_id"
-                        .to_string(),
-                    4,
-                ),
                 IndexedSearchKind::Prefix(Some(_)) => (
                     format!("e.{column} >= ?3 AND e.{column} < ?4"),
                     "CASE
@@ -1761,7 +1823,7 @@ impl IndexDb {
                     ],
                     &row_mapper,
                 ),
-                IndexedSearchKind::Exact | IndexedSearchKind::Prefix(None) => statement.query_map(
+                IndexedSearchKind::Prefix(None) => statement.query_map(
                     params![server, generation, normalized_query, candidate_limit],
                     &row_mapper,
                 ),
@@ -1853,7 +1915,6 @@ impl IndexDb {
 
 #[derive(Clone, Copy)]
 enum IndexedSearchKind<'a> {
-    Exact,
     Prefix(Option<&'a str>),
 }
 
@@ -9415,6 +9476,91 @@ mod tests {
                 .map(|value| value.item_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["a-display", "pump", "z-display"]
+        );
+    }
+
+    #[test]
+    fn exact_search_bounds_common_display_name_matches_with_equality_indexes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("broad-exact-search.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        let entries = (0..10_000)
+            .map(|index| inventory_entry("PV", &format!("Area.{index:05}.PV")))
+            .collect::<Vec<_>>();
+        db.insert_entries("S", generation, &entries).unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+
+        let plan_for = |sql: &str| {
+            db.connection
+                .prepare(sql)
+                .unwrap()
+                .query_map(params!["S", generation as i64, "pv", 4_i64], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let display_plan = plan_for(
+            "EXPLAIN QUERY PLAN
+             SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.display_name_norm = ?3
+             ORDER BY e.item_id_norm, e.item_id
+             LIMIT ?4",
+        );
+        assert!(
+            display_plan
+                .iter()
+                .any(|detail| detail.contains("entries_display_exact"))
+        );
+        assert!(
+            display_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE"))
+        );
+
+        let item_plan = plan_for(
+            "EXPLAIN QUERY PLAN
+             SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.item_id_norm = ?3
+               AND e.display_name_norm <> ?3
+             ORDER BY length(e.display_name_norm), e.display_name_norm,
+                      e.item_id_norm, e.item_id
+             LIMIT ?4",
+        );
+        assert!(
+            item_plan
+                .iter()
+                .any(|detail| detail.contains("entries_item_exact"))
+        );
+        assert!(
+            item_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE"))
+        );
+
+        let matches = db.search("S", generation, "PV", 1, 3).unwrap();
+        assert_eq!(matches.len(), 4);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Area.00000.PV",
+                "Area.00001.PV",
+                "Area.00002.PV",
+                "Area.00003.PV"
+            ]
         );
     }
 

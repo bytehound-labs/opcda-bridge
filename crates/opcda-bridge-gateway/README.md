@@ -78,11 +78,13 @@ Independent in-memory databases are isolated from the registry and do not create
 build-lock sidecars.
 Uncached indexed searches use a separate read-only SQLite connection and rank only bounded
 candidate sets in memory, so a broad query cannot hold the coordinator's foreground database
-mutex while it scans the FTS index. Exact searches use separate equality lookups on the
-normalized display-name and ItemID indexes, and prefix searches use separate lexicographic range
-probes over those same indexes; each probe is bounded to `limit + 1` rows before candidates are
-merged and deduplicated for ranking. Prefix bounds handle Unicode scalar boundaries, including the
-surrogate gap and the maximum scalar value. Contains searches use the trigram FTS index. Status,
+mutex while it scans the FTS index. Exact searches use separate equality lookups on ordered
+normalized display-name and ItemID indexes, exclude display-name matches from the lower-priority
+ItemID lookup, then merge and deduplicate those candidates before ranking; this avoids sorting a
+whole common-name result set before applying the limit. Prefix searches use separate
+lexicographic range probes over those same indexes; each probe is bounded to `limit + 1` rows.
+Prefix bounds handle Unicode scalar boundaries, including the surrogate gap and the maximum
+scalar value. Contains searches use the trigram FTS index. Status,
 discovery, reads, writes, and lazy browse therefore remain available while search work is in
 progress. Matching is case-insensitive with exact/prefix/contains ranking, and
 responses report when additional results exist beyond the requested limit. During promotion,
