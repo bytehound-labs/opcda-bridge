@@ -70,7 +70,8 @@ a working opcda-bridge, not a redesign of it.
   Exact searches must use separate equality lookups on the normalized display-name and ItemID
   indexes, and prefix searches must use separate lexicographic range probes over those indexes;
   each probe is bounded to `limit + 1` rows, then candidates are merged and deduplicated before
-  ranking. They must not reintroduce a broad `OR`/`LIKE` ordering scan over the generation. Search
+  ranking. Prefix upper bounds must handle the Unicode surrogate gap and maximum scalar value.
+  They must not reintroduce a broad `OR`/`LIKE` ordering scan over the generation. Search
   must never make status,
   discovery, reads, writes, or lazy browse wait on a broad query; during promotion it must use the
   active generation from the promotion-safe status read rather than call back through the writable

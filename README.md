@@ -246,8 +246,9 @@ config file — see [Configuration](#configuration) below.
   broad searches out of the foreground database mutex. Exact searches use separate equality
   lookups on the normalized display-name and ItemID indexes, and prefix searches use separate
   lexicographic range probes over those indexes. Each probe is bounded to `limit + 1` rows, then
-  candidates are merged and deduplicated before ranking; contains searches use the trigram FTS
-  index.
+  candidates are merged and deduplicated before ranking; prefix bounds handle Unicode scalar
+  boundaries, including the surrogate gap and the maximum scalar value; contains searches use the
+  trigram FTS index.
   During promotion, searches reuse the active generation reported by promotion-safe status rather
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
