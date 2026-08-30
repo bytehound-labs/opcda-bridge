@@ -178,6 +178,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytehound-opc-da-client"
+version = "0.2.8"
+source = "git+https://github.com/bytehound-labs/opc-cli.git?rev=b7fcff97d059effd1bd6d5934d2e20277b970bb3#b7fcff97d059effd1bd6d5934d2e20277b970bb3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows",
+ "windows-core 0.61.2",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -802,7 +818,7 @@ checksum = "eb41dd102b81a8c616f37e45ea5ce61c4be3234a743d13eaf372c93fa4b063de"
 dependencies = [
  "anyhow",
  "async-trait",
- "bytehound-opc-da-client",
+ "bytehound-opc-da-client 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "clap",
  "opcda-bridge-proto 0.3.2",
  "serde",
@@ -824,7 +840,7 @@ version = "0.4.21"
 dependencies = [
  "anyhow",
  "async-trait",
- "bytehound-opc-da-client",
+ "bytehound-opc-da-client 0.2.8 (git+https://github.com/bytehound-labs/opc-cli.git?rev=b7fcff97d059effd1bd6d5934d2e20277b970bb3)",
  "chrono",
  "clap",
  "fs2",

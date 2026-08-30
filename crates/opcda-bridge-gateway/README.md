@@ -21,6 +21,10 @@ endpoint and supports older clients.
 The gateway must run on the Windows machine hosting the OPC DA server. See the repository README
 for service installation, configuration, and firewall setup.
 
+Development branches may pin a compatible, unreleased `bytehound-opc-da-client` revision while
+the native client and gateway are tested together. A packaged or published gateway must use the
+corresponding released client version instead.
+
 Tag browsing uses native one-level OPC DA enumeration with bounded pages. The gateway owns opaque
 browse sessions and continuation tokens, preserves exact ItemIDs separately from display names,
 and reports whether a page is complete. Only selectable item and branch-and-item nodes expose
