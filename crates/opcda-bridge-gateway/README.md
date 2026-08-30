@@ -100,8 +100,11 @@ in one transaction, validates them before commit, and records a retryable failur
 if it cannot complete. Empty databases prepare automatically, and status remains inspectable while
 preparation is required. Unexpected existing index definitions fail initialization, and
 inconsistent full-text data is quarantined rather than served as a potentially incomplete cache;
-validation checks both row counts and the stored server/generation/item/display/breadcrumb values,
-so partial, duplicate, or same-sized replacement rows cannot pass as a consistent index.
+validation checks both row counts and the stored server/generation/item/display values plus
+normalized breadcrumb values. Relational breadcrumbs are JSON arrays while the FTS copy uses
+space-separated searchable text; both that representation and legacy JSON-form FTS rows are
+normalized before comparison, so partial, duplicate, or same-sized replacement rows cannot pass
+as a consistent index.
 Refresh setup is staged before the asynchronous build task is launched. If startup, capability
 negotiation, generation creation, task launch, or shutdown fails at that boundary, the
 provisional generation is abandoned and its build reservation is released while the last

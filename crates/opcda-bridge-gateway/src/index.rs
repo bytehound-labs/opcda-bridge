@@ -90,8 +90,20 @@ const FTS_CREATE_SQL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USI
 const FTS_POPULATE_SQL: &str = "INSERT INTO entries_fts(
     server, generation, item_id, display_name, breadcrumbs
 )
-SELECT server, generation, item_id, display_name, breadcrumbs
-FROM entries";
+SELECT
+    e.server,
+    e.generation,
+    e.item_id,
+    e.display_name,
+    COALESCE((
+        SELECT group_concat(value, ' ')
+        FROM (
+            SELECT value
+            FROM json_each(e.breadcrumbs)
+            ORDER BY key
+        )
+    ), '')
+FROM entries AS e";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexState {
@@ -1075,23 +1087,97 @@ fn validate_full_text_consistency(
     })?;
     let rows_match = relational_count == full_text_count
         && !connection.query_row(
-            "SELECT EXISTS(
+            "WITH expected AS (
+                 SELECT
+                     e.server,
+                     e.generation,
+                     e.item_id,
+                     e.display_name,
+                     COALESCE((
+                         SELECT group_concat(value, ' ')
+                         FROM (
+                             SELECT value
+                             FROM json_each(e.breadcrumbs)
+                             ORDER BY key
+                         )
+                     ), '') AS breadcrumbs
+                 FROM entries AS e
+             ),
+             actual AS (
+                 SELECT
+                     f.server,
+                     f.generation,
+                     f.item_id,
+                     f.display_name,
+                     CASE
+                         WHEN substr(ltrim(f.breadcrumbs), 1, 1) = '['
+                              AND json_valid(f.breadcrumbs)
+                         THEN COALESCE((
+                             SELECT group_concat(value, ' ')
+                             FROM (
+                                 SELECT value
+                                 FROM json_each(f.breadcrumbs)
+                                 ORDER BY key
+                             )
+                         ), '')
+                         ELSE f.breadcrumbs
+                     END AS breadcrumbs
+                 FROM entries_fts AS f
+             )
+             SELECT EXISTS(
                  SELECT server, generation, item_id, display_name, breadcrumbs
-                 FROM entries
+                 FROM expected
                  EXCEPT
                  SELECT server, generation, item_id, display_name, breadcrumbs
-                 FROM entries_fts
+                 FROM actual
              )",
             [],
             |row| row.get::<_, bool>(0),
         )?
         && !connection.query_row(
-            "SELECT EXISTS(
+            "WITH expected AS (
+                 SELECT
+                     e.server,
+                     e.generation,
+                     e.item_id,
+                     e.display_name,
+                     COALESCE((
+                         SELECT group_concat(value, ' ')
+                         FROM (
+                             SELECT value
+                             FROM json_each(e.breadcrumbs)
+                             ORDER BY key
+                         )
+                     ), '') AS breadcrumbs
+                 FROM entries AS e
+             ),
+             actual AS (
+                 SELECT
+                     f.server,
+                     f.generation,
+                     f.item_id,
+                     f.display_name,
+                     CASE
+                         WHEN substr(ltrim(f.breadcrumbs), 1, 1) = '['
+                              AND json_valid(f.breadcrumbs)
+                         THEN COALESCE((
+                             SELECT group_concat(value, ' ')
+                             FROM (
+                                 SELECT value
+                                 FROM json_each(f.breadcrumbs)
+                                 ORDER BY key
+                             )
+                         ), '')
+                         ELSE f.breadcrumbs
+                     END AS breadcrumbs
+                 FROM entries_fts AS f
+             )
+             SELECT EXISTS(
                  SELECT server, generation, item_id, display_name, breadcrumbs
-                 FROM entries_fts
+                 FROM actual
                  EXCEPT
                  SELECT server, generation, item_id, display_name, breadcrumbs
-                 FROM entries
+                 FROM expected
              )",
             [],
             |row| row.get::<_, bool>(0),
@@ -7743,6 +7829,64 @@ mod tests {
         assert_eq!(
             prepare_index_database(&database.path).unwrap(),
             IndexPreparationOutcome::AlreadyPrepared
+        );
+    }
+
+    #[test]
+    fn full_text_preparation_and_validation_normalize_breadcrumbs() {
+        let database = populated_database_without_expensive_indexes("breadcrumb-format");
+        let mut db = IndexDb::open(&database.path).unwrap();
+        db.connection
+            .execute("UPDATE entries SET breadcrumbs = '[\"Area\",\"Loop\"]'", [])
+            .unwrap();
+
+        assert_eq!(
+            db.prepare_indexes().unwrap(),
+            IndexPreparationOutcome::Prepared
+        );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT breadcrumbs FROM entries_fts", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "Area Loop"
+        );
+
+        db.connection
+            .execute(
+                "UPDATE entries_fts SET breadcrumbs = '[\"Area\",\"Loop\"]'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = IndexDb::open(&database.path).unwrap();
+        assert_eq!(reopened.status_rows("S").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_text_validation_rejects_malformed_relational_breadcrumbs() {
+        let database = TestDatabase::new("malformed-breadcrumbs");
+        let mut db = IndexDb::open(&database.path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries("S", generation, &[inventory_entry("Tag", "S.Tag")])
+            .unwrap();
+        drop(db);
+
+        let connection = Connection::open(&database.path).unwrap();
+        connection
+            .execute(
+                "UPDATE entries SET breadcrumbs = 'not-json' WHERE server = 'S'",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            validate_full_text_consistency(&connection, true).is_err(),
+            "malformed relational breadcrumbs must not be treated as consistent FTS data"
         );
     }
 

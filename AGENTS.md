@@ -57,6 +57,11 @@ a working opcda-bridge, not a redesign of it.
   validates the resulting objects, and leaves a retryable failure detail when preparation fails.
   The stop-gateway requirement is the operational mitigation for the accepted point-in-time race
   between inspection and index creation if another process opens the database after inspection.
+- **FTS breadcrumbs have two storage representations.** Relational `entries.breadcrumbs` stores
+  the canonical JSON array, while `entries_fts.breadcrumbs` stores its space-separated searchable
+  form. Full-text consistency validation must normalize both current flattened rows and legacy
+  JSON-form rows before comparing them; it must still reject missing, duplicate, or mismatched
+  identity/content rows.
 - **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
   limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
   OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
