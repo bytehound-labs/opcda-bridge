@@ -1059,28 +1059,44 @@ fn create_missing_index_objects(
     Ok(())
 }
 
-fn relational_entries_exist(connection: &Connection) -> anyhow::Result<bool> {
-    Ok(
-        connection.query_row("SELECT EXISTS(SELECT 1 FROM entries LIMIT 1)", [], |row| {
-            row.get::<_, bool>(0)
-        })?,
-    )
-}
-
-fn full_text_entries_exist(connection: &Connection) -> anyhow::Result<bool> {
-    Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM entries_fts LIMIT 1)",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?)
-}
-
 fn validate_full_text_consistency(
     connection: &Connection,
     fts_present: bool,
 ) -> anyhow::Result<()> {
-    if fts_present && relational_entries_exist(connection)? != full_text_entries_exist(connection)?
-    {
+    if !fts_present {
+        return Ok(());
+    }
+
+    let relational_count = connection.query_row("SELECT COUNT(*) FROM entries", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let full_text_count = connection.query_row("SELECT COUNT(*) FROM entries_fts", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let rows_match = relational_count == full_text_count
+        && !connection.query_row(
+            "SELECT EXISTS(
+                 SELECT server, generation, item_id, display_name, breadcrumbs
+                 FROM entries
+                 EXCEPT
+                 SELECT server, generation, item_id, display_name, breadcrumbs
+                 FROM entries_fts
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?
+        && !connection.query_row(
+            "SELECT EXISTS(
+                 SELECT server, generation, item_id, display_name, breadcrumbs
+                 FROM entries_fts
+                 EXCEPT
+                 SELECT server, generation, item_id, display_name, breadcrumbs
+                 FROM entries
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if !rows_match {
         anyhow::bail!("namespace index relational and full-text data are inconsistent");
     }
     Ok(())
@@ -7863,6 +7879,77 @@ mod tests {
                 .unwrap()
                 .filter_map(Result::ok)
                 .any(|entry| entry.file_name().to_string_lossy().contains("quarantine-"))
+        );
+    }
+
+    #[test]
+    fn sqlite_quarantines_partial_or_mismatched_full_text_data() {
+        let directory = tempdir().unwrap();
+        let partial_path = directory.path().join("fts-partial.sqlite3");
+        let mut partial = IndexDb::open(&partial_path).unwrap();
+        let partial_generation = partial
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        partial
+            .insert_entries(
+                "S",
+                partial_generation,
+                &[
+                    inventory_entry("First", "S.First"),
+                    inventory_entry("Second", "S.Second"),
+                ],
+            )
+            .unwrap();
+        partial
+            .promote("S", partial_generation, "2", &completed_progress(2))
+            .unwrap();
+        partial
+            .connection
+            .execute("DELETE FROM entries_fts WHERE item_id = 'S.Second'", [])
+            .unwrap();
+        drop(partial);
+
+        let recovered = IndexDb::open(&partial_path).unwrap();
+        assert!(recovered.status_rows("S").unwrap().is_empty());
+
+        let mismatch_path = directory.path().join("fts-mismatch.sqlite3");
+        let mut mismatch = IndexDb::open(&mismatch_path).unwrap();
+        let mismatch_generation = mismatch
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        mismatch
+            .insert_entries(
+                "S",
+                mismatch_generation,
+                &[
+                    inventory_entry("First", "S.First"),
+                    inventory_entry("Second", "S.Second"),
+                ],
+            )
+            .unwrap();
+        mismatch
+            .promote("S", mismatch_generation, "2", &completed_progress(2))
+            .unwrap();
+        mismatch
+            .connection
+            .execute(
+                "UPDATE entries_fts SET item_id = 'S.Replaced' WHERE item_id = 'S.Second'",
+                [],
+            )
+            .unwrap();
+        drop(mismatch);
+
+        let recovered = IndexDb::open(&mismatch_path).unwrap();
+        assert!(recovered.status_rows("S").unwrap().is_empty());
+        assert!(
+            directory
+                .path()
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("quarantine-"))
+                .count()
+                >= 2
         );
     }
 

@@ -99,7 +99,9 @@ starting the gateway or contacting OPC DA. Preparation creates and populates the
 in one transaction, validates them before commit, and records a retryable failure marker
 if it cannot complete. Empty databases prepare automatically, and status remains inspectable while
 preparation is required. Unexpected existing index definitions fail initialization, and
-inconsistent full-text data is quarantined rather than served as a potentially incomplete cache.
+inconsistent full-text data is quarantined rather than served as a potentially incomplete cache;
+validation checks both row counts and the stored server/generation/item/display/breadcrumb values,
+so partial, duplicate, or same-sized replacement rows cannot pass as a consistent index.
 Refresh setup is staged before the asynchronous build task is launched. If startup, capability
 negotiation, generation creation, task launch, or shutdown fails at that boundary, the
 provisional generation is abandoned and its build reservation is released while the last
@@ -112,7 +114,9 @@ Diagnostic logs identify inventory startup boundaries, pause and foreground tran
 health/controller state transitions at the default informational level. Maintenance and pacing
 waits, health-probe details, and bounded native-operation entry/return records — including browse
 paths, item names, durations, iterator results, and failures — are debug-level diagnostics to
-avoid high-volume production logs.
+avoid high-volume production logs. Successful foreground browse-page completions are also
+debug-level records, so a large indexed traversal does not fill the normal production log with
+one entry per page.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the

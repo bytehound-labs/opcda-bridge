@@ -233,7 +233,9 @@ config file — see [Configuration](#configuration) below.
   interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
   generations do not make a newer active generation appear failed. If relational index rows and
   the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache
-  is quarantined rather than serving silently incomplete substring results.
+  is quarantined rather than serving silently incomplete substring results. Validation compares
+  both row counts and the stored server/generation/item/display/breadcrumb values, detecting
+  partial, duplicate, and same-sized replacement FTS rows.
   Status combines the persisted generation snapshot with runtime build, health, storage,
   foreground, and scheduler diagnostics. During promotion, persisted status is read through a
   read-only connection; a runtime error overrides the reported state only when no build is active.

@@ -781,7 +781,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
             }),
         );
         let (session_id, page) = result?;
-        tracing::info!(
+        tracing::debug!(
             server = %req.server,
             session = %session_id,
             count = page.nodes.len(),
