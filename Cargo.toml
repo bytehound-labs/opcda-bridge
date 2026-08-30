@@ -21,7 +21,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs2 = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 # Pin the focused native OPC DA client candidate while the combined change is validated.
-opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "0b1b163f4ff96600a794e5071a71c19424e58133", version = "0.2.8" }
+opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "5f43d9d0287322193ef73fdeca2c57a100c57644", version = "0.2.8" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
 prost = "0.14"
