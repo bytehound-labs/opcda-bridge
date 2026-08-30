@@ -5577,7 +5577,7 @@ impl<C: OpcClient> IndexManager<C> {
             !windows.is_empty() && !maintenance_window_active(windows, Local::now());
         self.set_pause_overlay(server, Some(outside_window), None);
         if outside_window {
-            tracing::info!(
+            tracing::debug!(
                 server,
                 windows = windows.len(),
                 "namespace inventory waiting for an active maintenance window"
@@ -5591,7 +5591,7 @@ impl<C: OpcClient> IndexManager<C> {
             self.set_pause_overlay(server, Some(outside_window), None);
         }
         if !windows.is_empty() {
-            tracing::info!(server, "namespace inventory maintenance window is active");
+            tracing::debug!(server, "namespace inventory maintenance window is active");
         }
         true
     }
