@@ -73,10 +73,13 @@ a working opcda-bridge, not a redesign of it.
   Event-delivery waits use the configured operation timeout and label timeout-triggered native
   cancellation as `inventory_event_timeout`.
 - **Native inventory rate limits are charged once by operation cost.** DA2 operations cost one
-  item and DA3 page operations cost the requested page size. Gateway-to-client pacing must leave
-  the client's minimum interval at zero unless an independent delay is intentional; deriving a
-  batch-size interval in the gateway throttles every DA2 operation as if it were a full page and
-  double-counts the same item-rate limit.
+  item and DA3 page operations cost the requested page size. The native client is the sole
+  item-rate authority; the gateway must not add a burst/token limiter or derive a batch-size
+  interval. Gateway-to-client pacing must leave the client's minimum interval at zero unless an
+  independent delay is intentional, because a second limiter double-counts the same item-rate
+  limit and prevents adaptive updates from taking effect consistently. The legacy
+  `index.burst_size` setting remains accepted for configuration/source compatibility but is
+  intentionally ignored.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate

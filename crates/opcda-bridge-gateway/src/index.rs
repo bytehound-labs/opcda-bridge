@@ -326,7 +326,6 @@ struct BuildRunState {
     terminal: bool,
     accounted_active_time_ms: u64,
     persisted_item_count: u64,
-    rate_limiter: ItemRateLimiter,
     controller: Option<AdaptiveIndexController>,
     effective_duty_cycle_percent: u8,
     last_commit_at: Instant,
@@ -355,7 +354,6 @@ impl BuildRunState {
             terminal: false,
             accounted_active_time_ms: 0,
             persisted_item_count: 0,
-            rate_limiter: ItemRateLimiter::new(settings.item_rate_limit, settings.burst_size),
             controller,
             effective_duty_cycle_percent: settings.duty_cycle_percent,
             last_commit_at: Instant::now(),
@@ -745,48 +743,6 @@ struct QueryCache {
     values: HashMap<CacheKey, IndexedSearch>,
     order: VecDeque<CacheKey>,
     capacity: usize,
-}
-
-struct ItemRateLimiter {
-    rate: f64,
-    capacity: f64,
-    tokens: f64,
-    last_refill: Instant,
-}
-
-impl ItemRateLimiter {
-    fn new(rate: u32, burst_size: u32) -> Self {
-        let capacity = f64::from(burst_size.max(1));
-        Self {
-            rate: f64::from(rate),
-            capacity,
-            tokens: capacity,
-            last_refill: Instant::now(),
-        }
-    }
-
-    async fn acquire(&mut self, control: &Arc<dyn InventoryControl>) -> bool {
-        if self.rate <= 0.0 {
-            return !control.is_cancelled();
-        }
-        loop {
-            if control.is_cancelled() {
-                return false;
-            }
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-            self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
-            self.last_refill = now;
-            if self.tokens >= 1.0 {
-                self.tokens -= 1.0;
-                return true;
-            }
-            let wait = Duration::from_secs_f64((1.0 - self.tokens) / self.rate);
-            if !wait_with_cancellation(control, wait).await {
-                return false;
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5127,7 +5083,7 @@ impl<C: OpcClient> IndexManager<C> {
         state: &mut BuildRunState,
         entry: InventoryEntry,
     ) -> BuildEventOutcome {
-        if !state.rate_limiter.acquire(control).await {
+        if control.is_cancelled() {
             return BuildEventOutcome::Cancelled;
         }
         state.pending.push(entry);
@@ -7292,29 +7248,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limiter_and_wait_helpers_honor_cancellation() {
+    async fn wait_helper_honors_cancellation() {
         let control_impl = Arc::new(TestInventoryControl::default());
         let control: Arc<dyn InventoryControl> = control_impl.clone();
         control_impl.pause();
         control_impl.resume();
 
-        let mut disabled = ItemRateLimiter::new(0, 0);
-        assert!(disabled.acquire(&control).await);
+        assert!(wait_with_cancellation(&control, Duration::ZERO).await);
         control_impl.cancel();
-        assert!(!disabled.acquire(&control).await);
-
-        let active_impl = Arc::new(TestInventoryControl::default());
-        let active: Arc<dyn InventoryControl> = active_impl.clone();
-        assert!(wait_with_cancellation(&active, Duration::ZERO).await);
-        active_impl.cancel();
-        let mut cancelled_limiter = ItemRateLimiter::new(1, 1);
-        assert!(!cancelled_limiter.acquire(&active).await);
-
-        let active_impl = Arc::new(TestInventoryControl::default());
-        let active: Arc<dyn InventoryControl> = active_impl.clone();
-        let mut limited = ItemRateLimiter::new(10_000, 1);
-        assert!(limited.acquire(&active).await);
-        assert!(limited.acquire(&active).await);
+        assert!(!wait_with_cancellation(&control, Duration::ZERO).await);
 
         let waiting_impl = Arc::new(TestInventoryControl::default());
         let waiting: Arc<dyn InventoryControl> = waiting_impl.clone();
@@ -11688,18 +11630,6 @@ mod tests {
                 .wait_for_maintenance(&delayed_trait, "S", &[inactive])
                 .await
         );
-        cancel_task.await.unwrap();
-
-        let rate_control = Arc::new(RecordingInventoryControl::default());
-        let rate_trait: Arc<dyn InventoryControl> = rate_control.clone();
-        let mut limiter = ItemRateLimiter::new(1, 1);
-        assert!(limiter.acquire(&rate_trait).await);
-        let canceller = Arc::clone(&rate_control);
-        let cancel_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            canceller.cancel();
-        });
-        assert!(!limiter.acquire(&rate_trait).await);
         cancel_task.await.unwrap();
 
         let progress_control = Arc::new(RecordingInventoryControl::default());

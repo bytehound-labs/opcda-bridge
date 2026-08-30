@@ -109,10 +109,10 @@ requests received before inventory startup returns its control handle are retain
 once the handle is available.
 Cancellation requests carry a source label through the gateway adapter into the native client.
 Diagnostic logs identify inventory startup boundaries, pause and foreground transitions, and
-health/controller decisions at the default informational level. Maintenance and pacing waits,
-health-probe details, and bounded native-operation entry/return records — including browse paths,
-item names, durations, iterator results, and failures — are debug-level diagnostics to avoid
-high-volume production logs.
+health/controller state transitions at the default informational level. Maintenance and pacing
+waits, health-probe details, and bounded native-operation entry/return records — including browse
+paths, item names, durations, iterator results, and failures — are debug-level diagnostics to
+avoid high-volume production logs.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the
@@ -125,8 +125,9 @@ Native inventory batches are bounded to 1,000 entries by the OPC DA client contr
 Native inventory slicing and SQLite commit batching are independently bounded, and adaptive
 controller decisions update the native slice batch size and item-rate limit; native operation
 cost applies the rate once (one item for DA2 operations and the requested page size for DA3),
-without an additional batch-size delay before every operation. The commit interval provides a
-time limit for low-volume inventories. Runtime status includes rolling
+without a gateway-side burst/token limiter or an additional batch-size delay before every
+operation. The commit interval provides a time limit for low-volume inventories. Runtime status
+includes rolling
 foreground latency/error/quality metrics, host/storage availability, and persisted scheduler
 backoff diagnostics.
 If the native client rejects an initial or adaptive pacing update, the build fails visibly and

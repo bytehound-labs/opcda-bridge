@@ -117,6 +117,8 @@ pub struct IndexConfig {
     pub commit_interval_ms: Option<u64>,
     pub batch_size: Option<u32>,
     pub item_rate_limit: Option<u32>,
+    /// Deprecated compatibility setting. Native operation-cost pacing is authoritative,
+    /// so this value is retained but ignored.
     pub burst_size: Option<u32>,
     pub duty_cycle_percent: Option<u8>,
     /// Enable adaptive AIMD control for inventory pacing.
@@ -166,6 +168,8 @@ pub struct ResolvedIndexConfig {
     pub commit_interval_ms: u64,
     pub batch_size: u32,
     pub item_rate_limit: u32,
+    /// Deprecated compatibility value retained for callers that still construct this
+    /// configuration. It has no runtime effect.
     pub burst_size: u32,
     pub duty_cycle_percent: u8,
     pub adaptive: bool,

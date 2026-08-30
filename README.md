@@ -272,10 +272,11 @@ config file — see [Configuration](#configuration) below.
   tag; an unhealthy server pauses the build with bounded exponential backoff, while a healthy
   recovery resumes it with the configured pacing. Without a sentinel tag, the health status is
   reported as `Unavailable` while capability and latency checks can still permit the build.
-  The configured item rate is enforced by native-operation cost: DA2 operations cost one item,
-  while a DA3 page is charged by the number of entries requested. The slice batch size selects
-  the page size but does not add a separate delay before every native operation, so DA2
-  traversal is not throttled twice.
+  The configured item rate is enforced once by native-operation cost: DA2 operations cost one
+  item, while a DA3 page is charged by the number of entries requested. The slice batch size
+  selects the page size but does not add a separate delay before every native operation, so DA2
+  traversal is not throttled twice. There is no separate gateway burst limiter. The legacy
+  `index.burst_size` setting is accepted for configuration compatibility but has no effect.
   Cancellation, probe failure, or a rejected pacing update stops the build and preserves the last
   complete generation. Pending entries are
   flushed before terminal state is recorded, and successful completion or a non-fatal inventory
@@ -437,7 +438,7 @@ full-text data is quarantined rather than served as an incomplete cache.
 | SQLite commit interval     | `index.commit_interval_ms`            | `1000` ms                      |
 | Legacy batch size fallback | `index.batch_size`                    | `100` (max `1000`)             |
 | Average item rate          | `index.item_rate_limit`               | `250` items/second             |
-| Burst allowance            | `index.burst_size`                    | `100` items                    |
+| Legacy burst allowance     | `index.burst_size`                    | accepted but ignored           |
 | Active duty cycle          | `index.duty_cycle_percent`            | `20`%                          |
 | Adaptive pacing            | `index.adaptive`                      | `true`                         |
 | Adaptive canary profile    | `index.canary_*`                      | `50` items/s, batch `25`, `5`% |
