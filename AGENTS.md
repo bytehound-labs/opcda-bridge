@@ -127,7 +127,8 @@ a working opcda-bridge, not a redesign of it.
   database file so relative/symlink aliases cannot bypass the gate. For missing files, canonicalize
   the parent and reattach the filename; if that cannot be done, retain the original path spelling.
   Each `:memory:` database gets an independent coordination object and must not create or rely on a
-  filesystem build lock.
+  filesystem build lock. On Windows, cleanly released build locks remove their `.build.owner`
+  metadata sidecar; forced termination may leave it for the next acquisition to overwrite.
 - **Index status is an aggregation of durable and runtime state.** Status combines the persisted
   generation snapshot with runtime build, health, storage, foreground, and scheduler diagnostics.
   Promotion reads persisted rows through a read-only connection and filesystem diagnostics; a

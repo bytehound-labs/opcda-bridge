@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Remove Windows build-owner metadata on clean lock release while retaining it after forced
+  termination for the next acquisition's diagnostics.
+
 - Native inventory item-rate pacing no longer derives a per-operation delay from the configured
   batch size. DA2 operations and DA3 pages are now paced once by the native client's operation
   cost, avoiding an unintended second throttle during hierarchical traversal.

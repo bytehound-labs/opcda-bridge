@@ -478,10 +478,11 @@ Run only one gateway process with a given index database path. A gateway automat
 directory can otherwise start a second inventory against the same SQLite file. When multiple
 gateway instances are intentional, give each instance an explicit, different
 `index.database_path` and configure indexing on only the instance that should build that
-server's index. Each server's build uses a persistent sibling `.build.lock` file. The operating
-system's advisory lock, not the file's existence, determines whether a build is active; metadata
-from a forcibly terminated process is overwritten by the next successful acquisition. Do not
-delete the lock path while a gateway may still be running.
+server's index. Each server's build uses a persistent sibling `.build.lock` file. On Windows,
+`.build.owner` carries the same owner metadata because the locked file may be unreadable; it is
+removed on a clean lock release and may remain after forced termination until the next acquisition
+overwrites it. The operating-system advisory lock, not either file's existence, determines whether
+a build is active. Do not delete either path while a gateway may still be running.
 
 ### Client
 

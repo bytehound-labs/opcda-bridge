@@ -62,7 +62,9 @@ transition, and promotion status uses a read-only SQLite connection plus filesys
 status remains responsive even while the writer is in the promotion critical section.
 Only one build for a server can hold its gateway-wide file lock at a time; contention reports the
 owning process metadata. On Windows, that metadata is kept in an adjacent `.build.owner` sidecar
-because the locked file itself may be unreadable.
+because the locked file itself may be unreadable. The owner sidecar is removed on a clean lock
+release and can remain after forced termination until the next acquisition overwrites it; the
+operating-system advisory lock, not the sidecar's existence, determines whether a build is active.
 Superseded and abandoned data is reclaimed in bounded background batches through a separate
 SQLite WAL connection, coordinated by a database-wide writer gate shared with every build mutation
 for the same database file, including builds for other servers. Cleanup defers while any build is

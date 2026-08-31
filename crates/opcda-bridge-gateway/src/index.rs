@@ -890,12 +890,18 @@ struct IndexObjectInspection {
 #[derive(Debug)]
 struct BuildFileLock {
     file: Option<fs::File>,
+    #[cfg(windows)]
+    owner_path: Option<PathBuf>,
 }
 
 impl BuildFileLock {
     fn acquire(database_path: &Path, server: &str) -> anyhow::Result<Self> {
         if database_path == Path::new(":memory:") {
-            return Ok(Self { file: None });
+            return Ok(Self {
+                file: None,
+                #[cfg(windows)]
+                owner_path: None,
+            });
         }
         Self::acquire_with(database_path, server, |file, metadata| {
             file.set_len(0)?;
@@ -960,7 +966,11 @@ impl BuildFileLock {
             let _ = FileExt::unlock(&file);
             return Err(error.into());
         }
-        Ok(Self { file: Some(file) })
+        Ok(Self {
+            file: Some(file),
+            #[cfg(windows)]
+            owner_path: Some(build_owner_path(database_path, server)),
+        })
     }
 
     fn is_held(database_path: &Path, server: &str) -> anyhow::Result<bool> {
@@ -992,6 +1002,19 @@ fn is_lock_conflict(error: &std::io::Error) -> bool {
 impl Drop for BuildFileLock {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
+            #[cfg(windows)]
+            if let Some(owner_path) = self.owner_path.take() {
+                if let Err(error) = fs::remove_file(&owner_path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(
+                        process_id = std::process::id(),
+                        owner = %owner_path.display(),
+                        error = %error,
+                        "unable to remove namespace index build owner metadata"
+                    );
+                }
+            }
             let _ = FileExt::unlock(&file);
             drop(file);
         }
@@ -7274,6 +7297,8 @@ mod tests {
         let database = directory.path().join("index.sqlite3");
         let lock = BuildFileLock::acquire_with(&database, "S", |_file, _metadata| Ok(())).unwrap();
         assert!(build_lock_path(&database, "S").exists());
+        #[cfg(windows)]
+        assert!(build_owner_path(&database, "S").exists());
         assert!(BuildFileLock::is_held(&database, "S").unwrap());
         assert!(!BuildFileLock::is_held(&database, "T").unwrap());
         let error = BuildFileLock::acquire(&database, "S").unwrap_err();
@@ -7281,6 +7306,8 @@ mod tests {
         drop(lock);
         assert!(!BuildFileLock::is_held(&database, "S").unwrap());
         assert!(build_lock_path(&database, "S").exists());
+        #[cfg(windows)]
+        assert!(!build_owner_path(&database, "S").exists());
         let other_server_lock = BuildFileLock::acquire(&database, "T").unwrap();
         assert_ne!(
             build_lock_path(&database, "T"),
