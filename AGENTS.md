@@ -54,9 +54,13 @@ a working opcda-bridge, not a redesign of it.
   `index_meta`, exposes it through status/errors, and blocks refresh, control, search, writes, and
   obsolete-generation cleanup until an operator stops the gateway and runs
   `opcda-bridge-gateway --config PATH index-prepare`. The command is database-only, transactional,
-  validates the resulting objects, and leaves a retryable failure detail when preparation fails.
-  The stop-gateway requirement is the operational mitigation for the accepted point-in-time race
-  between inspection and index creation if another process opens the database after inspection.
+  validates the resulting objects and performs the full relational/FTS consistency check, and
+  leaves a retryable failure detail when preparation fails. Ordinary status/search opens inspect
+  schema and object definitions but deliberately do not scan every row of a populated FTS index;
+  this keeps large databases responsive, while explicit preparation retains the expensive
+  consistency/quarantine path. The stop-gateway requirement is the operational mitigation for the
+  accepted point-in-time race between inspection and index creation if another process opens the
+  database after inspection.
 - **FTS breadcrumbs have two storage representations.** Relational `entries.breadcrumbs` stores
   the canonical JSON array, while `entries_fts.breadcrumbs` stores its space-separated searchable
   form. Full-text consistency validation must normalize both current flattened rows and legacy

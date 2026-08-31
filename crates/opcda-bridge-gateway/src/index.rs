@@ -873,6 +873,7 @@ struct IndexDb {
     connection: Connection,
     preparation_required: bool,
     preparation_detail: Option<String>,
+    full_text_validated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1246,12 +1247,20 @@ fn preparation_error_message(detail: Option<&str>) -> String {
 /// Prepare the secondary and full-text namespace indexes for an existing
 /// inventory without starting the gateway or contacting OPC DA.
 pub fn prepare_index_database(path: &Path) -> anyhow::Result<IndexPreparationOutcome> {
-    let mut database = IndexDb::open(path)?;
+    let mut database = IndexDb::open_validated(path)?;
     database.prepare_indexes()
 }
 
 impl IndexDb {
     fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_resilient(path, false)
+    }
+
+    fn open_validated(path: &Path) -> anyhow::Result<Self> {
+        Self::open_resilient(path, true)
+    }
+
+    fn open_resilient(path: &Path, validate_full_text: bool) -> anyhow::Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -1263,7 +1272,7 @@ impl IndexDb {
             database = %path.display(),
             "opening namespace index database"
         );
-        match Self::open_once(path) {
+        match Self::open_once_with_validation(path, validate_full_text) {
             Ok(db) => Ok(db),
             Err(error) => {
                 if !is_quarantinable_index_error(&error) {
@@ -1279,12 +1288,17 @@ impl IndexDb {
                         "quarantined invalid namespace index"
                     );
                 }
-                Self::open_once(path)
+                Self::open_once_with_validation(path, validate_full_text)
             }
         }
     }
 
+    #[cfg(test)]
     fn open_once(path: &Path) -> anyhow::Result<Self> {
+        Self::open_once_with_validation(path, true)
+    }
+
+    fn open_once_with_validation(path: &Path, validate_full_text: bool) -> anyhow::Result<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1361,7 +1375,10 @@ impl IndexDb {
         let (stored_preparation_required, stored_preparation_detail) =
             read_preparation_state(&connection)?;
         let inspection = inspect_index_objects(&connection)?;
-        validate_full_text_consistency(&connection, inspection.fts_present)?;
+        let mut full_text_validated = validate_full_text;
+        if validate_full_text {
+            validate_full_text_consistency(&connection, inspection.fts_present)?;
+        }
         let populated = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM generations LIMIT 1)
              OR EXISTS(SELECT 1 FROM entries LIMIT 1)",
@@ -1385,6 +1402,7 @@ impl IndexDb {
         } else {
             create_missing_index_objects(&connection, &inspection.missing)?;
             validate_full_text_consistency(&connection, true)?;
+            full_text_validated = true;
             clear_preparation_state(&connection)?;
             (false, None)
         };
@@ -1429,6 +1447,7 @@ impl IndexDb {
             connection,
             preparation_required,
             preparation_detail,
+            full_text_validated,
         })
     }
 
@@ -1439,7 +1458,6 @@ impl IndexDb {
         let (stored_preparation_required, stored_preparation_detail) =
             read_preparation_state(&connection)?;
         let inspection = inspect_index_objects(&connection)?;
-        validate_full_text_consistency(&connection, inspection.fts_present)?;
         Ok(Self {
             path: path.to_path_buf(),
             connection,
@@ -1447,6 +1465,7 @@ impl IndexDb {
             preparation_detail: stored_preparation_detail.or_else(|| {
                 (!inspection.missing.is_empty()).then(|| missing_index_detail(&inspection.missing))
             }),
+            full_text_validated: false,
         })
     }
 
@@ -1464,7 +1483,10 @@ impl IndexDb {
 
     fn prepare_indexes(&mut self) -> anyhow::Result<IndexPreparationOutcome> {
         let inspection = inspect_index_objects(&self.connection)?;
-        validate_full_text_consistency(&self.connection, inspection.fts_present)?;
+        if !self.full_text_validated {
+            validate_full_text_consistency(&self.connection, inspection.fts_present)?;
+            self.full_text_validated = true;
+        }
         if inspection.missing.is_empty() {
             clear_preparation_state(&self.connection)?;
             self.preparation_required = false;
@@ -1491,6 +1513,7 @@ impl IndexDb {
                 Ok(()) => {
                     self.preparation_required = false;
                     self.preparation_detail = None;
+                    self.full_text_validated = true;
                     Ok(IndexPreparationOutcome::Prepared)
                 }
                 Err(error) => {
@@ -8073,7 +8096,15 @@ mod tests {
             .unwrap();
         drop(db);
 
-        let recovered = IndexDb::open(&path).unwrap();
+        let reopened = IndexDb::open(&path).unwrap();
+        assert_eq!(reopened.status_rows("S").unwrap().len(), 1);
+        drop(reopened);
+
+        let read_only = IndexDb::open_read_only(&path).unwrap();
+        assert_eq!(read_only.status_rows("S").unwrap().len(), 1);
+        drop(read_only);
+
+        let recovered = IndexDb::open_validated(&path).unwrap();
         assert!(recovered.status_rows("S").unwrap().is_empty());
         assert!(
             directory
@@ -8112,7 +8143,7 @@ mod tests {
             .unwrap();
         drop(partial);
 
-        let recovered = IndexDb::open(&partial_path).unwrap();
+        let recovered = IndexDb::open_validated(&partial_path).unwrap();
         assert!(recovered.status_rows("S").unwrap().is_empty());
 
         let mismatch_path = directory.path().join("fts-mismatch.sqlite3");
@@ -8142,7 +8173,7 @@ mod tests {
             .unwrap();
         drop(mismatch);
 
-        let recovered = IndexDb::open(&mismatch_path).unwrap();
+        let recovered = IndexDb::open_validated(&mismatch_path).unwrap();
         assert!(recovered.status_rows("S").unwrap().is_empty());
         assert!(
             directory

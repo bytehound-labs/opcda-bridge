@@ -420,13 +420,16 @@ generation remains available while a refresh runs, and failed or cancelled refre
 it.
 When an existing populated database is missing a required secondary index or the trigram full-text
 index, gateway startup records that preparation is required instead of creating large objects
-during ordinary operation. Stop the gateway and run the one-shot maintenance command
+during ordinary operation. Ordinary database opens inspect the schema and index definitions but do
+not scan every relational and FTS row, so status and search remain responsive on multi-million-entry
+databases. Stop the gateway and run the one-shot maintenance command
 `opcda-bridge-gateway --config PATH index-prepare`; this is a one-shot command that exits after
 preparation without starting the gateway or contacting OPC DA. It creates and populates the
 missing objects transactionally, validates them before commit, and records a retryable failure marker if
-preparation cannot complete. Empty databases prepare automatically, and status remains available
-while preparation is required. Unexpected index definitions fail initialization, and inconsistent
-full-text data is quarantined rather than served as an incomplete cache.
+preparation cannot complete. Explicit preparation performs the full relational/FTS consistency check.
+Empty databases prepare automatically, and status remains available while preparation is required.
+Unexpected index definitions fail initialization, and inconsistent full-text data is quarantined
+rather than served as an incomplete cache.
 
 | Index setting              | Config key                            | Default                        |
 | -------------------------- | ------------------------------------- | ------------------------------ |

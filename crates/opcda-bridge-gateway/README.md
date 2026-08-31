@@ -96,19 +96,21 @@ searches use the active generation already returned by the promotion-safe status
 waiting for the writable database mutex.
 When a populated database is missing required secondary indexes or the trigram full-text index,
 startup records that preparation is required instead of building those objects during ordinary
-gateway work. Refresh, control, search, and obsolete-generation cleanup remain blocked until the
+gateway work. Ordinary database opens inspect the schema and index definitions but do not scan
+every relational and FTS row, so status and search remain responsive on multi-million-entry
+databases. Refresh, control, search, and obsolete-generation cleanup remain blocked until the
 gateway is stopped and the one-shot `index-prepare` command completes:
 `opcda-bridge-gateway --config PATH index-prepare`. The command exits after preparation without
 starting the gateway or contacting OPC DA. Preparation creates and populates the missing objects
 in one transaction, validates them before commit, and records a retryable failure marker
 if it cannot complete. Empty databases prepare automatically, and status remains inspectable while
-preparation is required. Unexpected existing index definitions fail initialization, and
-inconsistent full-text data is quarantined rather than served as a potentially incomplete cache;
-validation checks both row counts and the stored server/generation/item/display values plus
-normalized breadcrumb values. Relational breadcrumbs are JSON arrays while the FTS copy uses
-space-separated searchable text; both that representation and legacy JSON-form FTS rows are
-normalized before comparison, so partial, duplicate, or same-sized replacement rows cannot pass
-as a consistent index.
+preparation is required. Explicit preparation also performs the full relational/FTS consistency
+check; unexpected existing index definitions fail initialization, and inconsistent full-text data
+is quarantined rather than served as a potentially incomplete cache. Validation checks both row
+counts and the stored server/generation/item/display values plus normalized breadcrumb values.
+Relational breadcrumbs are JSON arrays while the FTS copy uses space-separated searchable text;
+both that representation and legacy JSON-form FTS rows are normalized before comparison, so
+partial, duplicate, or same-sized replacement rows cannot pass as a consistent index.
 Refresh setup is staged before the asynchronous build task is launched. If startup, capability
 negotiation, generation creation, task launch, or shutdown fails at that boundary, the
 provisional generation is abandoned and its build reservation is released while the last
