@@ -456,6 +456,222 @@ async fn run_search<C: OpcClient>(
     }
 }
 
+struct SearchScope {
+    parent_node_key: Option<String>,
+    breadcrumbs: Vec<BrowseBreadcrumb>,
+    refresh: bool,
+}
+
+#[derive(Default)]
+struct SearchState {
+    matched_item_ids: HashSet<String>,
+    visited_nodes: u32,
+    matches: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchStep {
+    Continue,
+    Stop,
+}
+
+impl SearchState {
+    fn match_node(
+        &mut self,
+        node: &BrowseNode,
+        request: &SearchRequest,
+        mode: SearchMatchMode,
+        breadcrumbs: &[BrowseBreadcrumb],
+    ) -> Option<SearchMatch> {
+        let item_match = search_matches(node, &request.query, mode);
+        let branch_match = request.include_branches && item_match;
+        let has_new_item = node
+            .item_id
+            .as_ref()
+            .is_none_or(|item_id| !self.matched_item_ids.contains(item_id));
+        if !(item_match && has_new_item && (node.item_id.is_some() || branch_match)) {
+            return None;
+        }
+
+        if let Some(item_id) = node.item_id.as_ref() {
+            self.matched_item_ids.insert(item_id.clone());
+        }
+        self.matches = self.matches.saturating_add(1);
+        let mut result_breadcrumbs = breadcrumbs.to_vec();
+        result_breadcrumbs.push(BrowseBreadcrumb {
+            node_key: node.node_key.clone(),
+            display_name: node.display_name.clone(),
+        });
+        Some(SearchMatch {
+            node: Some(map_browse_node(node.clone())),
+            breadcrumbs: result_breadcrumbs,
+        })
+    }
+}
+
+fn initial_search_scopes(request: &SearchRequest) -> VecDeque<SearchScope> {
+    let breadcrumbs = request
+        .scope_node_key
+        .as_ref()
+        .map(|node_key| {
+            vec![BrowseBreadcrumb {
+                node_key: node_key.clone(),
+                display_name: String::new(),
+            }]
+        })
+        .unwrap_or_default();
+    VecDeque::from([SearchScope {
+        parent_node_key: request.scope_node_key.clone(),
+        breadcrumbs,
+        refresh: request.refresh,
+    }])
+}
+
+fn child_search_scope(node: &BrowseNode, breadcrumbs: &[BrowseBreadcrumb]) -> Option<SearchScope> {
+    if !is_expandable(node.kind) {
+        return None;
+    }
+    let mut child_breadcrumbs = breadcrumbs.to_vec();
+    child_breadcrumbs.push(BrowseBreadcrumb {
+        node_key: node.node_key.clone(),
+        display_name: node.display_name.clone(),
+    });
+    Some(SearchScope {
+        parent_node_key: Some(node.node_key.clone()),
+        breadcrumbs: child_breadcrumbs,
+        refresh: false,
+    })
+}
+
+async fn send_search_event(tx: &mpsc::Sender<Result<SearchEvent, Status>>, event: Event) -> bool {
+    tx.send(Ok(search_event(event))).await.is_ok()
+}
+
+async fn send_search_completion(
+    tx: &mpsc::Sender<Result<SearchEvent, Status>>,
+    complete: bool,
+    truncated: bool,
+    warning: Option<&str>,
+) -> Result<(), Status> {
+    tx.send(Ok(search_event(Event::Completed(SearchCompleted {
+        complete,
+        cancelled: false,
+        truncated,
+        warning: warning.map(str::to_string),
+    }))))
+    .await
+    .map_err(|_| Status::cancelled("search stream closed"))
+}
+
+struct SearchContext<'a, C: OpcClient> {
+    manager: Arc<BrowseManager<C>>,
+    server: &'a str,
+    session_id: &'a str,
+    request: &'a SearchRequest,
+    mode: SearchMatchMode,
+    max_results: u32,
+    state: SearchState,
+    scopes: VecDeque<SearchScope>,
+    tx: &'a mpsc::Sender<Result<SearchEvent, Status>>,
+}
+
+impl<'a, C: OpcClient> SearchContext<'a, C> {
+    async fn process_node(
+        &mut self,
+        node: BrowseNode,
+        breadcrumbs: &[BrowseBreadcrumb],
+    ) -> Result<SearchStep, Status> {
+        self.state.visited_nodes = self.state.visited_nodes.saturating_add(1);
+        if let Some(search_match) =
+            self.state
+                .match_node(&node, self.request, self.mode, breadcrumbs)
+        {
+            if !send_search_event(self.tx, Event::Match(search_match)).await {
+                return Ok(SearchStep::Stop);
+            }
+            if self.state.matches >= self.max_results {
+                send_search_completion(self.tx, false, true, Some("search result limit reached"))
+                    .await?;
+                return Ok(SearchStep::Stop);
+            }
+        }
+
+        if let Some(scope) = child_search_scope(&node, breadcrumbs) {
+            self.scopes.push_back(scope);
+        }
+        if self.state.visited_nodes >= MAX_SEARCH_VISITED {
+            send_search_completion(self.tx, false, true, Some("search visit limit reached"))
+                .await?;
+            return Ok(SearchStep::Stop);
+        }
+        Ok(SearchStep::Continue)
+    }
+
+    async fn process_page(
+        &mut self,
+        nodes: Vec<BrowseNode>,
+        partial: bool,
+        breadcrumbs: &[BrowseBreadcrumb],
+    ) -> Result<SearchStep, Status> {
+        for node in nodes {
+            if self.process_node(node, breadcrumbs).await? == SearchStep::Stop {
+                return Ok(SearchStep::Stop);
+            }
+        }
+
+        if !send_search_event(
+            self.tx,
+            Event::Progress(SearchProgress {
+                visited_nodes: self.state.visited_nodes,
+                matches: self.state.matches,
+                partial,
+            }),
+        )
+        .await
+        {
+            return Ok(SearchStep::Stop);
+        }
+        Ok(SearchStep::Continue)
+    }
+
+    async fn process_scope(&mut self, scope: SearchScope) -> Result<SearchStep, Status> {
+        let SearchScope {
+            parent_node_key,
+            breadcrumbs,
+            refresh,
+        } = scope;
+        let mut page_token = None;
+        let mut first_page = true;
+        loop {
+            let (_, page) = self
+                .manager
+                .browse(
+                    self.server,
+                    Some(self.session_id),
+                    parent_node_key.as_deref(),
+                    page_token.as_deref(),
+                    DEFAULT_PAGE_SIZE,
+                    refresh && first_page,
+                )
+                .await?;
+            first_page = false;
+            let next_page_token = page.next_page_token;
+            if self
+                .process_page(page.nodes, next_page_token.is_some(), &breadcrumbs)
+                .await?
+                == SearchStep::Stop
+            {
+                return Ok(SearchStep::Stop);
+            }
+
+            let Some(next_page_token) = next_page_token else {
+                return Ok(SearchStep::Continue);
+            };
+            page_token = Some(next_page_token);
+        }
+    }
+}
+
 async fn run_search_inner<C: OpcClient>(
     manager: Arc<BrowseManager<C>>,
     server: &str,
@@ -465,143 +681,37 @@ async fn run_search_inner<C: OpcClient>(
     max_results: u32,
     tx: &mpsc::Sender<Result<SearchEvent, Status>>,
 ) -> Result<(), Status> {
-    if tx
-        .send(Ok(search_event(Event::Progress(SearchProgress {
+    if !send_search_event(
+        tx,
+        Event::Progress(SearchProgress {
             visited_nodes: 0,
             matches: 0,
             partial: false,
-        }))))
-        .await
-        .is_err()
+        }),
+    )
+    .await
     {
         return Ok(());
     }
 
-    let mut scopes = VecDeque::from([(
-        request.scope_node_key.clone(),
-        request
-            .scope_node_key
-            .as_ref()
-            .map(|node_key| {
-                vec![BrowseBreadcrumb {
-                    node_key: node_key.clone(),
-                    display_name: String::new(),
-                }]
-            })
-            .unwrap_or_default(),
-        request.refresh,
-    )]);
-    let mut matched_item_ids = HashSet::new();
-    let mut visited_nodes = 0_u32;
-    let mut matches = 0_u32;
-
-    while let Some((parent_node_key, breadcrumbs, refresh)) = scopes.pop_front() {
-        let mut page_token = None;
-        let mut first_page = true;
-        loop {
-            let (_, page) = manager
-                .browse(
-                    server,
-                    Some(session_id),
-                    parent_node_key.as_deref(),
-                    page_token.as_deref(),
-                    DEFAULT_PAGE_SIZE,
-                    refresh && first_page,
-                )
-                .await?;
-            first_page = false;
-
-            for node in page.nodes {
-                visited_nodes = visited_nodes.saturating_add(1);
-                let item_match = search_matches(&node, &request.query, mode);
-                let branch_match = request.include_branches && item_match;
-                let has_new_item = node
-                    .item_id
-                    .as_ref()
-                    .is_none_or(|item_id| !matched_item_ids.contains(item_id));
-
-                if item_match && has_new_item && (node.item_id.is_some() || branch_match) {
-                    if let Some(item_id) = node.item_id.as_ref() {
-                        matched_item_ids.insert(item_id.clone());
-                    }
-                    matches = matches.saturating_add(1);
-                    let mut result_breadcrumbs = breadcrumbs.clone();
-                    result_breadcrumbs.push(BrowseBreadcrumb {
-                        node_key: node.node_key.clone(),
-                        display_name: node.display_name.clone(),
-                    });
-                    if tx
-                        .send(Ok(search_event(Event::Match(SearchMatch {
-                            node: Some(map_browse_node(node.clone())),
-                            breadcrumbs: result_breadcrumbs,
-                        }))))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                    if matches >= max_results {
-                        tx.send(Ok(search_event(Event::Completed(SearchCompleted {
-                            complete: false,
-                            cancelled: false,
-                            truncated: true,
-                            warning: Some("search result limit reached".to_string()),
-                        }))))
-                        .await
-                        .map_err(|_| Status::cancelled("search stream closed"))?;
-                        return Ok(());
-                    }
-                }
-
-                if is_expandable(node.kind) {
-                    let mut child_breadcrumbs = breadcrumbs.clone();
-                    child_breadcrumbs.push(BrowseBreadcrumb {
-                        node_key: node.node_key.clone(),
-                        display_name: node.display_name.clone(),
-                    });
-                    scopes.push_back((Some(node.node_key), child_breadcrumbs, false));
-                }
-
-                if visited_nodes >= MAX_SEARCH_VISITED {
-                    tx.send(Ok(search_event(Event::Completed(SearchCompleted {
-                        complete: false,
-                        cancelled: false,
-                        truncated: true,
-                        warning: Some("search visit limit reached".to_string()),
-                    }))))
-                    .await
-                    .map_err(|_| Status::cancelled("search stream closed"))?;
-                    return Ok(());
-                }
-            }
-
-            if tx
-                .send(Ok(search_event(Event::Progress(SearchProgress {
-                    visited_nodes,
-                    matches,
-                    partial: page.next_page_token.is_some(),
-                }))))
-                .await
-                .is_err()
-            {
-                return Ok(());
-            }
-
-            match page.next_page_token {
-                Some(next) => page_token = Some(next),
-                None => break,
-            }
+    let mut context = SearchContext {
+        manager,
+        server,
+        session_id,
+        request,
+        mode,
+        max_results,
+        state: SearchState::default(),
+        scopes: initial_search_scopes(request),
+        tx,
+    };
+    while let Some(scope) = context.scopes.pop_front() {
+        if context.process_scope(scope).await? == SearchStep::Stop {
+            return Ok(());
         }
     }
 
-    tx.send(Ok(search_event(Event::Completed(SearchCompleted {
-        complete: true,
-        cancelled: false,
-        truncated: false,
-        warning: None,
-    }))))
-    .await
-    .map_err(|_| Status::cancelled("search stream closed"))?;
+    send_search_completion(tx, true, false, None).await?;
     Ok(())
 }
 
@@ -1413,6 +1523,83 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Completed(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn search_stream_preserves_event_order_and_payloads() {
+        let mock = MockOpcClient::default();
+        *mock.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+            nodes: vec![BrowseNode {
+                node_key: "native".into(),
+                display_name: "tag".into(),
+                kind: BrowseNodeKind::Item,
+                item_id: Some("tag.item".into()),
+            }],
+            next_page_token: None,
+            complete: true,
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+            warning: None,
+        });
+        let service = BridgeService::new(mock);
+        let mut stream = service
+            .search(Request::new(SearchRequest {
+                server: "S".into(),
+                query: "tag".into(),
+                match_mode: SearchMatchMode::Prefix as i32,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let events = {
+            let mut events = Vec::new();
+            while let Some(event) = tokio_stream::StreamExt::next(&mut stream).await {
+                events.push(event.unwrap().event.unwrap());
+            }
+            events
+        };
+
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0],
+            Event::Progress(SearchProgress {
+                visited_nodes: 0,
+                matches: 0,
+                partial: false,
+            })
+        ));
+        let search_match = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Match(search_match) => Some(search_match),
+                _ => None,
+            })
+            .expect("expected a match event");
+        let node = search_match.node.as_ref().expect("match node");
+        assert_eq!(node.display_name, "tag");
+        assert_eq!(node.item_id.as_deref(), Some("tag.item"));
+        assert_eq!(search_match.breadcrumbs.len(), 1);
+        assert_eq!(search_match.breadcrumbs[0].node_key, node.node_key);
+        assert_eq!(search_match.breadcrumbs[0].display_name, "tag");
+        assert!(matches!(
+            events[2],
+            Event::Progress(SearchProgress {
+                visited_nodes: 1,
+                matches: 1,
+                partial: false,
+            })
+        ));
+        assert!(matches!(
+            events[3],
+            Event::Completed(SearchCompleted {
+                complete: true,
+                cancelled: false,
+                truncated: false,
+                warning: None,
+            })
+        ));
     }
 
     #[tokio::test]

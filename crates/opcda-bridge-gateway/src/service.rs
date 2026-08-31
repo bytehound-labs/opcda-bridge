@@ -140,7 +140,10 @@ pub fn is_scm_launch_error_code(code: Option<i32>) -> bool {
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use super::*;
+    use super::{
+        Cli, SERVICE_DISPLAY_NAME, SERVICE_NAME, ServiceDefinition, ServiceLifecycle,
+        build_service_definition, is_scm_launch_error_code,
+    };
     use crate::run;
     use clap::Parser;
     use std::ffi::OsString;

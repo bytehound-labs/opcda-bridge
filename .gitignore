@@ -29,6 +29,9 @@ target
 lcov.info
 *.profraw
 
+# Personal Copilot instructions (symlinked from ~/git/Work)
+copilot-instructions.md
+
 # Local cargo-fuzz artifacts and corpora
 fuzz/artifacts
 fuzz/corpus
