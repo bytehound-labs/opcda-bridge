@@ -8,6 +8,7 @@ use opc_da_client::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::opc::{
     BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource, InventoryCompleted,
@@ -30,8 +31,17 @@ impl OpcClient for OpcDaAdapter {
     }
 
     async fn get_capabilities(&self, server: &str) -> anyhow::Result<BrowseCapabilities> {
+        let started = Instant::now();
+        tracing::info!(server, "gateway native capability probe started");
         let capabilities = self.client.browse_capabilities(server).await?;
         let (organization, source) = map_capabilities(&capabilities);
+        tracing::info!(
+            server,
+            elapsed_ms = started.elapsed().as_millis(),
+            organization = ?organization,
+            source = ?source,
+            "gateway native capability probe completed"
+        );
         Ok(BrowseCapabilities {
             organization,
             source,
@@ -121,6 +131,12 @@ impl OpcClient for OpcDaAdapter {
         server: &str,
         batch_size: u32,
     ) -> anyhow::Result<InventoryHandle> {
+        let started = Instant::now();
+        tracing::info!(
+            server,
+            batch_size,
+            "gateway native inventory startup started"
+        );
         if !(1..=MAX_NATIVE_INVENTORY_BATCH_SIZE).contains(&batch_size) {
             anyhow::bail!(
                 "native inventory batch size must be between 1 and {}",
@@ -137,6 +153,12 @@ impl OpcClient for OpcDaAdapter {
                 },
             )
             .await?;
+        tracing::info!(
+            server,
+            batch_size,
+            elapsed_ms = started.elapsed().as_millis(),
+            "gateway native inventory stream created"
+        );
         let control = stream.control();
         Ok(InventoryHandle {
             stream: Box::new(AdapterInventoryStream { inner: stream }),

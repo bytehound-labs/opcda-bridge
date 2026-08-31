@@ -117,7 +117,8 @@ Cancellation
 requests received before inventory startup returns its control handle are retained and applied
 once the handle is available.
 Cancellation requests carry a source label through the gateway adapter into the native client.
-Diagnostic logs identify inventory startup boundaries, pause and foreground transitions, and
+Diagnostic logs identify COM worker startup, native server connection, capability detection,
+namespace organization, the first inventory operation, pause and foreground transitions, and
 health/controller state transitions at the default informational level. Maintenance and pacing
 waits, health-probe details, and bounded native-operation entry/return records — including browse
 paths, item names, durations, iterator results, and failures — are debug-level diagnostics to

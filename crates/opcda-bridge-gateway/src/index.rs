@@ -4144,12 +4144,27 @@ impl<C: OpcClient> IndexManager<C> {
         server: &str,
         force: bool,
     ) -> anyhow::Result<IndexStatus> {
+        let refresh_started = Instant::now();
+        tracing::info!(server, force, "namespace index refresh startup started");
         self.require_configured(server)?;
+        let preparation_started = Instant::now();
         self.ensure_database_prepared()?;
+        tracing::info!(
+            server,
+            elapsed_ms = preparation_started.elapsed().as_millis(),
+            "namespace index database preparation check completed"
+        );
         if self.background_tasks.is_shutting_down() {
             return self.status(server).await;
         }
+        let storage_started = Instant::now();
         let storage = self.with_database_read(|db| Ok(db.storage_diagnostics()))?;
+        tracing::info!(
+            server,
+            elapsed_ms = storage_started.elapsed().as_millis(),
+            free_bytes = ?storage.free_bytes,
+            "namespace index storage diagnostics completed"
+        );
         if storage.free_bytes.is_some_and(|free| {
             free < self
                 .settings
@@ -4165,7 +4180,14 @@ impl<C: OpcClient> IndexManager<C> {
             );
         }
         self.load_persisted_retry_state(server)?;
+        let reservation_started = Instant::now();
         let build_ownership = self.reserve_refresh_build(server, force)?;
+        tracing::info!(
+            server,
+            elapsed_ms = reservation_started.elapsed().as_millis(),
+            reserved = build_ownership.is_some(),
+            "namespace index build reservation completed"
+        );
         let Some(build_ownership) = build_ownership else {
             return self.status(server).await;
         };
@@ -4177,6 +4199,11 @@ impl<C: OpcClient> IndexManager<C> {
         else {
             return self.status(server).await;
         };
+        tracing::info!(
+            server,
+            elapsed_ms = refresh_started.elapsed().as_millis(),
+            "namespace index inventory startup returned a control handle"
+        );
         let Some(control_was_cancelled_before_attach) =
             self.attach_refresh_control(server, &build_ownership, &handle, initial_limits)?
         else {
@@ -4212,6 +4239,12 @@ impl<C: OpcClient> IndexManager<C> {
         else {
             return self.status(server).await;
         };
+        tracing::info!(
+            server,
+            generation,
+            elapsed_ms = refresh_started.elapsed().as_millis(),
+            "namespace index generation created"
+        );
         self.launch_refresh_build(
             server,
             generation,
@@ -4307,6 +4340,14 @@ impl<C: OpcClient> IndexManager<C> {
         build_ownership: &Arc<()>,
         initial_limits: InventoryLimits,
     ) -> anyhow::Result<Option<InventoryHandle>> {
+        let started = Instant::now();
+        tracing::info!(
+            server,
+            batch_size = initial_limits.batch_size,
+            item_rate_per_second = ?initial_limits.item_rate_per_second,
+            duty_cycle_percent = initial_limits.duty_cycle_percent,
+            "gateway requesting native inventory startup"
+        );
         match self
             .with_opc_timeout(
                 "start inventory",
@@ -4315,7 +4356,14 @@ impl<C: OpcClient> IndexManager<C> {
             )
             .await
         {
-            Ok(handle) => Ok(Some(handle)),
+            Ok(handle) => {
+                tracing::info!(
+                    server,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "gateway native inventory startup completed"
+                );
+                Ok(Some(handle))
+            }
             Err(error) => {
                 if self.take_pending_cancel(server) {
                     self.finish_build_owned(server, build_ownership, None);
@@ -4400,6 +4448,8 @@ impl<C: OpcClient> IndexManager<C> {
         build_ownership: &Arc<()>,
         control_was_cancelled_before_attach: bool,
     ) -> anyhow::Result<Option<u64>> {
+        let started = Instant::now();
+        tracing::info!(server, "gateway capability probe for generation started");
         let (organization, source) = match self
             .with_opc_timeout(
                 "inventory capability probe",
@@ -4407,7 +4457,16 @@ impl<C: OpcClient> IndexManager<C> {
             )
             .await
         {
-            Ok(capabilities) => (capabilities.organization, capabilities.source),
+            Ok(capabilities) => {
+                tracing::info!(
+                    server,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    organization = ?capabilities.organization,
+                    source = ?capabilities.source,
+                    "gateway capability probe for generation completed"
+                );
+                (capabilities.organization, capabilities.source)
+            }
             Err(error) => {
                 let cancelled = !control_was_cancelled_before_attach && control.is_cancelled();
                 self.request_inventory_cancel(
