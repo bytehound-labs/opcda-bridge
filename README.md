@@ -430,7 +430,8 @@ missing objects transactionally, validates them before commit, and records a ret
 preparation cannot complete. Explicit preparation performs the full relational/FTS consistency check.
 Empty databases prepare automatically, and status remains available while preparation is required.
 Unexpected index definitions fail initialization, and inconsistent full-text data is quarantined
-rather than served as an incomplete cache.
+rather than served as an incomplete cache. The preparation command is database-only and can run on
+non-Windows hosts; the gateway's normal OPC DA serving mode still requires Windows.
 
 | Index setting              | Config key                            | Default                        |
 | -------------------------- | ------------------------------------- | ------------------------------ |

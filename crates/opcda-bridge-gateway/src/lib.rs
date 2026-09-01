@@ -15,20 +15,71 @@ mod test_support;
 pub mod opc_da_adapter;
 
 #[cfg(not(target_os = "windows"))]
-pub fn non_windows_run() -> ! {
+pub fn non_windows_run<I, T>(args: I) -> u8
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
     use clap::Parser;
     use config::{Cli, ServiceCommand};
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(args);
     if matches!(cli.command.as_ref(), Some(ServiceCommand::IndexPrepare)) {
-        match run::prepare_index(&cli) {
-            Ok(()) => std::process::exit(0),
+        return match run::prepare_index(&cli) {
+            Ok(()) => 0,
             Err(error) => {
                 eprintln!("index preparation failed: {error:#}");
-                std::process::exit(1);
+                1
             }
-        }
+        };
     }
     eprintln!("opcda-bridge gateway requires Windows (COM/DCOM dependency)");
-    std::process::exit(1);
+    1
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::non_windows_run;
+    use std::ffi::OsString;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn index_prepare_args(config: &std::path::Path) -> Vec<OsString> {
+        vec![
+            OsString::from("opcda-bridge-gateway"),
+            OsString::from("--config"),
+            config.as_os_str().to_os_string(),
+            OsString::from("index-prepare"),
+        ]
+    }
+
+    #[test]
+    fn non_windows_index_prepare_dispatches_successfully() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let config = directory.path().join("gateway.toml");
+        fs::write(
+            &config,
+            format!(
+                "[index]\ndatabase_path = {:?}\n",
+                database.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(non_windows_run(index_prepare_args(&config)), 0);
+    }
+
+    #[test]
+    fn non_windows_index_prepare_reports_configuration_errors() {
+        let directory = tempdir().unwrap();
+        let missing_config = directory.path().join("missing.toml");
+
+        assert_eq!(non_windows_run(index_prepare_args(&missing_config)), 1);
+    }
+
+    #[test]
+    fn non_windows_gateway_mode_reports_windows_requirement() {
+        assert_eq!(non_windows_run([OsString::from("opcda-bridge-gateway")]), 1);
+    }
 }

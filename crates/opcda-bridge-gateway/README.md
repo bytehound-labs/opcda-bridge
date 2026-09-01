@@ -113,6 +113,8 @@ counts and the stored server/generation/item/display values plus normalized brea
 Relational breadcrumbs are JSON arrays while the FTS copy uses space-separated searchable text;
 both that representation and legacy JSON-form FTS rows are normalized before comparison, so
 partial, duplicate, or same-sized replacement rows cannot pass as a consistent index.
+Because this command only opens SQLite and does not use COM, it can also prepare an index database
+on a non-Windows host; all normal gateway serving modes still require Windows.
 Refresh setup is staged before the asynchronous build task is launched. If startup, capability
 negotiation, generation creation, task launch, or shutdown fails at that boundary, the
 provisional generation is abandoned and its build reservation is released while the last
