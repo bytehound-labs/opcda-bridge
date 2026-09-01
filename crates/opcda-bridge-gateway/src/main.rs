@@ -33,5 +33,8 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn main() -> std::process::ExitCode {
-    std::process::ExitCode::from(opcda_bridge_gateway::non_windows_run(std::env::args()))
+    use clap::Parser;
+
+    let cli = opcda_bridge_gateway::config::Cli::parse();
+    std::process::ExitCode::from(opcda_bridge_gateway::non_windows_run(cli))
 }

@@ -431,8 +431,9 @@ preparation cannot complete. Explicit preparation performs the full relational/F
 Empty databases prepare automatically, and status remains available while preparation is required.
 Unexpected index definitions fail initialization, and inconsistent full-text data is quarantined
 rather than served as an incomplete cache. The preparation command is database-only, can run on a
-non-Windows host, and returns a nonzero status when preparation fails; the gateway's normal OPC DA
-serving mode still requires Windows.
+non-Windows host, and returns a nonzero status when preparation fails. It uses the normal gateway
+CLI/configuration parsing but does not initialize COM or open a listener; the gateway's normal OPC
+DA serving mode still requires Windows.
 
 | Index setting              | Config key                            | Default                        |
 | -------------------------- | ------------------------------------- | ------------------------------ |
