@@ -1003,20 +1003,28 @@ impl Drop for BuildFileLock {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
             #[cfg(windows)]
-            if let Some(owner_path) = self.owner_path.take() {
-                if let Err(error) = fs::remove_file(&owner_path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(
-                        process_id = std::process::id(),
-                        owner = %owner_path.display(),
-                        error = %error,
-                        "unable to remove namespace index build owner metadata"
-                    );
-                }
-            }
+            self.remove_owner_metadata();
             let _ = FileExt::unlock(&file);
             drop(file);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl BuildFileLock {
+    fn remove_owner_metadata(&mut self) {
+        let Some(owner_path) = self.owner_path.take() else {
+            return;
+        };
+        if let Err(error) = fs::remove_file(&owner_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                process_id = std::process::id(),
+                owner = %owner_path.display(),
+                error = %error,
+                "unable to remove namespace index build owner metadata"
+            );
         }
     }
 }
