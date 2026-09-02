@@ -20,7 +20,9 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs2 = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
-opc-da-client = { package = "bytehound-opc-da-client", version = "0.2.8" }
+# Pin the reviewed native OPC DA client candidate while the combined change is validated.
+# It includes item-cost pacing, bounded iterator recovery, and DA3 continuation safeguards.
+opc-da-client = { package = "bytehound-opc-da-client", git = "https://github.com/bytehound-labs/opc-cli.git", rev = "e3a309790df0b12086cf1c8fa014d6baf9485bb2", version = "0.2.8" }
 opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
 opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
 prost = "0.14"

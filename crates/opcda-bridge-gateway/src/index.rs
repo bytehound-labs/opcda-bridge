@@ -30,6 +30,80 @@ const CLEANUP_BATCH_SIZE: usize = 10_000;
 const CLEANUP_BATCH_PAUSE: Duration = Duration::from_millis(1);
 const CLEANUP_RETRY_LIMIT: u32 = 3;
 const CLEANUP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const INDEX_PREPARATION_REQUIRED_KEY: &str = "index_preparation_required";
+const INDEX_PREPARATION_DETAIL_KEY: &str = "index_preparation_detail";
+const INDEX_PREPARATION_COMMAND: &str = "opcda-bridge-gateway index-prepare";
+
+const SECONDARY_INDEXES: [(&str, &str, &str); 4] = [
+    (
+        "entries_display_prefix",
+        "CREATE INDEX entries_display_prefix
+         ON entries(server, generation, display_name_norm)",
+        "CREATE INDEX IF NOT EXISTS entries_display_prefix
+         ON entries(server, generation, display_name_norm)",
+    ),
+    (
+        "entries_item_prefix",
+        "CREATE INDEX entries_item_prefix
+         ON entries(server, generation, item_id_norm)",
+        "CREATE INDEX IF NOT EXISTS entries_item_prefix
+         ON entries(server, generation, item_id_norm)",
+    ),
+    (
+        "entries_display_exact",
+        "CREATE INDEX entries_display_exact
+         ON entries(server, generation, display_name_norm, item_id_norm, item_id)",
+        "CREATE INDEX IF NOT EXISTS entries_display_exact
+         ON entries(server, generation, display_name_norm, item_id_norm, item_id)",
+    ),
+    (
+        "entries_item_exact",
+        "CREATE INDEX entries_item_exact
+         ON entries(
+             server, generation, item_id_norm, length(display_name_norm),
+             display_name_norm, item_id
+         )",
+        "CREATE INDEX IF NOT EXISTS entries_item_exact
+         ON entries(
+             server, generation, item_id_norm, length(display_name_norm),
+             display_name_norm, item_id
+         )",
+    ),
+];
+const FTS_OBJECT_NAME: &str = "entries_fts";
+const FTS_EXPECTED_SQL: &str = "CREATE VIRTUAL TABLE entries_fts USING fts5(
+    server UNINDEXED,
+    generation UNINDEXED,
+    item_id,
+    display_name,
+    breadcrumbs,
+    tokenize = 'trigram'
+)";
+const FTS_CREATE_SQL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+    server UNINDEXED,
+    generation UNINDEXED,
+    item_id,
+    display_name,
+    breadcrumbs,
+    tokenize = 'trigram'
+)";
+const FTS_POPULATE_SQL: &str = "INSERT INTO entries_fts(
+    server, generation, item_id, display_name, breadcrumbs
+)
+SELECT
+    e.server,
+    e.generation,
+    e.item_id,
+    e.display_name,
+    COALESCE((
+        SELECT group_concat(value, ' ')
+        FROM (
+            SELECT value
+            FROM json_each(e.breadcrumbs)
+            ORDER BY key
+        )
+    ), '')
+FROM entries AS e";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexState {
@@ -236,7 +310,7 @@ struct RuntimeStatus {
     health: HealthProbeState,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct PauseOverlayState {
     maintenance: bool,
     health: bool,
@@ -244,7 +318,7 @@ struct PauseOverlayState {
 
 struct HealthProbeObservation {
     healthy: bool,
-    failure_reason: String,
+    failure_reason: Option<String>,
     sentinel_configured: bool,
 }
 
@@ -264,7 +338,6 @@ struct BuildRunState {
     terminal: bool,
     accounted_active_time_ms: u64,
     persisted_item_count: u64,
-    rate_limiter: ItemRateLimiter,
     controller: Option<AdaptiveIndexController>,
     effective_duty_cycle_percent: u8,
     last_commit_at: Instant,
@@ -293,7 +366,6 @@ impl BuildRunState {
             terminal: false,
             accounted_active_time_ms: 0,
             persisted_item_count: 0,
-            rate_limiter: ItemRateLimiter::new(settings.item_rate_limit, settings.burst_size),
             controller,
             effective_duty_cycle_percent: settings.duty_cycle_percent,
             last_commit_at: Instant::now(),
@@ -685,48 +757,6 @@ struct QueryCache {
     capacity: usize,
 }
 
-struct ItemRateLimiter {
-    rate: f64,
-    capacity: f64,
-    tokens: f64,
-    last_refill: Instant,
-}
-
-impl ItemRateLimiter {
-    fn new(rate: u32, burst_size: u32) -> Self {
-        let capacity = f64::from(burst_size.max(1));
-        Self {
-            rate: f64::from(rate),
-            capacity,
-            tokens: capacity,
-            last_refill: Instant::now(),
-        }
-    }
-
-    async fn acquire(&mut self, control: &Arc<dyn InventoryControl>) -> bool {
-        if self.rate <= 0.0 {
-            return !control.is_cancelled();
-        }
-        loop {
-            if control.is_cancelled() {
-                return false;
-            }
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-            self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
-            self.last_refill = now;
-            if self.tokens >= 1.0 {
-                self.tokens -= 1.0;
-                return true;
-            }
-            let wait = Duration::from_secs_f64((1.0 - self.tokens) / self.rate);
-            if !wait_with_cancellation(control, wait).await {
-                return false;
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MaintenanceWindow {
     start_minute: u16,
@@ -841,17 +871,37 @@ struct CacheKey {
 struct IndexDb {
     path: PathBuf,
     connection: Connection,
+    preparation_required: bool,
+    preparation_detail: Option<String>,
+    full_text_validated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexPreparationOutcome {
+    AlreadyPrepared,
+    Prepared,
+}
+
+struct IndexObjectInspection {
+    missing: Vec<&'static str>,
+    fts_present: bool,
 }
 
 #[derive(Debug)]
 struct BuildFileLock {
     file: Option<fs::File>,
+    #[cfg(windows)]
+    owner_path: Option<PathBuf>,
 }
 
 impl BuildFileLock {
     fn acquire(database_path: &Path, server: &str) -> anyhow::Result<Self> {
         if database_path == Path::new(":memory:") {
-            return Ok(Self { file: None });
+            return Ok(Self {
+                file: None,
+                #[cfg(windows)]
+                owner_path: None,
+            });
         }
         Self::acquire_with(database_path, server, |file, metadata| {
             file.set_len(0)?;
@@ -916,7 +966,11 @@ impl BuildFileLock {
             let _ = FileExt::unlock(&file);
             return Err(error.into());
         }
-        Ok(Self { file: Some(file) })
+        Ok(Self {
+            file: Some(file),
+            #[cfg(windows)]
+            owner_path: Some(build_owner_path(database_path, server)),
+        })
     }
 
     fn is_held(database_path: &Path, server: &str) -> anyhow::Result<bool> {
@@ -948,26 +1002,308 @@ fn is_lock_conflict(error: &std::io::Error) -> bool {
 impl Drop for BuildFileLock {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
+            #[cfg(windows)]
+            self.remove_owner_metadata();
             let _ = FileExt::unlock(&file);
             drop(file);
         }
     }
 }
 
+#[cfg(windows)]
+impl BuildFileLock {
+    fn remove_owner_metadata(&mut self) {
+        let Some(owner_path) = self.owner_path.take() else {
+            return;
+        };
+        if let Err(error) = fs::remove_file(&owner_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                process_id = std::process::id(),
+                owner = %owner_path.display(),
+                error = %error,
+                "unable to remove namespace index build owner metadata"
+            );
+        }
+    }
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn inspect_index_object(
+    connection: &Connection,
+    name: &str,
+    expected_type: &str,
+    expected_sql: &str,
+) -> anyhow::Result<bool> {
+    let object = connection
+        .query_row(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((object_type, sql)) = object else {
+        return Ok(false);
+    };
+    if object_type != expected_type {
+        anyhow::bail!(
+            "namespace index object {name} has type {object_type}, expected {expected_type}"
+        );
+    }
+    if sql
+        .as_deref()
+        .is_none_or(|sql| normalize_schema_sql(sql) != normalize_schema_sql(expected_sql))
+    {
+        anyhow::bail!("namespace index object {name} has an unexpected definition");
+    }
+    Ok(true)
+}
+
+fn inspect_index_objects(connection: &Connection) -> anyhow::Result<IndexObjectInspection> {
+    let mut missing = Vec::new();
+    for (name, expected_sql, _) in SECONDARY_INDEXES {
+        if !inspect_index_object(connection, name, "index", expected_sql)? {
+            missing.push(name);
+        }
+    }
+    let fts_present = inspect_index_object(connection, FTS_OBJECT_NAME, "table", FTS_EXPECTED_SQL)?;
+    if !fts_present {
+        missing.push(FTS_OBJECT_NAME);
+    }
+    Ok(IndexObjectInspection {
+        missing,
+        fts_present,
+    })
+}
+
+fn create_missing_index_objects(
+    connection: &Connection,
+    missing: &[&'static str],
+) -> anyhow::Result<()> {
+    for name in missing {
+        if let Some((_, _, create_sql)) = SECONDARY_INDEXES
+            .iter()
+            .find(|(index_name, _, _)| index_name == name)
+        {
+            connection.execute(create_sql, [])?;
+        } else if *name == FTS_OBJECT_NAME {
+            connection.execute_batch(FTS_CREATE_SQL)?;
+            connection.execute_batch(FTS_POPULATE_SQL)?;
+        } else {
+            anyhow::bail!("unknown namespace index object {name}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_full_text_consistency(
+    connection: &Connection,
+    fts_present: bool,
+) -> anyhow::Result<()> {
+    if !fts_present {
+        return Ok(());
+    }
+
+    let relational_count = connection.query_row("SELECT COUNT(*) FROM entries", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let full_text_count = connection.query_row("SELECT COUNT(*) FROM entries_fts", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let rows_match = relational_count == full_text_count
+        && !connection.query_row(
+            "WITH expected AS (
+                 SELECT
+                     e.server,
+                     e.generation,
+                     e.item_id,
+                     e.display_name,
+                     COALESCE((
+                         SELECT group_concat(value, ' ')
+                         FROM (
+                             SELECT value
+                             FROM json_each(e.breadcrumbs)
+                             ORDER BY key
+                         )
+                     ), '') AS breadcrumbs
+                 FROM entries AS e
+             ),
+             actual AS (
+                 SELECT
+                     f.server,
+                     f.generation,
+                     f.item_id,
+                     f.display_name,
+                     CASE
+                         WHEN substr(ltrim(f.breadcrumbs), 1, 1) = '['
+                              AND json_valid(f.breadcrumbs)
+                         THEN COALESCE((
+                             SELECT group_concat(value, ' ')
+                             FROM (
+                                 SELECT value
+                                 FROM json_each(f.breadcrumbs)
+                                 ORDER BY key
+                             )
+                         ), '')
+                         ELSE f.breadcrumbs
+                     END AS breadcrumbs
+                 FROM entries_fts AS f
+             )
+             SELECT EXISTS(
+                 SELECT server, generation, item_id, display_name, breadcrumbs
+                 FROM expected
+                 EXCEPT
+                 SELECT server, generation, item_id, display_name, breadcrumbs
+                 FROM actual
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?
+        && !connection.query_row(
+            "WITH expected AS (
+                 SELECT
+                     e.server,
+                     e.generation,
+                     e.item_id,
+                     e.display_name,
+                     COALESCE((
+                         SELECT group_concat(value, ' ')
+                         FROM (
+                             SELECT value
+                             FROM json_each(e.breadcrumbs)
+                             ORDER BY key
+                         )
+                     ), '') AS breadcrumbs
+                 FROM entries AS e
+             ),
+             actual AS (
+                 SELECT
+                     f.server,
+                     f.generation,
+                     f.item_id,
+                     f.display_name,
+                     CASE
+                         WHEN substr(ltrim(f.breadcrumbs), 1, 1) = '['
+                              AND json_valid(f.breadcrumbs)
+                         THEN COALESCE((
+                             SELECT group_concat(value, ' ')
+                             FROM (
+                                 SELECT value
+                                 FROM json_each(f.breadcrumbs)
+                                 ORDER BY key
+                             )
+                         ), '')
+                         ELSE f.breadcrumbs
+                     END AS breadcrumbs
+                 FROM entries_fts AS f
+             )
+             SELECT EXISTS(
+                 SELECT server, generation, item_id, display_name, breadcrumbs
+                 FROM actual
+                 EXCEPT
+                 SELECT server, generation, item_id, display_name, breadcrumbs
+                 FROM expected
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if !rows_match {
+        anyhow::bail!("namespace index relational and full-text data are inconsistent");
+    }
+    Ok(())
+}
+
+fn read_preparation_state(connection: &Connection) -> anyhow::Result<(bool, Option<String>)> {
+    let value = |key: &str| -> anyhow::Result<Option<String>> {
+        Ok(connection
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    };
+    let required = match value(INDEX_PREPARATION_REQUIRED_KEY)?.as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(value) => {
+            anyhow::bail!("invalid namespace index preparation marker {value:?}");
+        }
+    };
+    Ok((required, value(INDEX_PREPARATION_DETAIL_KEY)?))
+}
+
+fn set_preparation_state(connection: &Connection, detail: &str) -> anyhow::Result<()> {
+    connection.execute(
+        "INSERT OR REPLACE INTO index_meta(key, value) VALUES (?1, '1')",
+        [INDEX_PREPARATION_REQUIRED_KEY],
+    )?;
+    connection.execute(
+        "INSERT OR REPLACE INTO index_meta(key, value) VALUES (?1, ?2)",
+        params![INDEX_PREPARATION_DETAIL_KEY, detail],
+    )?;
+    Ok(())
+}
+
+fn clear_preparation_state(connection: &Connection) -> anyhow::Result<()> {
+    connection.execute(
+        "DELETE FROM index_meta WHERE key IN (?1, ?2)",
+        params![INDEX_PREPARATION_REQUIRED_KEY, INDEX_PREPARATION_DETAIL_KEY],
+    )?;
+    Ok(())
+}
+
+fn missing_index_detail(missing: &[&str]) -> String {
+    format!("missing namespace index objects: {}", missing.join(", "))
+}
+
+fn preparation_error_message(detail: Option<&str>) -> String {
+    match detail.filter(|detail| !detail.trim().is_empty()) {
+        Some(detail) => format!(
+            "namespace index preparation required; {detail}; stop the gateway and run `{INDEX_PREPARATION_COMMAND}`"
+        ),
+        None => format!(
+            "namespace index preparation required; stop the gateway and run `{INDEX_PREPARATION_COMMAND}`"
+        ),
+    }
+}
+
+/// Prepare the secondary and full-text namespace indexes for an existing
+/// inventory without starting the gateway or contacting OPC DA.
+pub fn prepare_index_database(path: &Path) -> anyhow::Result<IndexPreparationOutcome> {
+    let mut database = IndexDb::open_validated(path)?;
+    database.prepare_indexes()
+}
+
 impl IndexDb {
     fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_resilient(path, false)
+    }
+
+    fn open_validated(path: &Path) -> anyhow::Result<Self> {
+        Self::open_resilient(path, true)
+    }
+
+    fn open_resilient(path: &Path, validate_full_text: bool) -> anyhow::Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
             fs::create_dir_all(parent)?;
         }
-        tracing::info!(
+        tracing::debug!(
             process_id = std::process::id(),
             database = %path.display(),
             "opening namespace index database"
         );
-        match Self::open_once(path) {
+        match Self::open_once_with_validation(path, validate_full_text) {
             Ok(db) => Ok(db),
             Err(error) => {
                 if !is_quarantinable_index_error(&error) {
@@ -983,12 +1319,17 @@ impl IndexDb {
                         "quarantined invalid namespace index"
                     );
                 }
-                Self::open_once(path)
+                Self::open_once_with_validation(path, validate_full_text)
             }
         }
     }
 
+    #[cfg(test)]
     fn open_once(path: &Path) -> anyhow::Result<Self> {
+        Self::open_once_with_validation(path, true)
+    }
+
+    fn open_once_with_validation(path: &Path, validate_full_text: bool) -> anyhow::Result<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1045,18 +1386,6 @@ impl IndexDb {
                  FOREIGN KEY (server, generation)
                    REFERENCES generations(server, generation)
                    ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS entries_display_prefix
-               ON entries(server, generation, display_name_norm);
-             CREATE INDEX IF NOT EXISTS entries_item_prefix
-               ON entries(server, generation, item_id_norm);
-             CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-                 server UNINDEXED,
-                 generation UNINDEXED,
-                 item_id,
-                 display_name,
-                 breadcrumbs,
-                 tokenize = 'trigram'
              );",
         )?;
         if schema_version == Some(2) {
@@ -1074,18 +1403,40 @@ impl IndexDb {
                 [SCHEMA_VERSION.to_string()],
             )?;
         }
-        let relational_entries_exist =
-            connection.query_row("SELECT EXISTS(SELECT 1 FROM entries LIMIT 1)", [], |row| {
-                row.get::<_, bool>(0)
-            })?;
-        let full_text_entries_exist = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM entries_fts LIMIT 1)",
+        let (stored_preparation_required, stored_preparation_detail) =
+            read_preparation_state(&connection)?;
+        let inspection = inspect_index_objects(&connection)?;
+        let mut full_text_validated = validate_full_text;
+        if validate_full_text {
+            validate_full_text_consistency(&connection, inspection.fts_present)?;
+        }
+        let populated = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations LIMIT 1)
+             OR EXISTS(SELECT 1 FROM entries LIMIT 1)",
             [],
             |row| row.get::<_, bool>(0),
         )?;
-        if relational_entries_exist != full_text_entries_exist {
-            anyhow::bail!("namespace index relational and full-text data are inconsistent");
-        }
+        let (preparation_required, preparation_detail) = if inspection.missing.is_empty() {
+            clear_preparation_state(&connection)?;
+            (false, None)
+        } else if populated {
+            let had_preparation_detail = stored_preparation_detail
+                .as_deref()
+                .is_some_and(|detail| !detail.trim().is_empty());
+            let detail = stored_preparation_detail
+                .filter(|detail| !detail.trim().is_empty())
+                .unwrap_or_else(|| missing_index_detail(&inspection.missing));
+            if !stored_preparation_required || !had_preparation_detail {
+                set_preparation_state(&connection, &detail)?;
+            }
+            (true, Some(detail))
+        } else {
+            create_missing_index_objects(&connection, &inspection.missing)?;
+            validate_full_text_consistency(&connection, true)?;
+            full_text_validated = true;
+            clear_preparation_state(&connection)?;
+            (false, None)
+        };
         let staging_servers = {
             let mut statement = connection
                 .prepare("SELECT DISTINCT server FROM generations WHERE state = 'staging'")?;
@@ -1125,6 +1476,9 @@ impl IndexDb {
         Ok(Self {
             path: path.to_path_buf(),
             connection,
+            preparation_required,
+            preparation_detail,
+            full_text_validated,
         })
     }
 
@@ -1132,10 +1486,92 @@ impl IndexDb {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "query_only", true)?;
+        let (stored_preparation_required, stored_preparation_detail) =
+            read_preparation_state(&connection)?;
+        let inspection = inspect_index_objects(&connection)?;
         Ok(Self {
             path: path.to_path_buf(),
             connection,
+            preparation_required: stored_preparation_required || !inspection.missing.is_empty(),
+            preparation_detail: stored_preparation_detail.or_else(|| {
+                (!inspection.missing.is_empty()).then(|| missing_index_detail(&inspection.missing))
+            }),
+            full_text_validated: false,
         })
+    }
+
+    fn preparation_error(&self) -> Option<String> {
+        self.preparation_required
+            .then(|| preparation_error_message(self.preparation_detail.as_deref()))
+    }
+
+    fn require_prepared(&self) -> anyhow::Result<()> {
+        if let Some(error) = self.preparation_error() {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+
+    fn prepare_indexes(&mut self) -> anyhow::Result<IndexPreparationOutcome> {
+        let inspection = inspect_index_objects(&self.connection)?;
+        if !self.full_text_validated {
+            validate_full_text_consistency(&self.connection, inspection.fts_present)?;
+            self.full_text_validated = true;
+        }
+        if inspection.missing.is_empty() {
+            clear_preparation_state(&self.connection)?;
+            self.preparation_required = false;
+            self.preparation_detail = None;
+            return Ok(IndexPreparationOutcome::AlreadyPrepared);
+        }
+
+        let transaction = self.connection.transaction()?;
+        let result = (|| -> anyhow::Result<()> {
+            create_missing_index_objects(&transaction, &inspection.missing)?;
+            let prepared = inspect_index_objects(&transaction)?;
+            validate_full_text_consistency(&transaction, prepared.fts_present)?;
+            if !prepared.missing.is_empty() {
+                anyhow::bail!(
+                    "namespace index preparation did not create: {}",
+                    prepared.missing.join(", ")
+                );
+            }
+            clear_preparation_state(&transaction)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => match transaction.commit() {
+                Ok(()) => {
+                    self.preparation_required = false;
+                    self.preparation_detail = None;
+                    self.full_text_validated = true;
+                    Ok(IndexPreparationOutcome::Prepared)
+                }
+                Err(error) => {
+                    self.preparation_required = true;
+                    let detail = format!("index preparation failed: {error:#}");
+                    self.preparation_detail = Some(detail.clone());
+                    if let Err(metadata_error) = set_preparation_state(&self.connection, &detail) {
+                        return Err(anyhow::anyhow!(
+                            "{error:#}; unable to record index preparation failure: {metadata_error:#}"
+                        ));
+                    }
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = transaction.rollback();
+                self.preparation_required = true;
+                let detail = format!("index preparation failed: {error:#}");
+                self.preparation_detail = Some(detail.clone());
+                if let Err(metadata_error) = set_preparation_state(&self.connection, &detail) {
+                    return Err(anyhow::anyhow!(
+                        "{error:#}; unable to record index preparation failure: {metadata_error:#}"
+                    ));
+                }
+                Err(error)
+            }
+        }
     }
 
     fn storage_diagnostics(&self) -> StorageDiagnostics {
@@ -1561,10 +1997,13 @@ impl IndexDb {
         if mode == 1 {
             return self.search_exact(server, generation, &normalized_query, limit);
         }
+        if mode == 2 {
+            return self.search_prefix(server, generation, &normalized_query, limit);
+        }
         let fts_compatible = normalized_query
             .split_whitespace()
             .all(|term| term.chars().count() >= 3);
-        if normalized_query.chars().count() >= 3 && fts_compatible && mode != 2 {
+        if normalized_query.chars().count() >= 3 && fts_compatible {
             return self.search_full_text(server, generation, &normalized_query, limit);
         }
         let mut sql = format!(
@@ -1572,25 +2011,13 @@ impl IndexDb {
              WHERE e.server = ? AND e.generation = {generation}"
         );
         let mut values = vec![server.to_string()];
-        match mode {
-            2 => {
-                let pattern = format!("{}%", escape_like(&normalized_query));
-                sql.push_str(
-                    " AND (e.display_name_norm LIKE ? ESCAPE '\\'
-                        OR e.item_id_norm LIKE ? ESCAPE '\\')",
-                );
-                values.extend([pattern.clone(), pattern]);
-            }
-            _ => {
-                let pattern = format!("%{}%", escape_like(&normalized_query));
-                sql.push_str(
-                    " AND (e.display_name_norm LIKE ? ESCAPE '\\'
-                        OR e.item_id_norm LIKE ? ESCAPE '\\'
-                        OR e.breadcrumbs LIKE ? ESCAPE '\\')",
-                );
-                values.extend([pattern.clone(), pattern.clone(), pattern]);
-            }
-        }
+        let pattern = format!("%{}%", escape_like(&normalized_query));
+        sql.push_str(
+            " AND (e.display_name_norm LIKE ? ESCAPE '\\'
+                OR e.item_id_norm LIKE ? ESCAPE '\\'
+                OR e.breadcrumbs LIKE ? ESCAPE '\\')",
+        );
+        values.extend([pattern.clone(), pattern.clone(), pattern]);
         sql.push_str(
             " ORDER BY CASE
                  WHEN e.display_name_norm = ? THEN 0
@@ -1640,6 +2067,23 @@ impl IndexDb {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    fn search_prefix(
+        &self,
+        server: &str,
+        generation: u64,
+        normalized_query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<IndexedMatch>> {
+        let upper_bound = prefix_upper_bound(normalized_query);
+        self.search_indexed(
+            server,
+            generation,
+            normalized_query,
+            limit,
+            IndexedSearchKind::Prefix(upper_bound.as_deref()),
+        )
+    }
+
     fn search_exact(
         &self,
         server: &str,
@@ -1650,46 +2094,35 @@ impl IndexDb {
         let generation = i64::try_from(generation)
             .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
         let candidate_limit = i64::from(limit.saturating_add(1));
+        let candidate_limit_usize = usize::try_from(candidate_limit).unwrap_or(usize::MAX);
         let mut candidates: HashMap<String, (SearchCandidate, IndexedMatch)> = HashMap::new();
 
-        for column in ["display_name_norm", "item_id_norm"] {
-            let sql = format!(
-                "SELECT e.item_id, e.display_name, e.display_name_norm,
-                        e.item_id_norm, e.kind, e.breadcrumbs
-                 FROM entries e
-                 WHERE e.server = ?1 AND e.generation = ?2 AND e.{column} = ?3
-                 ORDER BY length(e.display_name_norm), e.display_name_norm,
-                          e.item_id_norm, e.item_id
-                 LIMIT ?4"
-            );
-            let mut statement = self.connection.prepare(&sql)?;
+        let exact_queries = [
+            "SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.display_name_norm = ?3
+             ORDER BY e.item_id_norm, e.item_id
+             LIMIT ?4",
+            "SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.item_id_norm = ?3
+               AND e.display_name_norm <> ?3
+             ORDER BY length(e.display_name_norm), e.display_name_norm,
+                      e.item_id_norm, e.item_id
+             LIMIT ?4",
+        ];
+        for (query_index, sql) in exact_queries.iter().enumerate() {
+            if query_index == 1 && candidates.len() >= candidate_limit_usize {
+                break;
+            }
+            let mut statement = self.connection.prepare(sql)?;
             let query_params = params![server, generation, normalized_query, candidate_limit];
-            let row_mapper = |row: &rusqlite::Row<'_>| {
-                let item_id = row.get::<_, String>(0)?;
-                let display_name = row.get::<_, String>(1)?;
-                let display_name_norm = row.get::<_, String>(2)?;
-                let item_id_norm = row.get::<_, String>(3)?;
-                let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
-                let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
-                let candidate = SearchCandidate {
-                    rank: SearchRank {
-                        tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
-                        display_name_len: display_name_norm.chars().count(),
-                        display_name_norm,
-                        item_id_norm,
-                    },
-                    item_id: item_id.clone(),
-                };
-                Ok((
-                    candidate,
-                    IndexedMatch {
-                        item_id,
-                        display_name,
-                        kind,
-                        breadcrumbs,
-                    },
-                ))
-            };
+            let row_mapper =
+                |row: &rusqlite::Row<'_>| indexed_candidate_from_row(row, normalized_query);
             let rows = statement.query_map(query_params, row_mapper)?;
             let rows = rows.collect::<Result<Vec<_>, _>>()?;
             for (candidate, value) in rows {
@@ -1699,10 +2132,90 @@ impl IndexDb {
             }
         }
 
-        let mut candidates = candidates.into_values().collect::<Vec<_>>();
-        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
-        Ok(candidates.into_iter().map(|(_, value)| value).collect())
+        Ok(finish_indexed_candidates(candidates, limit))
+    }
+
+    fn search_indexed(
+        &self,
+        server: &str,
+        generation: u64,
+        normalized_query: &str,
+        limit: u32,
+        kind: IndexedSearchKind<'_>,
+    ) -> anyhow::Result<Vec<IndexedMatch>> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
+        let candidate_limit = i64::from(limit.saturating_add(1));
+        let mut candidates: HashMap<String, (SearchCandidate, IndexedMatch)> = HashMap::new();
+
+        for column in ["display_name_norm", "item_id_norm"] {
+            let (range, order, limit_parameter) = match kind {
+                IndexedSearchKind::Prefix(Some(_)) => (
+                    format!("e.{column} >= ?3 AND e.{column} < ?4"),
+                    "CASE
+                        WHEN e.display_name_norm = ?3 THEN 0
+                        WHEN e.item_id_norm = ?3 THEN 1
+                        WHEN e.display_name_norm >= ?3 AND e.display_name_norm < ?4 THEN 2
+                        WHEN e.item_id_norm >= ?3 AND e.item_id_norm < ?4 THEN 3
+                        ELSE 6
+                      END,
+                      length(e.display_name_norm), e.display_name_norm,
+                      e.item_id_norm, e.item_id"
+                        .to_string(),
+                    5,
+                ),
+                IndexedSearchKind::Prefix(None) => (
+                    format!("e.{column} >= ?3"),
+                    "CASE
+                        WHEN e.display_name_norm = ?3 THEN 0
+                        WHEN e.item_id_norm = ?3 THEN 1
+                        WHEN substr(e.display_name_norm, 1, length(?3)) = ?3 THEN 2
+                        WHEN substr(e.item_id_norm, 1, length(?3)) = ?3 THEN 3
+                        ELSE 6
+                      END,
+                      length(e.display_name_norm), e.display_name_norm,
+                      e.item_id_norm, e.item_id"
+                        .to_string(),
+                    4,
+                ),
+            };
+            let sql = format!(
+                "SELECT e.item_id, e.display_name, e.display_name_norm,
+                        e.item_id_norm, e.kind, e.breadcrumbs
+                 FROM entries e
+                 WHERE e.server = ?1 AND e.generation = ?2 AND {range}
+                 ORDER BY {order}
+                 LIMIT ?{limit_parameter}"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let row_mapper =
+                |row: &rusqlite::Row<'_>| indexed_candidate_from_row(row, normalized_query);
+            let rows = match kind {
+                IndexedSearchKind::Prefix(Some(upper_bound)) => statement.query_map(
+                    params![
+                        server,
+                        generation,
+                        normalized_query,
+                        upper_bound,
+                        candidate_limit
+                    ],
+                    &row_mapper,
+                ),
+                IndexedSearchKind::Prefix(None) => statement.query_map(
+                    params![server, generation, normalized_query, candidate_limit],
+                    &row_mapper,
+                ),
+            };
+            let rows = rows?;
+            for row in rows {
+                let (candidate, value) = row?;
+                candidates
+                    .entry(value.item_id.clone())
+                    .or_insert((candidate, value));
+            }
+        }
+
+        Ok(finish_indexed_candidates(candidates, limit))
     }
 
     fn search_full_text(
@@ -1775,6 +2288,11 @@ impl IndexDb {
     }
 }
 
+#[derive(Clone, Copy)]
+enum IndexedSearchKind<'a> {
+    Prefix(Option<&'a str>),
+}
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct SearchCandidate {
     rank: SearchRank,
@@ -1807,6 +2325,24 @@ fn search_rank(query: &str, display_name_norm: &str, item_id_norm: &str) -> u8 {
     }
 }
 
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars = prefix.chars().collect::<Vec<_>>();
+    for index in (0..chars.len()).rev() {
+        let value = chars[index] as u32;
+        let next = match value {
+            0x10ffff => None,
+            0xd7ff => char::from_u32(0xe000),
+            _ => char::from_u32(value + 1),
+        };
+        if let Some(next) = next {
+            chars[index] = next;
+            chars.truncate(index + 1);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
 fn build_fts_query(query: &str) -> String {
     query
         .split_whitespace()
@@ -1829,6 +2365,46 @@ fn parse_indexed_breadcrumbs(value: String) -> rusqlite::Result<Vec<String>> {
     serde_json::from_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
     })
+}
+
+fn indexed_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+    normalized_query: &str,
+) -> rusqlite::Result<(SearchCandidate, IndexedMatch)> {
+    let item_id = row.get::<_, String>(0)?;
+    let display_name = row.get::<_, String>(1)?;
+    let display_name_norm = row.get::<_, String>(2)?;
+    let item_id_norm = row.get::<_, String>(3)?;
+    let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
+    let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
+    let candidate = SearchCandidate {
+        rank: SearchRank {
+            tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
+            display_name_len: display_name_norm.chars().count(),
+            display_name_norm,
+            item_id_norm,
+        },
+        item_id: item_id.clone(),
+    };
+    Ok((
+        candidate,
+        IndexedMatch {
+            item_id,
+            display_name,
+            kind,
+            breadcrumbs,
+        },
+    ))
+}
+
+fn finish_indexed_candidates(
+    candidates: HashMap<String, (SearchCandidate, IndexedMatch)>,
+    limit: u32,
+) -> Vec<IndexedMatch> {
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
+    candidates.into_iter().map(|(_, value)| value).collect()
 }
 
 #[derive(Default)]
@@ -1973,7 +2549,7 @@ fn cleanup_one_batch(
         return Ok(CleanupBatchResult::Shutdown);
     }
     if cleanup_build_is_active(active_builds) {
-        tracing::info!(
+        tracing::debug!(
             process_id = std::process::id(),
             database = %path.display(),
             server,
@@ -1990,7 +2566,7 @@ fn cleanup_one_batch(
         .lock()
         .map_err(|_| anyhow::anyhow!("index writer gate poisoned"))?;
     if cleanup_build_is_active(active_builds) {
-        tracing::info!(
+        tracing::debug!(
             process_id = std::process::id(),
             database = %path.display(),
             server,
@@ -2031,6 +2607,15 @@ fn cleanup_obsolete_generations_coordinated(
 ) -> anyhow::Result<CleanupStats> {
     let cleanup_started = Instant::now();
     let read_only = IndexDb::open_read_only(path)?;
+    if read_only.preparation_required {
+        tracing::debug!(
+            process_id = std::process::id(),
+            database = %path.display(),
+            server,
+            "skipped namespace index cleanup because index preparation is required"
+        );
+        return Ok(CleanupStats::default());
+    }
     if !read_only.has_obsolete_generations(server)? {
         tracing::debug!(
             process_id = std::process::id(),
@@ -2473,6 +3058,7 @@ pub struct IndexManager<C: OpcClient> {
     client: Arc<C>,
     settings: ResolvedIndexConfig,
     database: Arc<Mutex<Option<IndexDb>>>,
+    database_initialized: AtomicBool,
     coordination: Arc<DatabaseCoordination>,
     writer_gate: Arc<Mutex<()>>,
     build_changed: Arc<tokio::sync::Notify>,
@@ -2537,7 +3123,12 @@ impl<C: OpcClient> Drop for BuildFinalizationGuard<C> {
         if !self.armed {
             return;
         }
-        self.control.cancel();
+        self.manager.request_inventory_cancel(
+            &self.server,
+            Some(self.generation),
+            &self.control,
+            "build_unwind",
+        );
         self.manager.fail_generation_and_schedule_cleanup(
             &self.server,
             self.generation,
@@ -2596,6 +3187,7 @@ impl<C: OpcClient> IndexManager<C> {
             client,
             settings,
             database: Arc::new(Mutex::new(None)),
+            database_initialized: AtomicBool::new(false),
             coordination: Arc::clone(&coordination),
             writer_gate: Arc::clone(&coordination.writer_gate),
             build_changed: Arc::clone(&coordination.build_changed),
@@ -2764,13 +3356,13 @@ impl<C: OpcClient> IndexManager<C> {
     pub async fn shutdown_background_indexing(&self) {
         self.background_tasks.request_shutdown();
         if let Ok(runtime) = self.runtime.lock() {
-            for state in runtime.values() {
+            for (server, state) in runtime.iter() {
                 if let Some(control) = state
                     .build
                     .as_ref()
                     .and_then(|build| build.control.as_ref())
                 {
-                    control.cancel();
+                    self.request_inventory_cancel(server, None, control, "gateway_shutdown");
                 }
             }
         }
@@ -2986,7 +3578,7 @@ impl<C: OpcClient> IndexManager<C> {
             match self.settings.initial_build_policy {
                 InitialBuildPolicy::Immediate => true,
                 InitialBuildPolicy::Manual => {
-                    tracing::info!(
+                    tracing::debug!(
                         server = %status.server,
                         "automatic namespace index build is disabled until a manual refresh"
                     );
@@ -3021,22 +3613,36 @@ impl<C: OpcClient> IndexManager<C> {
     fn set_pause_overlay(&self, server: &str, maintenance: Option<bool>, health: Option<bool>) {
         let update_result = self.pause_overlays.lock().map(|mut overlays| {
             let state = overlays.entry(server.to_string()).or_default();
+            let previous = *state;
             if let Some(value) = maintenance {
                 state.maintenance = value;
             }
             if let Some(value) = health {
                 state.health = value;
             }
+            let current = *state;
             if !state.maintenance && !state.health {
                 overlays.remove(server);
             }
+            (previous, current)
         });
-        if update_result.is_err() {
-            tracing::error!(
-                server,
-                "unable to update namespace index pause overlays because the overlay lock is poisoned"
-            );
-            return;
+        match update_result {
+            Ok((previous, current)) => {
+                if previous != current {
+                    tracing::info!(
+                        server,
+                        previous_maintenance = previous.maintenance,
+                        previous_health = previous.health,
+                        maintenance = current.maintenance,
+                        health = current.health,
+                        "namespace index pause overlay changed"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(server, error = %error, "namespace index pause overlay lock poisoned");
+                return;
+            }
         }
         self.reconcile_pause_state(server);
     }
@@ -3068,44 +3674,63 @@ impl<C: OpcClient> IndexManager<C> {
                 return;
             }
         };
-        let (control, reason) = match self.runtime.lock() {
-            Ok(mut runtime) => {
-                let Some(build) = runtime
-                    .get_mut(server)
-                    .and_then(|state| state.build.as_mut())
-                else {
+        let (control, reason, previous_reason, foreground_users, operator_paused, controller_state) =
+            match self.runtime.lock() {
+                Ok(mut runtime) => {
+                    let Some(build) = runtime
+                        .get_mut(server)
+                        .and_then(|state| state.build.as_mut())
+                    else {
+                        return;
+                    };
+                    let foreground = build.foreground_users > 0
+                        || build
+                            .quiet_until
+                            .is_some_and(|deadline| deadline > Instant::now());
+                    let reason = if build.operator_paused {
+                        Some(crate::controller::PauseReason::Operator)
+                    } else if foreground {
+                        Some(crate::controller::PauseReason::Foreground)
+                    } else if overlay.maintenance {
+                        Some(crate::controller::PauseReason::Maintenance)
+                    } else if overlay.health {
+                        Some(crate::controller::PauseReason::OpcHealth)
+                    } else if let Some(crate::controller::ControllerState::Paused(reason)) =
+                        build.controller_state
+                    {
+                        Some(reason)
+                    } else {
+                        None
+                    };
+                    let previous_reason = build.pause_reason;
+                    build.pause_reason = reason;
+                    (
+                        build.control.clone(),
+                        reason,
+                        previous_reason,
+                        build.foreground_users,
+                        build.operator_paused,
+                        build.controller_state,
+                    )
+                }
+                Err(error) => {
+                    tracing::error!(server, error = %error, "namespace index runtime lock poisoned");
                     return;
-                };
-                let foreground = build.foreground_users > 0
-                    || build
-                        .quiet_until
-                        .is_some_and(|deadline| deadline > Instant::now());
-                let reason = if build.operator_paused {
-                    Some(crate::controller::PauseReason::Operator)
-                } else if foreground {
-                    Some(crate::controller::PauseReason::Foreground)
-                } else if overlay.maintenance {
-                    Some(crate::controller::PauseReason::Maintenance)
-                } else if overlay.health {
-                    Some(crate::controller::PauseReason::OpcHealth)
-                } else if let Some(crate::controller::ControllerState::Paused(reason)) =
-                    build.controller_state
-                {
-                    Some(reason)
-                } else {
-                    None
-                };
-                build.pause_reason = reason;
-                (build.control.clone(), reason)
-            }
-            Err(_) => {
-                tracing::error!(
-                    server,
-                    "unable to reconcile namespace index pause state because the runtime lock is poisoned"
-                );
-                return;
-            }
-        };
+                }
+            };
+        if previous_reason != reason {
+            tracing::info!(
+                server,
+                previous_reason = previous_reason.map(|value| value.as_str()),
+                reason = reason.map(|value| value.as_str()),
+                foreground_users,
+                operator_paused,
+                controller_state = ?controller_state,
+                maintenance_overlay = overlay.maintenance,
+                health_overlay = overlay.health,
+                "namespace index pause reason changed"
+            );
+        }
         if let Some(control) = control {
             if reason.is_some() {
                 control.pause();
@@ -3133,6 +3758,13 @@ impl<C: OpcClient> IndexManager<C> {
             build.foreground_users = foreground_users;
             build.quiet_until = None;
         }
+        if foreground_users == 1 {
+            tracing::info!(
+                server,
+                foreground_users,
+                "namespace index foreground activity started"
+            );
+        }
         self.reconcile_pause_state(server);
         ForegroundGuard {
             manager: Arc::clone(self),
@@ -3142,15 +3774,17 @@ impl<C: OpcClient> IndexManager<C> {
 
     fn decrement_foreground_users(&self, server: &str) {
         if let Ok(mut users) = self.foreground_users.lock() {
-            let remaining = users
-                .get_mut(server)
-                .map(|count| {
-                    *count = count.saturating_sub(1);
-                    *count
-                })
-                .unwrap_or(0);
-            if remaining == 0 {
+            let ended = users.get_mut(server).is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+            if ended {
                 users.remove(server);
+                tracing::info!(
+                    server,
+                    foreground_users = 0,
+                    "namespace index foreground activity ended"
+                );
             }
         }
     }
@@ -3254,6 +3888,10 @@ impl<C: OpcClient> IndexManager<C> {
             runtime.last_error.as_deref(),
             promotion_read_error.as_deref(),
         );
+        if let Some(error) = self.database_preparation_error(is_promoting)? {
+            status.state = IndexState::Failed;
+            status.last_error = Some(error);
+        }
         status.foreground_metrics = self.foreground_metrics_snapshot(server);
         status.host_metrics = self.host_metrics.snapshot();
         status.storage = storage;
@@ -3284,7 +3922,19 @@ impl<C: OpcClient> IndexManager<C> {
                 }
             };
         }
-        Ok((self.with_database_read(|db| db.status_rows(server))?, None))
+        Ok((
+            self.with_database_read_unchecked(|db| db.status_rows(server))?,
+            None,
+        ))
+    }
+
+    fn database_preparation_error(&self, is_promoting: bool) -> anyhow::Result<Option<String>> {
+        if is_promoting && self.settings.database_path != Path::new(":memory:") {
+            return Ok(IndexDb::open_read_only(&self.settings.database_path)
+                .ok()
+                .and_then(|database| database.preparation_error()));
+        }
+        self.with_database_read_unchecked(|database| Ok(database.preparation_error()))
     }
 
     fn runtime_status(&self, server: &str) -> anyhow::Result<RuntimeStatus> {
@@ -3548,11 +4198,27 @@ impl<C: OpcClient> IndexManager<C> {
         server: &str,
         force: bool,
     ) -> anyhow::Result<IndexStatus> {
+        let refresh_started = Instant::now();
+        tracing::info!(server, force, "namespace index refresh startup started");
         self.require_configured(server)?;
+        let preparation_started = Instant::now();
+        self.ensure_database_prepared()?;
+        tracing::debug!(
+            server,
+            elapsed_ms = preparation_started.elapsed().as_millis(),
+            "namespace index database preparation check completed"
+        );
         if self.background_tasks.is_shutting_down() {
             return self.status(server).await;
         }
+        let storage_started = Instant::now();
         let storage = self.with_database_read(|db| Ok(db.storage_diagnostics()))?;
+        tracing::debug!(
+            server,
+            elapsed_ms = storage_started.elapsed().as_millis(),
+            free_bytes = ?storage.free_bytes,
+            "namespace index storage diagnostics completed"
+        );
         if storage.free_bytes.is_some_and(|free| {
             free < self
                 .settings
@@ -3568,7 +4234,14 @@ impl<C: OpcClient> IndexManager<C> {
             );
         }
         self.load_persisted_retry_state(server)?;
+        let reservation_started = Instant::now();
         let build_ownership = self.reserve_refresh_build(server, force)?;
+        tracing::debug!(
+            server,
+            elapsed_ms = reservation_started.elapsed().as_millis(),
+            reserved = build_ownership.is_some(),
+            "namespace index build reservation completed"
+        );
         let Some(build_ownership) = build_ownership else {
             return self.status(server).await;
         };
@@ -3580,6 +4253,11 @@ impl<C: OpcClient> IndexManager<C> {
         else {
             return self.status(server).await;
         };
+        tracing::debug!(
+            server,
+            elapsed_ms = refresh_started.elapsed().as_millis(),
+            "namespace index inventory startup returned a control handle"
+        );
         let Some(control_was_cancelled_before_attach) =
             self.attach_refresh_control(server, &build_ownership, &handle, initial_limits)?
         else {
@@ -3595,7 +4273,12 @@ impl<C: OpcClient> IndexManager<C> {
             "started namespace index inventory"
         );
         if self.background_tasks.is_shutting_down() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "gateway_shutdown_before_capability_probe",
+            );
             self.finish_build_owned(server, &build_ownership, None);
             return self.status(server).await;
         }
@@ -3610,6 +4293,12 @@ impl<C: OpcClient> IndexManager<C> {
         else {
             return self.status(server).await;
         };
+        tracing::info!(
+            server,
+            generation,
+            elapsed_ms = refresh_started.elapsed().as_millis(),
+            "namespace index generation created"
+        );
         self.launch_refresh_build(
             server,
             generation,
@@ -3705,6 +4394,14 @@ impl<C: OpcClient> IndexManager<C> {
         build_ownership: &Arc<()>,
         initial_limits: InventoryLimits,
     ) -> anyhow::Result<Option<InventoryHandle>> {
+        let started = Instant::now();
+        tracing::info!(
+            server,
+            batch_size = initial_limits.batch_size,
+            item_rate_per_second = ?initial_limits.item_rate_per_second,
+            duty_cycle_percent = initial_limits.duty_cycle_percent,
+            "gateway requesting native inventory startup"
+        );
         match self
             .with_opc_timeout(
                 "start inventory",
@@ -3713,7 +4410,14 @@ impl<C: OpcClient> IndexManager<C> {
             )
             .await
         {
-            Ok(handle) => Ok(Some(handle)),
+            Ok(handle) => {
+                tracing::info!(
+                    server,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "gateway native inventory startup completed"
+                );
+                Ok(Some(handle))
+            }
             Err(error) => {
                 if self.take_pending_cancel(server) {
                     self.finish_build_owned(server, build_ownership, None);
@@ -3737,7 +4441,12 @@ impl<C: OpcClient> IndexManager<C> {
             let message = format!("unable to apply initial inventory pacing: {error}");
             let cancelled = self.take_pending_cancel(server)
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "startup_pacing_failure_cleanup",
+            );
             if cancelled {
                 self.finish_build_owned(server, build_ownership, None);
                 return Ok(None);
@@ -3760,7 +4469,12 @@ impl<C: OpcClient> IndexManager<C> {
         if let Err(error) = control_result {
             let cancelled = self.take_pending_cancel(server)
                 || (!control_was_cancelled_before_attach && handle.control.is_cancelled());
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "startup_runtime_attach_failure_cleanup",
+            );
             if cancelled {
                 self.finish_build_owned(server, build_ownership, None);
                 return Ok(None);
@@ -3769,7 +4483,12 @@ impl<C: OpcClient> IndexManager<C> {
             return Err(error);
         }
         if self.take_pending_cancel(server) {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                None,
+                &handle.control,
+                "pending_cancel_after_attach",
+            );
             self.finish_build_for_control_owned(server, &handle.control, build_ownership, None);
             return Ok(None);
         }
@@ -3783,6 +4502,8 @@ impl<C: OpcClient> IndexManager<C> {
         build_ownership: &Arc<()>,
         control_was_cancelled_before_attach: bool,
     ) -> anyhow::Result<Option<u64>> {
+        let started = Instant::now();
+        tracing::info!(server, "gateway capability probe for generation started");
         let (organization, source) = match self
             .with_opc_timeout(
                 "inventory capability probe",
@@ -3790,10 +4511,24 @@ impl<C: OpcClient> IndexManager<C> {
             )
             .await
         {
-            Ok(capabilities) => (capabilities.organization, capabilities.source),
+            Ok(capabilities) => {
+                tracing::info!(
+                    server,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    organization = ?capabilities.organization,
+                    source = ?capabilities.source,
+                    "gateway capability probe for generation completed"
+                );
+                (capabilities.organization, capabilities.source)
+            }
             Err(error) => {
                 let cancelled = !control_was_cancelled_before_attach && control.is_cancelled();
-                control.cancel();
+                self.request_inventory_cancel(
+                    server,
+                    None,
+                    control,
+                    "capability_probe_failure_cleanup",
+                );
                 if cancelled {
                     self.finish_build_for_control_owned(server, control, build_ownership, None);
                     return Ok(None);
@@ -3817,7 +4552,12 @@ impl<C: OpcClient> IndexManager<C> {
                     "namespace index database operation failed"
                 );
                 let cancelled = !control_was_cancelled_before_attach && control.is_cancelled();
-                control.cancel();
+                self.request_inventory_cancel(
+                    server,
+                    None,
+                    control,
+                    "start_generation_failure_cleanup",
+                );
                 if cancelled {
                     self.finish_build_for_control_owned(server, control, build_ownership, None);
                     return Ok(None);
@@ -3859,7 +4599,12 @@ impl<C: OpcClient> IndexManager<C> {
             });
         if let Err(error) = control_result {
             let cancelled = handle.control.is_cancelled();
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "startup_runtime_validation_failure_cleanup",
+            );
             self.abandon_generation(server, generation, &error.to_string());
             if cancelled {
                 self.finish_build_owned(server, &build_ownership, None);
@@ -3869,14 +4614,24 @@ impl<C: OpcClient> IndexManager<C> {
             return Err(error);
         }
         if !control_was_cancelled_before_attach && handle.control.is_cancelled() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "startup_cancelled",
+            );
             self.abandon_generation(server, generation, "index build cancelled during startup");
             self.finish_build_for_control_owned(server, &handle.control, &build_ownership, None);
             return Ok(());
         }
         self.reconcile_pause_state(server);
         if self.background_tasks.is_shutting_down() {
-            handle.control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &handle.control,
+                "gateway_shutdown_before_build_spawn",
+            );
             self.abandon_generation(server, generation, "gateway shutdown before index build");
             self.finish_build_owned(server, &build_ownership, None);
             return Ok(());
@@ -3896,7 +4651,12 @@ impl<C: OpcClient> IndexManager<C> {
                     .await;
             })
         {
-            control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                &control,
+                "build_spawn_rejected",
+            );
             self.abandon_generation(server, generation, "index build task was not started");
             self.finish_build_for_control_owned(server, &control, &build_ownership, None);
         }
@@ -4023,6 +4783,24 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    fn request_inventory_cancel(
+        &self,
+        server: &str,
+        generation: Option<u64>,
+        control: &Arc<dyn InventoryControl>,
+        source: &str,
+    ) {
+        tracing::warn!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server,
+            generation = ?generation,
+            cancellation_source = %source,
+            "requesting namespace inventory cancellation"
+        );
+        control.cancel_with_reason(source);
+    }
+
     fn clear_pending_cancel(&self, server: &str) {
         if let Err(error) = self.pending_cancels.lock().map(|mut pending| {
             pending.remove(server);
@@ -4043,6 +4821,7 @@ impl<C: OpcClient> IndexManager<C> {
         action: IndexControlAction,
     ) -> anyhow::Result<IndexStatus> {
         self.require_configured(server)?;
+        self.ensure_database_prepared()?;
         self.apply_control_action(server, action)?;
         if !matches!(action, IndexControlAction::Cancel) {
             self.reconcile_pause_state(server);
@@ -4082,7 +4861,7 @@ impl<C: OpcClient> IndexManager<C> {
 
     fn cancel_build(&self, server: &str, build: &RuntimeBuild) -> anyhow::Result<()> {
         if let Some(control) = &build.control {
-            control.cancel();
+            self.request_inventory_cancel(server, None, control, "grpc_control_cancel");
         } else {
             self.pending_cancels
                 .lock()
@@ -4108,6 +4887,9 @@ impl<C: OpcClient> IndexManager<C> {
                 has_more: false,
                 status: empty_status(server, false, IndexState::NotIndexed),
             });
+        }
+        if self.settings.database_path == Path::new(":memory:") {
+            self.ensure_database_prepared()?;
         }
         let limit = limit.max(1).min(self.settings.max_results);
         let status = self.status(server).await?;
@@ -4160,6 +4942,7 @@ impl<C: OpcClient> IndexManager<C> {
                     let _ = release.blocking_recv();
                 }
                 let db = IndexDb::open_read_only(&database_path)?;
+                db.require_prepared()?;
                 db.search(&server_name, generation, &query_name, mode, limit)
             })
             .await??
@@ -4211,7 +4994,12 @@ impl<C: OpcClient> IndexManager<C> {
             match parse_maintenance_windows(&self.settings.maintenance_windows) {
                 Ok(windows) => windows,
                 Err(error) => {
-                    handle.control.cancel();
+                    self.request_inventory_cancel(
+                        &server,
+                        Some(generation),
+                        &handle.control,
+                        "maintenance_window_parse_failure_cleanup",
+                    );
                     let message = error.to_string();
                     self.fail_generation_and_schedule_cleanup(&server, generation, &message);
                     self.finish_build_for_control_owned(
@@ -4256,6 +5044,83 @@ impl<C: OpcClient> IndexManager<C> {
         finalization.disarm();
     }
 
+    fn log_inventory_event_wait(&self, server: &str, generation: u64, state: &BuildRunState) {
+        tracing::debug!(
+            server,
+            generation,
+            entries_seen = state.last_progress.entries_seen,
+            unique_items = state.last_progress.unique_items,
+            paused_time_ms = state.last_progress.paused_time_ms,
+            controller_state = ?state.controller.as_ref().map(AdaptiveIndexController::state),
+            pause_reason = ?self
+                .runtime
+                .lock()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .get(server)
+                        .and_then(|value| value.build.as_ref())
+                        .and_then(|build| build.pause_reason)
+                }),
+            "waiting for next native inventory event"
+        );
+    }
+
+    fn log_inventory_event_return(
+        &self,
+        server: &str,
+        generation: u64,
+        event_wait_started: Instant,
+    ) {
+        tracing::debug!(
+            server,
+            generation,
+            event_wait_elapsed_ms = event_wait_started.elapsed().as_millis(),
+            "native inventory event wait returned"
+        );
+    }
+
+    async fn wait_for_inventory_event(
+        &self,
+        server: &str,
+        generation: u64,
+        handle: &mut InventoryHandle,
+        state: &BuildRunState,
+        event_wait_logs: &mut u8,
+        event_wait_return_logs: &mut u8,
+    ) -> Result<Option<anyhow::Result<InventoryEvent>>, String> {
+        let should_log_wait = *event_wait_logs < 3;
+        let _ = should_log_wait.then(|| self.log_inventory_event_wait(server, generation, state));
+        *event_wait_logs = (*event_wait_logs).saturating_add(u8::from(should_log_wait));
+        let event_wait_started = Instant::now();
+        let event = match tokio::time::timeout(
+            Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
+            handle.stream.next(),
+        )
+        .await
+        {
+            Ok(event) => event,
+            Err(_) => {
+                self.request_inventory_cancel(
+                    server,
+                    Some(generation),
+                    &handle.control,
+                    "inventory_event_timeout",
+                );
+                return Err(format!(
+                    "inventory event timed out after {} seconds",
+                    self.settings.operation_timeout_seconds.max(1)
+                ));
+            }
+        };
+        let should_log_return = *event_wait_return_logs < 3;
+        let _ = should_log_return
+            .then(|| self.log_inventory_event_return(server, generation, event_wait_started));
+        *event_wait_return_logs =
+            (*event_wait_return_logs).saturating_add(u8::from(should_log_return));
+        Ok(event)
+    }
+
     async fn run_build_loop(
         &self,
         server: &str,
@@ -4264,6 +5129,8 @@ impl<C: OpcClient> IndexManager<C> {
         maintenance_windows: &[MaintenanceWindow],
         state: &mut BuildRunState,
     ) -> BuildLoopOutcome {
+        let mut event_wait_logs = 0_u8;
+        let mut event_wait_return_logs = 0_u8;
         loop {
             if let Some(error) = self.commit_pending_if_due(server, generation, state) {
                 state.failed = Some(error);
@@ -4283,24 +5150,23 @@ impl<C: OpcClient> IndexManager<C> {
                     break;
                 }
             }
-            let event = match tokio::time::timeout(
-                Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
-                handle.stream.next(),
-            )
-            .await
+            let event = match self
+                .wait_for_inventory_event(
+                    server,
+                    generation,
+                    handle,
+                    state,
+                    &mut event_wait_logs,
+                    &mut event_wait_return_logs,
+                )
+                .await
             {
-                Ok(event) => event,
-                Err(_) => {
-                    handle.control.cancel();
-                    state.failed = Some(format!(
-                        "inventory event timed out after {} seconds",
-                        self.settings.operation_timeout_seconds.max(1)
-                    ));
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    state.failed = Some(error);
                     break;
                 }
-            };
-            let Some(event) = event else {
-                break;
             };
             match self
                 .handle_inventory_event(server, generation, &handle.control, state, event)
@@ -4373,7 +5239,12 @@ impl<C: OpcClient> IndexManager<C> {
             Ok(true) => BuildReadiness::Ready,
             Ok(false) => BuildReadiness::Cancelled,
             Err(error) => {
-                control.cancel();
+                self.request_inventory_cancel(
+                    server,
+                    None,
+                    control,
+                    "controller_recovery_failure_cleanup",
+                );
                 BuildReadiness::Failed(error.to_string())
             }
         }
@@ -4427,7 +5298,7 @@ impl<C: OpcClient> IndexManager<C> {
         state: &mut BuildRunState,
         entry: InventoryEntry,
     ) -> BuildEventOutcome {
-        if !state.rate_limiter.acquire(control).await {
+        if control.is_cancelled() {
             return BuildEventOutcome::Cancelled;
         }
         state.pending.push(entry);
@@ -4526,7 +5397,12 @@ impl<C: OpcClient> IndexManager<C> {
                 error = %error,
                 "namespace index pacing update failed"
             );
-            control.cancel();
+            self.request_inventory_cancel(
+                server,
+                Some(generation),
+                control,
+                "adaptive_pacing_update_failure_cleanup",
+            );
             return BuildEventOutcome::Failed(message);
         }
         tracing::debug!(
@@ -4871,12 +5747,22 @@ impl<C: OpcClient> IndexManager<C> {
         let mut outside_window =
             !windows.is_empty() && !maintenance_window_active(windows, Local::now());
         self.set_pause_overlay(server, Some(outside_window), None);
+        if outside_window {
+            tracing::debug!(
+                server,
+                windows = windows.len(),
+                "namespace inventory waiting for an active maintenance window"
+            );
+        }
         while outside_window {
             if !wait_with_cancellation(control, Duration::from_secs(1)).await {
                 return false;
             }
             outside_window = !maintenance_window_active(windows, Local::now());
             self.set_pause_overlay(server, Some(outside_window), None);
+        }
+        if !windows.is_empty() {
+            tracing::debug!(server, "namespace inventory maintenance window is active");
         }
         true
     }
@@ -4893,6 +5779,7 @@ impl<C: OpcClient> IndexManager<C> {
                 self.set_pause_overlay(server, None, Some(false));
                 return false;
             }
+            let sentinel_due = self.sentinel_probe_due(server, Instant::now());
             match self.health_probe_action(server, *next_probe, Instant::now()) {
                 HealthProbeAction::Ready => return true,
                 HealthProbeAction::Wait(delay) => {
@@ -4904,8 +5791,20 @@ impl<C: OpcClient> IndexManager<C> {
                 }
                 HealthProbeAction::Probe => {}
             }
+            tracing::debug!(
+                server,
+                sentinel_due,
+                "starting namespace inventory health probe"
+            );
             self.set_pause_overlay(server, None, Some(true));
             let observation = self.probe_health(server).await;
+            tracing::debug!(
+                server,
+                healthy = observation.healthy,
+                sentinel_configured = observation.sentinel_configured,
+                failure_reason = ?observation.failure_reason,
+                "namespace inventory health probe completed"
+            );
             self.update_health_state(server, Self::health_state(&observation));
             if observation.healthy {
                 self.set_pause_overlay(server, None, Some(false));
@@ -4917,7 +5816,10 @@ impl<C: OpcClient> IndexManager<C> {
 
             tracing::warn!(
                 server = %server,
-                reason = %observation.failure_reason,
+                reason = observation
+                    .failure_reason
+                    .as_deref()
+                    .unwrap_or("health probe returned unhealthy without detail"),
                 "deferring namespace inventory"
             );
             let delay = (*backoff).min(Duration::from_secs(300));
@@ -4986,19 +5888,23 @@ impl<C: OpcClient> IndexManager<C> {
         let healthy = capability.is_ok()
             && elapsed <= Duration::from_millis(self.settings.health_latency_threshold_ms)
             && sentinel_healthy;
-        let failure_reason = if let Err(error) = capability.as_ref() {
-            format!("health probe failed: {error}")
+        let failure_reason = if healthy {
+            None
+        } else if let Err(error) = capability.as_ref() {
+            Some(format!("health probe failed: {error}"))
         } else if let Some(sentinel) = sentinel.as_ref().filter(|value| !value.healthy) {
-            sentinel
-                .failure_reason
-                .clone()
-                .unwrap_or_else(|| "sentinel read was unhealthy".to_string())
+            Some(
+                sentinel
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "sentinel read was unhealthy".to_string()),
+            )
         } else {
-            format!(
+            Some(format!(
                 "health probe exceeded {} ms ({} ms)",
                 self.settings.health_latency_threshold_ms,
                 elapsed.as_millis()
-            )
+            ))
         };
         HealthProbeObservation {
             healthy,
@@ -5112,10 +6018,23 @@ impl<C: OpcClient> IndexManager<C> {
                 .get_mut(server)
                 .and_then(|state| state.build.as_mut())
         {
+            let previous_state = build.controller_state;
             build.effective_limits = Some(limits);
             build.controller_state = Some(state);
             build.recovery_deadline = recovery_deadline;
             drop(runtime);
+            if previous_state != Some(state) {
+                tracing::info!(
+                    server,
+                    previous_state = ?previous_state,
+                    state = ?state,
+                    item_rate_per_second = limits.item_rate_per_second,
+                    batch_size = limits.batch_size,
+                    duty_cycle_percent = limits.duty_cycle_percent,
+                    recovery_deadline = ?recovery_deadline.map(instant_timestamp),
+                    "namespace index controller state changed"
+                );
+            }
             self.reconcile_pause_state(server);
         }
     }
@@ -5526,6 +6445,16 @@ impl<C: OpcClient> IndexManager<C> {
         Ok(())
     }
 
+    fn ensure_database_prepared(&self) -> anyhow::Result<()> {
+        if self.database_initialized.load(Ordering::Acquire)
+            && self.settings.database_path != Path::new(":memory:")
+        {
+            return IndexDb::open_read_only(&self.settings.database_path)
+                .and_then(|database| database.require_prepared());
+        }
+        self.with_database_read_unchecked(|database| database.require_prepared())
+    }
+
     #[cfg(test)]
     fn with_database<F, R>(&self, operation: F) -> anyhow::Result<R>
     where
@@ -5535,6 +6464,16 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn with_database_read<F, R>(&self, operation: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut IndexDb) -> anyhow::Result<R>,
+    {
+        self.with_database_read_unchecked(|database| {
+            database.require_prepared()?;
+            operation(database)
+        })
+    }
+
+    fn with_database_read_unchecked<F, R>(&self, operation: F) -> anyhow::Result<R>
     where
         F: FnOnce(&mut IndexDb) -> anyhow::Result<R>,
     {
@@ -5583,10 +6522,18 @@ impl<C: OpcClient> IndexManager<C> {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index database lock poisoned"))?;
             let cleanup_servers = self.initialize_database(&mut database)?;
-            (
-                operation(database.as_mut().expect("database initialized")),
-                cleanup_servers,
-            )
+            let result = database
+                .as_ref()
+                .expect("database initialized")
+                .require_prepared();
+            if let Err(error) = result {
+                (Err(error), cleanup_servers)
+            } else {
+                (
+                    operation(database.as_mut().expect("database initialized")),
+                    cleanup_servers,
+                )
+            }
         };
         for server in cleanup_servers {
             self.schedule_cleanup(&server);
@@ -5602,6 +6549,7 @@ impl<C: OpcClient> IndexManager<C> {
                 "initializing namespace index database handle"
             );
             *database = Some(IndexDb::open(&self.settings.database_path)?);
+            self.database_initialized.store(true, Ordering::Release);
             Ok(database
                 .as_ref()
                 .expect("database initialized")
@@ -5781,15 +6729,12 @@ fn parse_timestamp(value: &str) -> Option<SystemTime> {
 }
 
 fn pacing_for_limits(limits: InventoryLimits) -> InventoryPacing {
-    let min_interval = if limits.item_rate_per_second == 0 {
-        Duration::ZERO
-    } else {
-        let numerator = u128::from(limits.batch_size.max(1)) * 1_000_000_000;
-        let denominator = u128::from(limits.item_rate_per_second);
-        Duration::from_nanos(numerator.div_ceil(denominator) as u64)
-    };
     InventoryPacing {
-        min_interval,
+        // The client charges each native operation by cost: one for DA2
+        // operations and the requested page size for DA3. Adding a
+        // batch-size-derived minimum here would delay every DA2 operation as
+        // though it returned a full page and throttle the same work twice.
+        min_interval: Duration::ZERO,
         item_rate_per_second: (limits.item_rate_per_second > 0)
             .then_some(limits.item_rate_per_second),
         batch_size: Some(limits.batch_size.clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE)),
@@ -6009,6 +6954,53 @@ mod tests {
         }
     }
 
+    struct TestDatabase {
+        path: PathBuf,
+    }
+
+    impl TestDatabase {
+        fn new(label: &str) -> Self {
+            let directory = std::env::current_dir().unwrap().join("target");
+            fs::create_dir_all(&directory).unwrap();
+            Self {
+                path: directory.join(format!(
+                    "index-preparation-{label}-{}-{}.sqlite3",
+                    std::process::id(),
+                    Uuid::new_v4()
+                )),
+            }
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            for suffix in ["-wal", "-shm"] {
+                let _ = fs::remove_file(IndexDb::sqlite_sidecar_path(&self.path, suffix));
+            }
+        }
+    }
+
+    fn populated_database_without_expensive_indexes(label: &str) -> TestDatabase {
+        let database = TestDatabase::new(label);
+        let mut db = IndexDb::open(&database.path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries("S", generation, &[inventory_entry("Tag", "S.Tag")])
+            .unwrap();
+        drop(db);
+
+        let connection = Connection::open(&database.path).unwrap();
+        for (name, _, _) in SECONDARY_INDEXES {
+            connection
+                .execute(&format!("DROP INDEX {name}"), [])
+                .unwrap();
+        }
+        connection.execute("DROP TABLE entries_fts", []).unwrap();
+        database
+    }
+
     fn completed_progress(count: u64) -> InventoryProgress {
         InventoryProgress {
             entries_seen: count,
@@ -6029,6 +7021,10 @@ mod tests {
     fn normalization_and_timestamp_helpers_are_safe() {
         assert_eq!(normalize_query("  FCS0201   PV "), "fcs0201 pv");
         assert_eq!(escape_like(r"a%b_c\d"), r"a\%b\_c\\d");
+        assert_eq!(prefix_upper_bound("abc"), Some("abd".into()));
+        assert_eq!(prefix_upper_bound("\u{d7ff}"), Some("\u{e000}".into()));
+        assert_eq!(prefix_upper_bound("a\u{10ffff}"), Some("b".into()));
+        assert_eq!(prefix_upper_bound("\u{10ffff}"), None);
         assert_eq!(build_fts_query("fcs0201 pv"), "\"fcs0201\" AND \"pv\"");
         assert_eq!(search_rank("219", "219", "display-exact"), 0);
         assert_eq!(search_rank("219", "ordinary", "219"), 1);
@@ -6125,13 +7121,13 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_limits_translate_to_native_operation_pacing() {
+    fn adaptive_limits_translate_to_item_cost_pacing() {
         let pacing = pacing_for_limits(InventoryLimits {
             item_rate_per_second: 100,
             batch_size: 10,
             duty_cycle_percent: 50,
         });
-        assert_eq!(pacing.min_interval, Duration::from_millis(100));
+        assert_eq!(pacing.min_interval, Duration::ZERO);
         assert_eq!(pacing.item_rate_per_second, Some(100));
         assert_eq!(pacing.batch_size, Some(10));
         assert_eq!(
@@ -6141,7 +7137,7 @@ mod tests {
                 duty_cycle_percent: 1,
             })
             .min_interval,
-            Duration::from_nanos(333_333_334)
+            Duration::ZERO
         );
         assert_eq!(
             pacing_for_limits(InventoryLimits {
@@ -6309,6 +7305,8 @@ mod tests {
         let database = directory.path().join("index.sqlite3");
         let lock = BuildFileLock::acquire_with(&database, "S", |_file, _metadata| Ok(())).unwrap();
         assert!(build_lock_path(&database, "S").exists());
+        #[cfg(windows)]
+        assert!(build_owner_path(&database, "S").exists());
         assert!(BuildFileLock::is_held(&database, "S").unwrap());
         assert!(!BuildFileLock::is_held(&database, "T").unwrap());
         let error = BuildFileLock::acquire(&database, "S").unwrap_err();
@@ -6316,6 +7314,8 @@ mod tests {
         drop(lock);
         assert!(!BuildFileLock::is_held(&database, "S").unwrap());
         assert!(build_lock_path(&database, "S").exists());
+        #[cfg(windows)]
+        assert!(!build_owner_path(&database, "S").exists());
         let other_server_lock = BuildFileLock::acquire(&database, "T").unwrap();
         assert_ne!(
             build_lock_path(&database, "T"),
@@ -6467,29 +7467,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limiter_and_wait_helpers_honor_cancellation() {
+    async fn wait_helper_honors_cancellation() {
         let control_impl = Arc::new(TestInventoryControl::default());
         let control: Arc<dyn InventoryControl> = control_impl.clone();
         control_impl.pause();
         control_impl.resume();
 
-        let mut disabled = ItemRateLimiter::new(0, 0);
-        assert!(disabled.acquire(&control).await);
+        assert!(wait_with_cancellation(&control, Duration::ZERO).await);
         control_impl.cancel();
-        assert!(!disabled.acquire(&control).await);
-
-        let active_impl = Arc::new(TestInventoryControl::default());
-        let active: Arc<dyn InventoryControl> = active_impl.clone();
-        assert!(wait_with_cancellation(&active, Duration::ZERO).await);
-        active_impl.cancel();
-        let mut cancelled_limiter = ItemRateLimiter::new(1, 1);
-        assert!(!cancelled_limiter.acquire(&active).await);
-
-        let active_impl = Arc::new(TestInventoryControl::default());
-        let active: Arc<dyn InventoryControl> = active_impl.clone();
-        let mut limited = ItemRateLimiter::new(10_000, 1);
-        assert!(limited.acquire(&active).await);
-        assert!(limited.acquire(&active).await);
+        assert!(!wait_with_cancellation(&control, Duration::ZERO).await);
 
         let waiting_impl = Arc::new(TestInventoryControl::default());
         let waiting: Arc<dyn InventoryControl> = waiting_impl.clone();
@@ -6872,6 +7858,179 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_open_prepares_indexes_for_a_fresh_database() {
+        let database = TestDatabase::new("fresh");
+        let db = IndexDb::open(&database.path).unwrap();
+
+        assert!(!db.preparation_required);
+        assert!(db.preparation_detail.is_none());
+        assert!(
+            inspect_index_objects(&db.connection)
+                .unwrap()
+                .missing
+                .is_empty()
+        );
+        assert_eq!(
+            read_preparation_state(&db.connection).unwrap(),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn sqlite_open_defers_expensive_indexes_for_a_populated_database() {
+        let database = populated_database_without_expensive_indexes("deferred");
+        let db = IndexDb::open(&database.path).unwrap();
+        let inspection = inspect_index_objects(&db.connection).unwrap();
+
+        assert_eq!(
+            inspection.missing,
+            vec![
+                "entries_display_prefix",
+                "entries_item_prefix",
+                "entries_display_exact",
+                "entries_item_exact",
+                "entries_fts",
+            ]
+        );
+        assert!(db.preparation_required);
+        assert_eq!(
+            db.preparation_error().unwrap(),
+            "namespace index preparation required; missing namespace index objects: \
+             entries_display_prefix, entries_item_prefix, entries_display_exact, \
+             entries_item_exact, entries_fts; stop the gateway and run `opcda-bridge-gateway \
+             index-prepare`"
+        );
+        assert_eq!(
+            read_preparation_state(&db.connection).unwrap(),
+            (
+                true,
+                Some(
+                    "missing namespace index objects: entries_display_prefix, \
+                     entries_item_prefix, entries_display_exact, entries_item_exact, entries_fts"
+                        .into()
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn explicit_index_preparation_builds_missing_objects_and_is_idempotent() {
+        let database = populated_database_without_expensive_indexes("prepare");
+        let mut db = IndexDb::open(&database.path).unwrap();
+
+        assert_eq!(
+            db.prepare_indexes().unwrap(),
+            IndexPreparationOutcome::Prepared
+        );
+        assert!(!db.preparation_required);
+        assert!(
+            inspect_index_objects(&db.connection)
+                .unwrap()
+                .missing
+                .is_empty()
+        );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT COUNT(*) FROM entries_fts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_preparation_state(&db.connection).unwrap(),
+            (false, None)
+        );
+        drop(db);
+
+        assert_eq!(
+            prepare_index_database(&database.path).unwrap(),
+            IndexPreparationOutcome::AlreadyPrepared
+        );
+    }
+
+    #[test]
+    fn full_text_preparation_and_validation_normalize_breadcrumbs() {
+        let database = populated_database_without_expensive_indexes("breadcrumb-format");
+        let mut db = IndexDb::open(&database.path).unwrap();
+        db.connection
+            .execute("UPDATE entries SET breadcrumbs = '[\"Area\",\"Loop\"]'", [])
+            .unwrap();
+
+        assert_eq!(
+            db.prepare_indexes().unwrap(),
+            IndexPreparationOutcome::Prepared
+        );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT breadcrumbs FROM entries_fts", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "Area Loop"
+        );
+
+        db.connection
+            .execute(
+                "UPDATE entries_fts SET breadcrumbs = '[\"Area\",\"Loop\"]'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = IndexDb::open(&database.path).unwrap();
+        assert_eq!(reopened.status_rows("S").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_text_validation_rejects_malformed_relational_breadcrumbs() {
+        let database = TestDatabase::new("malformed-breadcrumbs");
+        let mut db = IndexDb::open(&database.path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries("S", generation, &[inventory_entry("Tag", "S.Tag")])
+            .unwrap();
+        drop(db);
+
+        let connection = Connection::open(&database.path).unwrap();
+        connection
+            .execute(
+                "UPDATE entries SET breadcrumbs = 'not-json' WHERE server = 'S'",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            validate_full_text_consistency(&connection, true).is_err(),
+            "malformed relational breadcrumbs must not be treated as consistent FTS data"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn populated_database_preparation_is_observable_and_blocks_refresh() {
+        let database = populated_database_without_expensive_indexes("manager");
+        let client = Arc::new(MockOpcClient::default());
+        let manager = Arc::new(IndexManager::new(
+            Arc::clone(&client),
+            settings(database.path.clone()),
+        ));
+
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::Failed);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("index-prepare"))
+        );
+
+        let error = manager.refresh("S", true).await.unwrap_err();
+        assert!(error.to_string().contains("index-prepare"));
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn sqlite_migrates_v2_and_records_confirmed_compatibility_fallbacks() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("v2.sqlite3");
@@ -6924,6 +8083,10 @@ mod tests {
                 .unwrap()
                 .compatibility_fallback
         );
+        assert_eq!(
+            migrated.prepare_indexes().unwrap(),
+            IndexPreparationOutcome::Prepared
+        );
 
         let generation = migrated
             .start_generation(
@@ -6968,7 +8131,15 @@ mod tests {
             .unwrap();
         drop(db);
 
-        let recovered = IndexDb::open(&path).unwrap();
+        let reopened = IndexDb::open(&path).unwrap();
+        assert_eq!(reopened.status_rows("S").unwrap().len(), 1);
+        drop(reopened);
+
+        let read_only = IndexDb::open_read_only(&path).unwrap();
+        assert_eq!(read_only.status_rows("S").unwrap().len(), 1);
+        drop(read_only);
+
+        let recovered = IndexDb::open_validated(&path).unwrap();
         assert!(recovered.status_rows("S").unwrap().is_empty());
         assert!(
             directory
@@ -6977,6 +8148,77 @@ mod tests {
                 .unwrap()
                 .filter_map(Result::ok)
                 .any(|entry| entry.file_name().to_string_lossy().contains("quarantine-"))
+        );
+    }
+
+    #[test]
+    fn sqlite_quarantines_partial_or_mismatched_full_text_data() {
+        let directory = tempdir().unwrap();
+        let partial_path = directory.path().join("fts-partial.sqlite3");
+        let mut partial = IndexDb::open(&partial_path).unwrap();
+        let partial_generation = partial
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        partial
+            .insert_entries(
+                "S",
+                partial_generation,
+                &[
+                    inventory_entry("First", "S.First"),
+                    inventory_entry("Second", "S.Second"),
+                ],
+            )
+            .unwrap();
+        partial
+            .promote("S", partial_generation, "2", &completed_progress(2))
+            .unwrap();
+        partial
+            .connection
+            .execute("DELETE FROM entries_fts WHERE item_id = 'S.Second'", [])
+            .unwrap();
+        drop(partial);
+
+        let recovered = IndexDb::open_validated(&partial_path).unwrap();
+        assert!(recovered.status_rows("S").unwrap().is_empty());
+
+        let mismatch_path = directory.path().join("fts-mismatch.sqlite3");
+        let mut mismatch = IndexDb::open(&mismatch_path).unwrap();
+        let mismatch_generation = mismatch
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        mismatch
+            .insert_entries(
+                "S",
+                mismatch_generation,
+                &[
+                    inventory_entry("First", "S.First"),
+                    inventory_entry("Second", "S.Second"),
+                ],
+            )
+            .unwrap();
+        mismatch
+            .promote("S", mismatch_generation, "2", &completed_progress(2))
+            .unwrap();
+        mismatch
+            .connection
+            .execute(
+                "UPDATE entries_fts SET item_id = 'S.Replaced' WHERE item_id = 'S.Second'",
+                [],
+            )
+            .unwrap();
+        drop(mismatch);
+
+        let recovered = IndexDb::open_validated(&mismatch_path).unwrap();
+        assert!(recovered.status_rows("S").unwrap().is_empty());
+        assert!(
+            directory
+                .path()
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("quarantine-"))
+                .count()
+                >= 2
         );
     }
 
@@ -9070,6 +10312,168 @@ mod tests {
     }
 
     #[test]
+    fn exact_search_bounds_common_display_name_matches_with_equality_indexes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("broad-exact-search.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        let entries = (0..10_000)
+            .map(|index| inventory_entry("PV", &format!("Area.{index:05}.PV")))
+            .collect::<Vec<_>>();
+        db.insert_entries("S", generation, &entries).unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+
+        let plan_for = |sql: &str| {
+            db.connection
+                .prepare(sql)
+                .unwrap()
+                .query_map(params!["S", generation as i64, "pv", 4_i64], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let display_plan = plan_for(
+            "EXPLAIN QUERY PLAN
+             SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.display_name_norm = ?3
+             ORDER BY e.item_id_norm, e.item_id
+             LIMIT ?4",
+        );
+        assert!(
+            display_plan
+                .iter()
+                .any(|detail| detail.contains("entries_display_exact"))
+        );
+        assert!(
+            display_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE"))
+        );
+
+        let item_plan = plan_for(
+            "EXPLAIN QUERY PLAN
+             SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.item_id_norm = ?3
+               AND e.display_name_norm <> ?3
+             ORDER BY length(e.display_name_norm), e.display_name_norm,
+                      e.item_id_norm, e.item_id
+             LIMIT ?4",
+        );
+        assert!(
+            item_plan
+                .iter()
+                .any(|detail| detail.contains("entries_item_exact"))
+        );
+        assert!(
+            item_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE"))
+        );
+
+        let matches = db.search("S", generation, "PV", 1, 3).unwrap();
+        assert_eq!(matches.len(), 4);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Area.00000.PV",
+                "Area.00001.PV",
+                "Area.00002.PV",
+                "Area.00003.PV"
+            ]
+        );
+    }
+
+    #[test]
+    fn prefix_search_uses_indexed_ranges_and_preserves_ranking() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("prefix-search.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries(
+            "S",
+            generation,
+            &[
+                inventory_entry("219 block", "display-prefix"),
+                inventory_entry("219", "display-exact"),
+                inventory_entry("ordinary", "219.item"),
+                inventory_entry("219 both", "219.both"),
+                inventory_entry("ordinary", "x219.item"),
+                inventory_entry("ordinary", "x%219.item"),
+                inventory_entry("éclair", "unicode-display"),
+                inventory_entry("ordinary", "\u{d7ff}.item"),
+                inventory_entry("ordinary", "\u{10ffff}.item"),
+                inventory_entry("block 219", "display-contains"),
+            ],
+        )
+        .unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+
+        assert_eq!(
+            db.search("S", generation, "219", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["display-exact", "219.both", "display-prefix", "219.item"]
+        );
+        assert_eq!(
+            db.search("S", generation, "219", 2, 2)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["display-exact", "219.both", "display-prefix"]
+        );
+        assert_eq!(
+            db.search("S", generation, "x%", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x%219.item"]
+        );
+        assert_eq!(
+            db.search("S", generation, "É", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unicode-display"]
+        );
+        assert_eq!(
+            db.search("S", generation, "\u{d7ff}", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["\u{d7ff}.item"]
+        );
+        assert_eq!(
+            db.search("S", generation, "\u{10ffff}", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["\u{10ffff}.item"]
+        );
+    }
+
+    #[test]
     fn full_text_search_reports_missing_tables() {
         let directory = tempdir().unwrap();
         let fts_path = directory.path().join("missing-fts.sqlite3");
@@ -10584,18 +11988,6 @@ mod tests {
         );
         cancel_task.await.unwrap();
 
-        let rate_control = Arc::new(RecordingInventoryControl::default());
-        let rate_trait: Arc<dyn InventoryControl> = rate_control.clone();
-        let mut limiter = ItemRateLimiter::new(1, 1);
-        assert!(limiter.acquire(&rate_trait).await);
-        let canceller = Arc::clone(&rate_control);
-        let cancel_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            canceller.cancel();
-        });
-        assert!(!limiter.acquire(&rate_trait).await);
-        cancel_task.await.unwrap();
-
         let progress_control = Arc::new(RecordingInventoryControl::default());
         progress_control.cancel_on_pause();
         let progress_client = Arc::new(LifecycleClient::new(
@@ -12013,6 +13405,10 @@ mod tests {
             good.status("S").await.unwrap().health,
             HealthProbeState::Healthy
         );
+        let observation = good.probe_health("S").await;
+        assert!(observation.healthy);
+        assert!(observation.failure_reason.is_none());
+        assert!(observation.sentinel_configured);
     }
 
     #[test]
@@ -12412,6 +13808,30 @@ mod tests {
             .apply_control_action("S", IndexControlAction::Cancel)
             .unwrap();
         assert!(manager.pending_cancels.lock().unwrap().contains("S"));
+    }
+
+    #[tokio::test]
+    async fn control_cancel_forwards_a_diagnostic_source_to_attached_control() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("control-cancel-reason.sqlite3")),
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, trait_control);
+
+        let status = manager
+            .control("S", IndexControlAction::Cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(status.state, IndexState::Partial);
+        assert!(control.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            control.cancellation_reasons(),
+            vec!["grpc_control_cancel".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -13098,6 +14518,7 @@ mod tests {
         resume_count: AtomicUsize,
         pacing_calls: AtomicUsize,
         fail_pacing_on_call: AtomicUsize,
+        cancel_reasons: Mutex<Vec<String>>,
     }
 
     impl InventoryControl for RecordingInventoryControl {
@@ -13116,6 +14537,11 @@ mod tests {
 
         fn cancel(&self) {
             self.cancelled.store(true, Ordering::Release);
+        }
+
+        fn cancel_with_reason(&self, reason: &str) {
+            self.cancel();
+            self.cancel_reasons.lock().unwrap().push(reason.to_owned());
         }
 
         fn is_cancelled(&self) -> bool {
@@ -13146,6 +14572,10 @@ mod tests {
 
         fn fail_pacing_on_call(&self, call: usize) {
             self.fail_pacing_on_call.store(call, Ordering::Release);
+        }
+
+        fn cancellation_reasons(&self) -> Vec<String> {
+            self.cancel_reasons.lock().unwrap().clone()
         }
     }
 

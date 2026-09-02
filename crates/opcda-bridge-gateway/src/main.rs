@@ -8,6 +8,7 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(command) = &cli.command {
         return match command {
+            ServiceCommand::IndexPrepare => run::prepare_index(&cli),
             ServiceCommand::Install => service::install(&cli),
             ServiceCommand::Uninstall => service::uninstall(),
             ServiceCommand::Start => service::start(),
@@ -31,6 +32,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn main() {
-    opcda_bridge_gateway::non_windows_run();
+fn main() -> std::process::ExitCode {
+    use clap::Parser;
+
+    let cli = opcda_bridge_gateway::config::Cli::parse();
+    std::process::ExitCode::from(opcda_bridge_gateway::non_windows_run(cli))
 }

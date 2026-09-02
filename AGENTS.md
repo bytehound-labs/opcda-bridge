@@ -47,12 +47,48 @@ a working opcda-bridge, not a redesign of it.
   generation, operation, and terminal build outcome to make this class of deployment error
   diagnosable. Build locks use OS advisory ownership, and startup recovery preserves staging
   generations whose server-specific lock is still held by another live process.
+- **Large index preparation is explicit for existing inventories.** Opening a fresh or empty index
+  database creates the secondary lookup indexes and trigram FTS table automatically, but opening a
+  populated database must never build those potentially multi-million-row objects as a side effect
+  of ordinary startup or the first write. Startup records the preparation-required state in
+  `index_meta`, exposes it through status/errors, and blocks refresh, control, search, writes, and
+  obsolete-generation cleanup until an operator stops the gateway and runs
+  `opcda-bridge-gateway --config PATH index-prepare`. The command is database-only, transactional,
+  validates the resulting objects and performs the full relational/FTS consistency check, and
+  leaves a retryable failure detail when preparation fails. Ordinary status/search opens inspect
+  schema and object definitions but deliberately do not scan every row of a populated FTS index;
+  this keeps large databases responsive, while explicit preparation retains the expensive
+  consistency/quarantine path. The stop-gateway requirement is the operational mitigation for the
+  accepted point-in-time race between inspection and index creation if another process opens the
+  database after inspection.
+- **FTS breadcrumbs have two storage representations.** Relational `entries.breadcrumbs` stores
+  the canonical JSON array, while `entries_fts.breadcrumbs` stores its space-separated searchable
+  form. Full-text consistency validation must normalize both current flattened rows and legacy
+  JSON-form rows before comparing them; it must still reject missing, duplicate, or mismatched
+  identity/content rows.
 - **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
   limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
   OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
   start a replacement build. Persisted retry deadlines take precedence over the normal refresh
   cadence after a restart, so a failed server is not retried immediately just because the
   gateway restarted.
+- **Native inventory diagnostics are boundary-aware and volume-controlled.** Gateway inventory
+  logs keep startup, pause-overlay, controller, and foreground transitions at informational
+  level. Health-probe details, maintenance-window/pacing waits, event-wait boundaries, and
+  per-operation records are debug-level diagnostics; the native client records only the first
+  bounded operations with browse paths, item names, durations, iterator results, and failures.
+  This keeps normal production logs bounded while allowing scheduler admission delays to be
+  distinguished from native browse or event-delivery stalls when debug logging is enabled.
+  Event-delivery waits use the configured operation timeout and label timeout-triggered native
+  cancellation as `inventory_event_timeout`.
+- **Native inventory rate limits are charged once by operation cost.** DA2 operations cost one
+  item and DA3 page operations cost the requested page size. The native client is the sole
+  item-rate authority; the gateway must not add a burst/token limiter or derive a batch-size
+  interval. Gateway-to-client pacing must leave the client's minimum interval at zero unless an
+  independent delay is intentional, because a second limiter double-counts the same item-rate
+  limit and prevents adaptive updates from taking effect consistently. The legacy
+  `index.burst_size` setting remains accepted for configuration/source compatibility but is
+  intentionally ignored.
 - **Inventory failures are terminal, typed failures.** The native inventory worker catches
   unexpected panics, logs the payload type without exposing panic contents through the public
   protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
@@ -60,10 +96,13 @@ a working opcda-bridge, not a redesign of it.
 - **Indexed search is isolated from foreground database coordination.** Uncached full-text
   queries open a read-only SQLite connection outside the process-wide writable database mutex,
   retain only a bounded ranked candidate set, and fetch metadata for the final result page.
-  Exact searches must use separate equality lookups on the normalized display-name and ItemID
-  indexes, each bounded to `limit + 1` rows, then merge and deduplicate those candidate sets before
-  ranking; they must not reintroduce a broad `OR`/`LIKE` ordering scan over the generation. Search
-  must never make status,
+  Exact searches must use separate equality lookups on ordered normalized display-name and ItemID
+  indexes, exclude display-name matches from the lower-priority ItemID lookup, and prefix searches
+  must use separate lexicographic range probes over those indexes. Each probe is bounded to
+  `limit + 1` rows, then candidates are merged and deduplicated before ranking. Prefix upper
+  bounds must handle the Unicode surrogate gap and maximum scalar value. They must not reintroduce
+  a broad `OR`/`LIKE` ordering scan or whole-result equality sort over the generation. Search must
+  never make status,
   discovery, reads, writes, or lazy browse wait on a broad query; during promotion it must use the
   active generation from the promotion-safe status read rather than call back through the writable
   database mutex. Live search streams begin with an initial progress event, emit matches in browse
@@ -88,7 +127,8 @@ a working opcda-bridge, not a redesign of it.
   database file so relative/symlink aliases cannot bypass the gate. For missing files, canonicalize
   the parent and reattach the filename; if that cannot be done, retain the original path spelling.
   Each `:memory:` database gets an independent coordination object and must not create or rely on a
-  filesystem build lock.
+  filesystem build lock. On Windows, cleanly released build locks remove their `.build.owner`
+  metadata sidecar; forced termination may leave it for the next acquisition to overwrite.
 - **Index status is an aggregation of durable and runtime state.** Status combines the persisted
   generation snapshot with runtime build, health, storage, foreground, and scheduler diagnostics.
   Promotion reads persisted rows through a read-only connection and filesystem diagnostics; a

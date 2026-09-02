@@ -21,6 +21,10 @@ endpoint and supports older clients.
 The gateway must run on the Windows machine hosting the OPC DA server. See the repository README
 for service installation, configuration, and firewall setup.
 
+Development branches may pin a compatible, unreleased `bytehound-opc-da-client` revision while
+the native client and gateway are tested together. A packaged or published gateway must use the
+corresponding released client version instead.
+
 Tag browsing uses native one-level OPC DA enumeration with bounded pages. The gateway owns opaque
 browse sessions and continuation tokens, preserves exact ItemIDs separately from display names,
 and reports whether a page is complete. Only selectable item and branch-and-item nodes expose
@@ -47,7 +51,9 @@ the next inventory event. Health readiness combines capability and latency check
 optional sentinel tag; unhealthy targets pause inventory with bounded exponential backoff and
 healthy recovery resumes it with the configured pacing. Without a sentinel tag, the health
 status is reported as `Unavailable` while capability and latency checks can still permit the
-build. Cancellation, health failure, or a rejected pacing update terminates the build without
+build. The event wait is bounded by the configured operation timeout; an expired wait requests
+native cancellation with the `inventory_event_timeout` source before the generation is marked
+failed. Cancellation, health failure, or a rejected pacing update terminates the build without
 replacing the last complete generation.
 Pending entries are flushed before terminal state is recorded, and successful completion with a
 non-fatal inventory warning remains searchable while the warning is exposed in status.
@@ -56,7 +62,9 @@ transition, and promotion status uses a read-only SQLite connection plus filesys
 status remains responsive even while the writer is in the promotion critical section.
 Only one build for a server can hold its gateway-wide file lock at a time; contention reports the
 owning process metadata. On Windows, that metadata is kept in an adjacent `.build.owner` sidecar
-because the locked file itself may be unreadable.
+because the locked file itself may be unreadable. The owner sidecar is removed on a clean lock
+release and can remain after forced termination until the next acquisition overwrites it; the
+operating-system advisory lock, not the sidecar's existence, determines whether a build is active.
 Superseded and abandoned data is reclaimed in bounded background batches through a separate
 SQLite WAL connection, coordinated by a database-wide writer gate shared with every build mutation
 for the same database file, including builds for other servers. Cleanup defers while any build is
@@ -76,14 +84,39 @@ Independent in-memory databases are isolated from the registry and do not create
 build-lock sidecars.
 Uncached indexed searches use a separate read-only SQLite connection and rank only bounded
 candidate sets in memory, so a broad query cannot hold the coordinator's foreground database
-mutex while it scans the FTS index. Exact searches use separate equality lookups on the
-normalized display-name and ItemID indexes, each bounded to `limit + 1` rows, then merge and
-deduplicate those candidates before ranking; prefix and contains searches retain their indexed/FTS
-paths. Status, discovery, reads, writes, and lazy browse therefore remain available while search
-work is in progress. Matching is case-insensitive with exact/prefix/contains ranking, and
+mutex while it scans the FTS index. Exact searches use separate equality lookups on ordered
+normalized display-name and ItemID indexes, exclude display-name matches from the lower-priority
+ItemID lookup, then merge and deduplicate those candidates before ranking; this avoids sorting a
+whole common-name result set before applying the limit. Prefix searches use separate
+lexicographic range probes over those same indexes; each probe is bounded to `limit + 1` rows.
+Prefix bounds handle Unicode scalar boundaries, including the surrogate gap and the maximum
+scalar value. Contains searches use the trigram FTS index. Status,
+discovery, reads, writes, and lazy browse therefore remain available while search work is in
+progress. Matching is case-insensitive with exact/prefix/contains ranking, and
 responses report when additional results exist beyond the requested limit. During promotion,
 searches use the active generation already returned by the promotion-safe status path instead of
 waiting for the writable database mutex.
+When a populated database is missing required secondary indexes or the trigram full-text index,
+startup records that preparation is required instead of building those objects during ordinary
+gateway work. Ordinary database opens inspect the schema and index definitions but do not scan
+every relational and FTS row, so status and search remain responsive on multi-million-entry
+databases. Refresh, control, search, and obsolete-generation cleanup remain blocked until the
+gateway is stopped and the one-shot `index-prepare` command completes:
+`opcda-bridge-gateway --config PATH index-prepare`. The command exits after preparation without
+starting the gateway or contacting OPC DA. Preparation creates and populates the missing objects
+in one transaction, validates them before commit, and records a retryable failure marker
+if it cannot complete. Empty databases prepare automatically, and status remains inspectable while
+preparation is required. Explicit preparation also performs the full relational/FTS consistency
+check; unexpected existing index definitions fail initialization, and inconsistent full-text data
+is quarantined rather than served as a potentially incomplete cache. Validation checks both row
+counts and the stored server/generation/item/display values plus normalized breadcrumb values.
+Relational breadcrumbs are JSON arrays while the FTS copy uses space-separated searchable text;
+both that representation and legacy JSON-form FTS rows are normalized before comparison, so
+partial, duplicate, or same-sized replacement rows cannot pass as a consistent index.
+Because this command only opens SQLite and does not use COM, it can also prepare an index database
+on a non-Windows host and returns a nonzero status when preparation fails. It uses the normal
+gateway CLI/configuration parsing but does not initialize COM or open a listener; all normal
+gateway serving modes still require Windows.
 Refresh setup is staged before the asynchronous build task is launched. If startup, capability
 negotiation, generation creation, task launch, or shutdown fails at that boundary, the
 provisional generation is abandoned and its build reservation is released while the last
@@ -91,10 +124,15 @@ complete active generation remains available.
 Cancellation
 requests received before inventory startup returns its control handle are retained and applied
 once the handle is available.
-
-Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
-BSTR contents without adding display quote characters; quotes remain only when present in the
-server value.
+Cancellation requests carry a source label through the gateway adapter into the native client.
+Diagnostic logs identify COM worker startup, native server connection, capability detection,
+namespace organization, the first inventory operation, pause and foreground transitions, and
+health/controller state transitions at the default informational level. Maintenance and pacing
+waits, health-probe details, and bounded native-operation entry/return records — including browse
+paths, item names, durations, iterator results, and failures — are debug-level diagnostics to
+avoid high-volume production logs. Successful foreground browse-page completions are also
+debug-level records, so a large indexed traversal does not fill the normal production log with
+one entry per page.
 
 Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
 BSTR contents without adding display quote characters; quotes remain only when present in the
@@ -105,8 +143,11 @@ the explicit `servers` allow-list and uses a service-writable SQLite database, c
 batch/rate/duty-cycle defaults, a two-second foreground quiet period, and one build at a time.
 Native inventory batches are bounded to 1,000 entries by the OPC DA client contract.
 Native inventory slicing and SQLite commit batching are independently bounded, and adaptive
-controller decisions update both the native slice batch size and pacing interval; the commit
-interval provides a time limit for low-volume inventories. Runtime status includes rolling
+controller decisions update the native slice batch size and item-rate limit; native operation
+cost applies the rate once (one item for DA2 operations and the requested page size for DA3),
+without a gateway-side burst/token limiter or an additional batch-size delay before every
+operation. The commit interval provides a time limit for low-volume inventories. Runtime status
+includes rolling
 foreground latency/error/quality metrics, host/storage availability, and persisted scheduler
 backoff diagnostics.
 If the native client rejects an initial or adaptive pacing update, the build fails visibly and
@@ -127,4 +168,5 @@ unresponsive target cannot hold the scheduler indefinitely.
 An optional `sentinel_tag` is read during health probes; omitted or unavailable sentinel
 configuration is reported explicitly rather than treated as a healthy zero value. Status also
 distinguishes a configured sentinel from its probe result, so an unprobed sentinel is not reported
-as absent.
+as absent. Healthy probe observations carry no failure detail; that field is populated only when
+capability, sentinel, or latency checks fail.

@@ -197,8 +197,7 @@ checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 [[package]]
 name = "bytehound-opc-da-client"
 version = "0.2.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b9a18a71cd424d1028e38ac1536adafc851bd74b9c6c9525490b382b1e1f9b9"
+source = "git+https://github.com/bytehound-labs/opc-cli.git?rev=e3a309790df0b12086cf1c8fa014d6baf9485bb2#e3a309790df0b12086cf1c8fa014d6baf9485bb2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1378,7 +1377,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",

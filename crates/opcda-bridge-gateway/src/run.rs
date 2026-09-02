@@ -47,6 +47,25 @@ pub async fn serve_with_ready<C: OpcClient>(
     Ok(())
 }
 
+/// Prepare the gateway-owned namespace-index structures without starting the
+/// gateway or contacting OPC DA.
+pub fn prepare_index(cli: &crate::config::Cli) -> anyhow::Result<()> {
+    let config = crate::config::load_config(cli.config.as_deref())?;
+    let index = crate::config::resolve_index_config(&config.index);
+    let outcome = crate::index::prepare_index_database(&index.database_path)?;
+    match outcome {
+        crate::index::IndexPreparationOutcome::AlreadyPrepared => println!(
+            "namespace index is already prepared: {}",
+            index.database_path.display()
+        ),
+        crate::index::IndexPreparationOutcome::Prepared => println!(
+            "namespace index prepared successfully: {}",
+            index.database_path.display()
+        ),
+    }
+    Ok(())
+}
+
 /// Resolves when the OS asks the process to stop: `Ctrl+C`, `Ctrl+Break`, a
 /// console window close, a user logoff, or a system shutdown/restart.
 ///
@@ -137,10 +156,15 @@ pub async fn run_gateway(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Cli, GatewayConfig, IndexConfig, ServiceCommand};
     use crate::test_support::MockOpcClient;
     use opcda_bridge_proto::bridge::ListServersRequest;
     use opcda_bridge_proto::bridge::bridge_client::BridgeClient;
+    use rusqlite::Connection;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
+    use tempfile::tempdir;
     use tokio::sync::oneshot;
 
     /// Binds an ephemeral localhost port and returns both the listener and
@@ -281,5 +305,83 @@ mod tests {
             .expect("serve did not shut down in time")
             .unwrap()
             .unwrap();
+    }
+
+    fn index_prepare_cli(config: PathBuf) -> Cli {
+        Cli {
+            command: Some(ServiceCommand::IndexPrepare),
+            config: Some(config),
+            port: None,
+            log_level: None,
+            log_dir: None,
+            log_format: None,
+            log_rotation: None,
+        }
+    }
+
+    fn write_index_config(directory: &Path, database: &Path) -> PathBuf {
+        let config_path = directory.join("gateway.toml");
+        let config = GatewayConfig {
+            index: IndexConfig {
+                database_path: Some(database.display().to_string()),
+                ..IndexConfig::default()
+            },
+            ..GatewayConfig::default()
+        };
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        config_path
+    }
+
+    #[test]
+    fn prepare_index_reports_both_preparation_outcomes() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let config = write_index_config(directory.path(), &database);
+        let cli = index_prepare_cli(config);
+
+        assert!(prepare_index(&cli).is_ok());
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO generations
+                 (server, generation, state, organization, source, started_at)
+                 VALUES ('S', 1, 'active', 'flat', 'flat', '1')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO entries
+                 (server, generation, item_id, item_id_norm, display_name,
+                  display_name_norm, kind, breadcrumbs)
+                 VALUES ('S', 1, 'S.Tag', 's.tag', 'Tag', 'tag', 1, '[]')",
+                [],
+            )
+            .unwrap();
+        for index_name in [
+            "entries_display_prefix",
+            "entries_item_prefix",
+            "entries_display_exact",
+            "entries_item_exact",
+        ] {
+            connection
+                .execute(&format!("DROP INDEX {index_name}"), [])
+                .unwrap();
+        }
+        connection.execute("DROP TABLE entries_fts", []).unwrap();
+        drop(connection);
+
+        assert!(prepare_index(&cli).is_ok());
+        assert!(prepare_index(&cli).is_ok());
+    }
+
+    #[test]
+    fn prepare_index_reports_missing_explicit_config() {
+        let directory = tempdir().unwrap();
+        let cli = index_prepare_cli(directory.path().join("missing.toml"));
+
+        let error = prepare_index(&cli).unwrap_err();
+        assert!(error.to_string().contains("config file not found"));
     }
 }

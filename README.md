@@ -233,7 +233,11 @@ config file — see [Configuration](#configuration) below.
   interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
   generations do not make a newer active generation appear failed. If relational index rows and
   the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache
-  is quarantined rather than serving silently incomplete substring results.
+  is quarantined rather than serving silently incomplete substring results. Validation compares
+  both row counts and the stored server/generation/item/display values plus normalized breadcrumb
+  values. Relational breadcrumbs are JSON arrays while the FTS copy uses space-separated
+  searchable text; legacy JSON-form FTS rows are normalized too, while partial, duplicate, and
+  same-sized replacement rows are still detected.
   Status combines the persisted generation snapshot with runtime build, health, storage,
   foreground, and scheduler diagnostics. During promotion, persisted status is read through a
   read-only connection; a runtime error overrides the reported state only when no build is active.
@@ -244,13 +248,27 @@ config file — see [Configuration](#configuration) below.
   build-lock sidecars.
   Indexed queries use a dedicated read-only SQLite connection and bounded candidate sets, keeping
   broad searches out of the foreground database mutex. Exact searches use separate equality
-  lookups on the normalized display-name and ItemID indexes, each bounded to `limit + 1` rows,
-  then merge and deduplicate those candidates before ranking; prefix and contains searches retain
-  their existing indexed/FTS paths.
+  lookups on ordered normalized display-name and ItemID indexes, exclude display-name matches
+  from the lower-priority ItemID lookup, then merge and deduplicate those candidates before
+  ranking; this avoids sorting a whole common-name result set before applying the limit. Prefix
+  searches use separate lexicographic range probes over the normalized indexes. Each probe is
+  bounded to `limit + 1` rows; prefix bounds handle Unicode scalar boundaries, including the
+  surrogate gap and the maximum scalar value; contains searches use the trigram FTS index.
   During promotion, searches reuse the active generation reported by promotion-safe status rather
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
   becomes available.
+  Cancellation requests carry a source label through the gateway adapter into the native client,
+  and diagnostic logs cover startup boundaries, pause/foreground/health/controller transitions,
+  maintenance and pacing waits, and bounded native operation entry/return details. Transition
+  records are informational; maintenance, pacing, health-probe, and actionable operation details
+  use debug-level logging, while high-frequency native iterator refill and per-entry diagnostics
+  remain at trace level to keep normal production logs bounded. These records distinguish gateway
+  scheduling and cancellation cleanup from a native browse or event-delivery stall without
+  changing protocol behavior.
+  Event-delivery waits use the configured operation timeout; when that deadline expires, the
+  gateway requests native cancellation with an `inventory_event_timeout` source label before
+  recording the build failure.
   If refresh setup fails or shutdown wins before the background build task starts, the provisional
   generation is abandoned and the build reservation is released without disturbing the last
   complete active generation.
@@ -259,6 +277,13 @@ config file — see [Configuration](#configuration) below.
   tag; an unhealthy server pauses the build with bounded exponential backoff, while a healthy
   recovery resumes it with the configured pacing. Without a sentinel tag, the health status is
   reported as `Unavailable` while capability and latency checks can still permit the build.
+  Healthy probe observations carry no failure detail; failure reasons are populated only for
+  capability, sentinel, or latency failures.
+  The configured item rate is enforced once by native-operation cost: DA2 operations cost one
+  item, while a DA3 page is charged by the number of entries requested. The slice batch size
+  selects the page size but does not add a separate delay before every native operation, so DA2
+  traversal is not throttled twice. There is no separate gateway burst limiter. The legacy
+  `index.burst_size` setting is accepted for configuration compatibility but has no effect.
   Cancellation, probe failure, or a rejected pacing update stops the build and preserves the last
   complete generation. Pending entries are
   flushed before terminal state is recorded, and successful completion or a non-fatal inventory
@@ -396,6 +421,21 @@ The persistent namespace index is opt-in by server: index operations are accepte
 in `index.servers`, and automatic indexing never scans any other server. A valid complete
 generation remains available while a refresh runs, and failed or cancelled refreshes never replace
 it.
+When an existing populated database is missing a required secondary index or the trigram full-text
+index, gateway startup records that preparation is required instead of creating large objects
+during ordinary operation. Ordinary database opens inspect the schema and index definitions but do
+not scan every relational and FTS row, so status and search remain responsive on multi-million-entry
+databases. Stop the gateway and run the one-shot maintenance command
+`opcda-bridge-gateway --config PATH index-prepare`; this is a one-shot command that exits after
+preparation without starting the gateway or contacting OPC DA. It creates and populates the
+missing objects transactionally, validates them before commit, and records a retryable failure marker if
+preparation cannot complete. Explicit preparation performs the full relational/FTS consistency check.
+Empty databases prepare automatically, and status remains available while preparation is required.
+Unexpected index definitions fail initialization, and inconsistent full-text data is quarantined
+rather than served as an incomplete cache. The preparation command is database-only, can run on a
+non-Windows host, and returns a nonzero status when preparation fails. It uses the normal gateway
+CLI/configuration parsing but does not initialize COM or open a listener; the gateway's normal OPC
+DA serving mode still requires Windows.
 
 | Index setting              | Config key                            | Default                        |
 | -------------------------- | ------------------------------------- | ------------------------------ |
@@ -411,7 +451,7 @@ it.
 | SQLite commit interval     | `index.commit_interval_ms`            | `1000` ms                      |
 | Legacy batch size fallback | `index.batch_size`                    | `100` (max `1000`)             |
 | Average item rate          | `index.item_rate_limit`               | `250` items/second             |
-| Burst allowance            | `index.burst_size`                    | `100` items                    |
+| Legacy burst allowance     | `index.burst_size`                    | accepted but ignored           |
 | Active duty cycle          | `index.duty_cycle_percent`            | `20`%                          |
 | Adaptive pacing            | `index.adaptive`                      | `true`                         |
 | Adaptive canary profile    | `index.canary_*`                      | `50` items/s, batch `25`, `5`% |
@@ -443,10 +483,11 @@ Run only one gateway process with a given index database path. A gateway automat
 directory can otherwise start a second inventory against the same SQLite file. When multiple
 gateway instances are intentional, give each instance an explicit, different
 `index.database_path` and configure indexing on only the instance that should build that
-server's index. Each server's build uses a persistent sibling `.build.lock` file. The operating
-system's advisory lock, not the file's existence, determines whether a build is active; metadata
-from a forcibly terminated process is overwritten by the next successful acquisition. Do not
-delete the lock path while a gateway may still be running.
+server's index. Each server's build uses a persistent sibling `.build.lock` file. On Windows,
+`.build.owner` carries the same owner metadata because the locked file may be unreadable; it is
+removed on a clean lock release and may remain after forced termination until the next acquisition
+overwrites it. The operating-system advisory lock, not either file's existence, determines whether
+a build is active. Do not delete either path while a gateway may still be running.
 
 ### Client
 
