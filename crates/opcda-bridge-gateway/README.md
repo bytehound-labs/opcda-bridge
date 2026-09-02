@@ -168,4 +168,5 @@ unresponsive target cannot hold the scheduler indefinitely.
 An optional `sentinel_tag` is read during health probes; omitted or unavailable sentinel
 configuration is reported explicitly rather than treated as a healthy zero value. Status also
 distinguishes a configured sentinel from its probe result, so an unprobed sentinel is not reported
-as absent.
+as absent. Healthy probe observations carry no failure detail; that field is populated only when
+capability, sentinel, or latency checks fail.

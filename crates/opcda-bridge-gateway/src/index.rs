@@ -1298,7 +1298,7 @@ impl IndexDb {
         {
             fs::create_dir_all(parent)?;
         }
-        tracing::info!(
+        tracing::debug!(
             process_id = std::process::id(),
             database = %path.display(),
             "opening namespace index database"
@@ -2549,7 +2549,7 @@ fn cleanup_one_batch(
         return Ok(CleanupBatchResult::Shutdown);
     }
     if cleanup_build_is_active(active_builds) {
-        tracing::info!(
+        tracing::debug!(
             process_id = std::process::id(),
             database = %path.display(),
             server,
@@ -2566,7 +2566,7 @@ fn cleanup_one_batch(
         .lock()
         .map_err(|_| anyhow::anyhow!("index writer gate poisoned"))?;
     if cleanup_build_is_active(active_builds) {
-        tracing::info!(
+        tracing::debug!(
             process_id = std::process::id(),
             database = %path.display(),
             server,
@@ -2608,7 +2608,7 @@ fn cleanup_obsolete_generations_coordinated(
     let cleanup_started = Instant::now();
     let read_only = IndexDb::open_read_only(path)?;
     if read_only.preparation_required {
-        tracing::info!(
+        tracing::debug!(
             process_id = std::process::id(),
             database = %path.display(),
             server,
@@ -3578,7 +3578,7 @@ impl<C: OpcClient> IndexManager<C> {
             match self.settings.initial_build_policy {
                 InitialBuildPolicy::Immediate => true,
                 InitialBuildPolicy::Manual => {
-                    tracing::info!(
+                    tracing::debug!(
                         server = %status.server,
                         "automatic namespace index build is disabled until a manual refresh"
                     );
@@ -4203,7 +4203,7 @@ impl<C: OpcClient> IndexManager<C> {
         self.require_configured(server)?;
         let preparation_started = Instant::now();
         self.ensure_database_prepared()?;
-        tracing::info!(
+        tracing::debug!(
             server,
             elapsed_ms = preparation_started.elapsed().as_millis(),
             "namespace index database preparation check completed"
@@ -4213,7 +4213,7 @@ impl<C: OpcClient> IndexManager<C> {
         }
         let storage_started = Instant::now();
         let storage = self.with_database_read(|db| Ok(db.storage_diagnostics()))?;
-        tracing::info!(
+        tracing::debug!(
             server,
             elapsed_ms = storage_started.elapsed().as_millis(),
             free_bytes = ?storage.free_bytes,
@@ -4236,7 +4236,7 @@ impl<C: OpcClient> IndexManager<C> {
         self.load_persisted_retry_state(server)?;
         let reservation_started = Instant::now();
         let build_ownership = self.reserve_refresh_build(server, force)?;
-        tracing::info!(
+        tracing::debug!(
             server,
             elapsed_ms = reservation_started.elapsed().as_millis(),
             reserved = build_ownership.is_some(),
@@ -4253,7 +4253,7 @@ impl<C: OpcClient> IndexManager<C> {
         else {
             return self.status(server).await;
         };
-        tracing::info!(
+        tracing::debug!(
             server,
             elapsed_ms = refresh_started.elapsed().as_millis(),
             "namespace index inventory startup returned a control handle"
@@ -13405,6 +13405,10 @@ mod tests {
             good.status("S").await.unwrap().health,
             HealthProbeState::Healthy
         );
+        let observation = good.probe_health("S").await;
+        assert!(observation.healthy);
+        assert!(observation.failure_reason.is_none());
+        assert!(observation.sentinel_configured);
     }
 
     #[test]

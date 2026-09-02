@@ -277,6 +277,8 @@ config file — see [Configuration](#configuration) below.
   tag; an unhealthy server pauses the build with bounded exponential backoff, while a healthy
   recovery resumes it with the configured pacing. Without a sentinel tag, the health status is
   reported as `Unavailable` while capability and latency checks can still permit the build.
+  Healthy probe observations carry no failure detail; failure reasons are populated only for
+  capability, sentinel, or latency failures.
   The configured item rate is enforced once by native-operation cost: DA2 operations cost one
   item, while a DA3 page is charged by the number of entries requested. The slice batch size
   selects the page size but does not add a separate delay before every native operation, so DA2
