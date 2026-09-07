@@ -843,7 +843,7 @@ mod tests {
         SearchIndexStatus {
             server: "S".into(),
             state: state as i32,
-            auto_refresh_enabled: true,
+            configured: true,
             active_generation: 4,
             entry_count: 100,
             unique_item_count: 99,

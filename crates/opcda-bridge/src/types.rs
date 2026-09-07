@@ -841,7 +841,7 @@ impl TryFrom<proto::SearchIndexStatus> for SearchIndexStatus {
         Ok(Self {
             server: value.server,
             state: search_index_state(value.state)?,
-            auto_refresh_enabled: value.auto_refresh_enabled,
+            auto_refresh_enabled: value.configured,
             active_generation: value.active_generation,
             entry_count: value.entry_count,
             unique_item_count: value.unique_item_count,
@@ -1434,7 +1434,7 @@ mod tests {
             status: Some(proto::SearchIndexStatus {
                 server: "Yokogawa.CSHIS_OPC.1".into(),
                 state: proto::SearchIndexState::Refreshing as i32,
-                auto_refresh_enabled: true,
+                configured: true,
                 active_generation: 7,
                 entry_count: 100_001,
                 unique_item_count: 100_000,

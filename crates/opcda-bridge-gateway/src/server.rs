@@ -271,7 +271,7 @@ fn map_index_status(status: IndexStatus) -> SearchIndexStatus {
     SearchIndexStatus {
         server: status.server,
         state: map_index_state(status.state) as i32,
-        auto_refresh_enabled: status.auto_refresh_enabled,
+        configured: status.auto_refresh_enabled,
         active_generation: status.active_generation,
         entry_count: status.entry_count,
         unique_item_count: status.unique_item_count,
@@ -2159,7 +2159,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(!disabled.auto_refresh_enabled);
+        assert!(!disabled.configured);
         let deleted = service
             .control_search_index(Request::new(ControlSearchIndexRequest {
                 server: "S".into(),
@@ -2169,7 +2169,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(deleted.state, SearchIndexState::Deleting as i32);
-        assert!(!deleted.auto_refresh_enabled);
+        assert!(!deleted.configured);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let status = service

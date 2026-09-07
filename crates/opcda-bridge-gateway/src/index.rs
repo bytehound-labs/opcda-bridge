@@ -1067,15 +1067,15 @@ impl Drop for BuildFileLock {
         if let Some(file) = self.file.take() {
             #[cfg(windows)]
             if let Some(owner_path) = self.owner_path.take() {
-                if let Err(error) = fs::remove_file(&owner_path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::warn!(
+                match fs::remove_file(&owner_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => tracing::warn!(
                         process_id = std::process::id(),
                         owner = %owner_path.display(),
                         error = %error,
                         "unable to remove namespace index build owner metadata"
-                    );
+                    ),
                 }
             }
             let _ = FileExt::unlock(&file);
@@ -3106,44 +3106,68 @@ impl<C: OpcClient> IndexManager<C> {
             return;
         }
         let manager = Arc::clone(self);
-        let mut shutdown = self.background_tasks.subscribe();
+        let shutdown = self.background_tasks.subscribe();
         self.background_tasks.spawn(async move {
-            let startup_grace = Duration::from_secs(manager.settings.startup_grace_period_seconds);
-            if !startup_grace.is_zero() {
-                tokio::select! {
-                    _ = shutdown.changed() => return,
-                    _ = tokio::time::sleep(startup_grace) => {}
-                }
-            }
-
-            loop {
-                if *shutdown.borrow() {
-                    break;
-                }
-                let mut delay = Duration::from_secs(60);
-                let servers = match manager.with_database_read(|db| db.scheduled_servers()) {
-                    Ok(servers) => servers,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "unable to list scheduled namespace indexes");
-                        Vec::new()
-                    }
-                };
-                for server in servers {
-                    if *shutdown.borrow() {
-                        break;
-                    }
-                    manager.refresh_if_due(&server).await;
-                    delay = delay.min(manager.background_refresh_delay(&server).await);
-                }
-                if *shutdown.borrow() {
-                    break;
-                }
-                tokio::select! {
-                    _ = shutdown.changed() => {}
-                    _ = tokio::time::sleep(delay) => {}
-                }
-            }
+            manager.run_background_indexing(shutdown).await;
         });
+    }
+
+    async fn run_background_indexing(
+        self: &Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        if !self.wait_for_startup_grace(&mut shutdown).await {
+            return;
+        }
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            let delay = self.refresh_scheduled_servers(&mut shutdown).await;
+            if *shutdown.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = shutdown.changed() => {}
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    async fn wait_for_startup_grace(
+        &self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        let startup_grace = Duration::from_secs(self.settings.startup_grace_period_seconds);
+        if startup_grace.is_zero() {
+            return true;
+        }
+        tokio::select! {
+            _ = shutdown.changed() => false,
+            _ = tokio::time::sleep(startup_grace) => true,
+        }
+    }
+
+    async fn refresh_scheduled_servers(
+        self: &Arc<Self>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Duration {
+        let mut delay = Duration::from_secs(60);
+        let servers = match self.with_database_read(|db| db.scheduled_servers()) {
+            Ok(servers) => servers,
+            Err(error) => {
+                tracing::warn!(error = %error, "unable to list scheduled namespace indexes");
+                Vec::new()
+            }
+        };
+        for server in servers {
+            if *shutdown.borrow() {
+                break;
+            }
+            self.refresh_if_due(&server).await;
+            delay = delay.min(self.background_refresh_delay(&server).await);
+        }
+        delay
     }
 
     pub async fn shutdown_background_indexing(&self) {

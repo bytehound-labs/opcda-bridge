@@ -191,7 +191,9 @@ message SearchIndexRequest {
 message SearchIndexStatus {
   string server = 1;
   SearchIndexState state = 2;
-  bool auto_refresh_enabled = 3;
+  // Field 3 retains its historical wire name for protobuf compatibility.
+  // In the 0.5 lifecycle contract it reports automatic-refresh eligibility.
+  bool configured = 3;
   uint64 active_generation = 4;
   uint64 entry_count = 5;
   uint64 unique_item_count = 6;
