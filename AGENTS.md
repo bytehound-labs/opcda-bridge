@@ -137,6 +137,9 @@ target for early gateway development.
 
 ## Build / Test / Lint / Coverage
 
+- Use Rust's `stable` toolchain for local development, validation, coverage, SonarQube, and
+  release-plz jobs. The separate MSRV (Minimum Supported Rust Version) check uses Rust 1.88.0.
+  Keep the cargo-fuzz smoke workflow on nightly unless stable support is verified independently.
 - **Build**: `cargo build`
 - **Test**: `cargo test --workspace`
 - **Lint**: `cargo fmt --check --all` and
