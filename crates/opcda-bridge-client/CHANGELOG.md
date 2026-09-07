@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-client-v0.4.8...opcda-bridge-client-v0.5.0) - 2026-09-07
+
+### Added
+
+- *(index)* move namespace indexing to UI-driven lifecycle ([#134](https://github.com/bytehound-labs/opcda-bridge/pull/134))
+
 ### Changed
 
 - Report the indexed-search per-server auto-refresh setting instead of obsolete configured-list
