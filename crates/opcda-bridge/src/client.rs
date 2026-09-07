@@ -348,6 +348,12 @@ fn index_operation_error(operation: &'static str, server: String, status: tonic:
         Code::Unimplemented => Error::IncompatibleGateway { operation },
         Code::InvalidArgument => Error::UnknownIndexServer { server },
         Code::NotFound => Error::IndexNotEnrolled { server },
+        Code::FailedPrecondition
+            if status.message()
+                == format!("namespace index for OPC DA server {server:?} is being deleted") =>
+        {
+            Error::IndexDeleting { server }
+        }
         _ => Error::Rpc(status),
     }
 }
@@ -394,6 +400,28 @@ mod tests {
         assert!(matches!(
             error,
             Error::Rpc(status) if status.code() == tonic::Code::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn index_operation_error_only_classifies_the_gateway_deletion_message() {
+        let error = index_operation_error(
+            "indexed-search refresh",
+            "S".into(),
+            tonic::Status::failed_precondition(
+                r#"namespace index for OPC DA server "S" is being deleted"#,
+            ),
+        );
+        assert!(matches!(error, Error::IndexDeleting { server } if server == "S"));
+
+        let error = index_operation_error(
+            "indexed-search refresh",
+            "S".into(),
+            tonic::Status::failed_precondition("some other precondition failed"),
+        );
+        assert!(matches!(
+            error,
+            Error::Rpc(status) if status.code() == tonic::Code::FailedPrecondition
         ));
     }
 

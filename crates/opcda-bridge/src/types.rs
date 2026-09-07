@@ -112,6 +112,7 @@ pub enum SearchIndexState {
     Refreshing,
     Promoting,
     Failed,
+    Deleting,
 }
 
 impl fmt::Display for SearchIndexState {
@@ -125,6 +126,7 @@ impl fmt::Display for SearchIndexState {
             Self::Refreshing => "refreshing",
             Self::Promoting => "promoting",
             Self::Failed => "failed",
+            Self::Deleting => "deleting",
         })
     }
 }
@@ -638,6 +640,7 @@ fn search_index_state(value: i32) -> Result<SearchIndexState> {
         proto::SearchIndexState::Refreshing => Ok(SearchIndexState::Refreshing),
         proto::SearchIndexState::Promoting => Ok(SearchIndexState::Promoting),
         proto::SearchIndexState::Failed => Ok(SearchIndexState::Failed),
+        proto::SearchIndexState::Deleting => Ok(SearchIndexState::Deleting),
     }
 }
 
@@ -1058,6 +1061,7 @@ mod tests {
         assert_eq!(SearchIndexState::Refreshing.to_string(), "refreshing");
         assert_eq!(SearchIndexState::Promoting.to_string(), "promoting");
         assert_eq!(SearchIndexState::Failed.to_string(), "failed");
+        assert_eq!(SearchIndexState::Deleting.to_string(), "deleting");
         assert_eq!(IndexControllerState::Unspecified.to_string(), "unspecified");
         assert_eq!(IndexControllerState::Ramping.to_string(), "ramping");
         assert_eq!(IndexControllerState::Steady.to_string(), "steady");
@@ -1233,6 +1237,10 @@ mod tests {
                 SearchIndexState::Promoting,
             ),
             (proto::SearchIndexState::Failed, SearchIndexState::Failed),
+            (
+                proto::SearchIndexState::Deleting,
+                SearchIndexState::Deleting,
+            ),
         ] {
             assert_eq!(search_index_state(proto_state as i32).unwrap(), state);
         }

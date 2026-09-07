@@ -96,6 +96,9 @@ fn index_error(error: IndexOperationError) -> Status {
         IndexOperationError::NotEnrolled { server } => Status::not_found(format!(
             "namespace index for OPC DA server {server:?} is not enrolled"
         )),
+        IndexOperationError::Deleting { server } => Status::failed_precondition(format!(
+            "namespace index for OPC DA server {server:?} is being deleted"
+        )),
         IndexOperationError::Internal(error) => internal(error),
     }
 }
@@ -218,6 +221,7 @@ fn map_index_state(state: IndexState) -> SearchIndexState {
         IndexState::Refreshing => SearchIndexState::Refreshing,
         IndexState::Promoting => SearchIndexState::Refreshing,
         IndexState::Failed => SearchIndexState::Failed,
+        IndexState::Deleting => SearchIndexState::Deleting,
     }
 }
 
@@ -1058,6 +1062,7 @@ mod tests {
             (IndexState::Refreshing, SearchIndexState::Refreshing),
             (IndexState::Promoting, SearchIndexState::Refreshing),
             (IndexState::Failed, SearchIndexState::Failed),
+            (IndexState::Deleting, SearchIndexState::Deleting),
         ] {
             assert_eq!(map_index_state(state), expected);
         }
@@ -1211,6 +1216,13 @@ mod tests {
                 assert!(mapped.pause_reason.is_some());
             }
         }
+        let mut deleting = base.clone();
+        deleting.state = IndexState::Deleting;
+        assert_eq!(
+            map_index_status(deleting).state,
+            SearchIndexState::Deleting as i32
+        );
+
         for (health, expected) in [
             (
                 crate::index::HealthProbeState::Unavailable,
@@ -1258,6 +1270,10 @@ mod tests {
         assert_eq!(
             index_error(IndexOperationError::NotEnrolled { server: "S".into() }).code(),
             tonic::Code::NotFound
+        );
+        assert_eq!(
+            index_error(IndexOperationError::Deleting { server: "S".into() }).code(),
+            tonic::Code::FailedPrecondition
         );
         assert_eq!(
             index_error(IndexOperationError::Internal(anyhow::anyhow!(
@@ -2152,8 +2168,25 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(deleted.state, SearchIndexState::NotIndexed as i32);
+        assert_eq!(deleted.state, SearchIndexState::Deleting as i32);
         assert!(!deleted.auto_refresh_enabled);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = service
+                    .get_search_index_status(Request::new(GetSearchIndexStatusRequest {
+                        server: "S".into(),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if status.state == SearchIndexState::NotIndexed as i32 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

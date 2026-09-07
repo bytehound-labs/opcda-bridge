@@ -275,9 +275,11 @@ config file — see [Configuration](#configuration) below.
   build-lock sidecars.
   Indexed queries use a dedicated read-only SQLite connection and bounded candidate sets, keeping
   broad searches out of the foreground database mutex. Exact searches use separate equality
-  lookups on the normalized display-name and ItemID indexes, each bounded to `limit + 1` rows,
-  then merge and deduplicate those candidates before ranking; prefix and contains searches retain
-  their existing indexed/FTS paths.
+  lookups on covering normalized display-name and ItemID indexes, each bounded to `limit + 1`
+  rows, exclude lower-priority ItemID duplicates already found by the display-name probe, and then
+  merge and deduplicate those candidates before ranking. Prefix searches use indexed
+  lexicographic ranges rather than generation-wide `LIKE` scans; contains searches retain their FTS
+  path.
   During promotion, searches reuse the active generation reported by promotion-safe status rather
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
@@ -464,7 +466,8 @@ schedules only enrolled servers with a successful active generation and
 browse, search, refresh, and read operations remain available when it is false. Per-server
 scheduled refresh can be disabled without deleting its searchable data through the indexed-search
 control API. Deleting an index cancels and coordinates any active build, then removes enrollment,
-generations, entries, and retry metadata; its final status is `not-indexed`.
+generations, entries, and retry metadata asynchronously. The delete request returns a temporary
+`deleting` status while cleanup runs; its final status is `not-indexed`.
 
 The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (falling back to
 `$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS and

@@ -40,6 +40,7 @@ pub enum IndexState {
     Refreshing,
     Promoting,
     Failed,
+    Deleting,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -913,6 +914,7 @@ struct Enrollment {
 pub enum IndexOperationError {
     UnknownServer { server: String },
     NotEnrolled { server: String },
+    Deleting { server: String },
     Internal(anyhow::Error),
 }
 
@@ -928,6 +930,12 @@ impl std::fmt::Display for IndexOperationError {
                     "namespace index for OPC DA server {server:?} is not enrolled"
                 )
             }
+            Self::Deleting { server } => {
+                write!(
+                    formatter,
+                    "namespace index for OPC DA server {server:?} is being deleted"
+                )
+            }
             Self::Internal(error) => error.fmt(formatter),
         }
     }
@@ -937,7 +945,7 @@ impl std::error::Error for IndexOperationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Internal(error) => Some(error.root_cause()),
-            Self::UnknownServer { .. } | Self::NotEnrolled { .. } => None,
+            Self::UnknownServer { .. } | Self::NotEnrolled { .. } | Self::Deleting { .. } => None,
         }
     }
 }
@@ -1184,6 +1192,13 @@ impl IndexDb {
                ON entries(server, generation, display_name_norm);
              CREATE INDEX IF NOT EXISTS entries_item_prefix
                ON entries(server, generation, item_id_norm);
+             CREATE INDEX IF NOT EXISTS entries_display_exact
+               ON entries(server, generation, display_name_norm, item_id_norm, item_id);
+             CREATE INDEX IF NOT EXISTS entries_item_exact
+               ON entries(
+                   server, generation, item_id_norm, length(display_name_norm),
+                   display_name_norm, item_id
+               );
              CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
                  server UNINDEXED,
                  generation UNINDEXED,
@@ -1782,10 +1797,13 @@ impl IndexDb {
         if mode == 1 {
             return self.search_exact(server, generation, &normalized_query, limit);
         }
+        if mode == 2 {
+            return self.search_prefix(server, generation, &normalized_query, limit);
+        }
         let fts_compatible = normalized_query
             .split_whitespace()
             .all(|term| term.chars().count() >= 3);
-        if normalized_query.chars().count() >= 3 && fts_compatible && mode != 2 {
+        if normalized_query.chars().count() >= 3 && fts_compatible {
             return self.search_full_text(server, generation, &normalized_query, limit);
         }
         let mut sql = format!(
@@ -1793,25 +1811,13 @@ impl IndexDb {
              WHERE e.server = ? AND e.generation = {generation}"
         );
         let mut values = vec![server.to_string()];
-        match mode {
-            2 => {
-                let pattern = format!("{}%", escape_like(&normalized_query));
-                sql.push_str(
-                    " AND (e.display_name_norm LIKE ? ESCAPE '\\'
-                        OR e.item_id_norm LIKE ? ESCAPE '\\')",
-                );
-                values.extend([pattern.clone(), pattern]);
-            }
-            _ => {
-                let pattern = format!("%{}%", escape_like(&normalized_query));
-                sql.push_str(
-                    " AND (e.display_name_norm LIKE ? ESCAPE '\\'
-                        OR e.item_id_norm LIKE ? ESCAPE '\\'
-                        OR e.breadcrumbs LIKE ? ESCAPE '\\')",
-                );
-                values.extend([pattern.clone(), pattern.clone(), pattern]);
-            }
-        }
+        let pattern = format!("%{}%", escape_like(&normalized_query));
+        sql.push_str(
+            " AND (e.display_name_norm LIKE ? ESCAPE '\\'
+                OR e.item_id_norm LIKE ? ESCAPE '\\'
+                OR e.breadcrumbs LIKE ? ESCAPE '\\')",
+        );
+        values.extend([pattern.clone(), pattern.clone(), pattern]);
         sql.push_str(
             " ORDER BY CASE
                  WHEN e.display_name_norm = ? THEN 0
@@ -1861,6 +1867,111 @@ impl IndexDb {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    fn search_prefix(
+        &self,
+        server: &str,
+        generation: u64,
+        normalized_query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<IndexedMatch>> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
+        let candidate_limit = i64::from(limit.saturating_add(1));
+        let upper_bound = prefix_upper_bound(normalized_query);
+        let mut candidates: HashMap<String, (SearchCandidate, IndexedMatch)> = HashMap::new();
+
+        for column in ["display_name_norm", "item_id_norm"] {
+            let (range, display_prefix_condition, item_prefix_condition, limit_parameter) =
+                match upper_bound.as_deref() {
+                    Some(_) => (
+                        format!("e.{column} >= ?3 AND e.{column} < ?4"),
+                        "e.display_name_norm >= ?3 AND e.display_name_norm < ?4".to_string(),
+                        "e.item_id_norm >= ?3 AND e.item_id_norm < ?4".to_string(),
+                        5,
+                    ),
+                    None => (
+                        format!(
+                            "e.{column} >= ?3
+                             AND substr(e.{column}, 1, length(?3)) = ?3"
+                        ),
+                        "substr(e.display_name_norm, 1, length(?3)) = ?3".to_string(),
+                        "substr(e.item_id_norm, 1, length(?3)) = ?3".to_string(),
+                        4,
+                    ),
+                };
+            let sql = format!(
+                "SELECT e.item_id, e.display_name, e.display_name_norm,
+                        e.item_id_norm, e.kind, e.breadcrumbs
+                 FROM entries e
+                 WHERE e.server = ?1 AND e.generation = ?2 AND {range}
+                 ORDER BY CASE
+                            WHEN e.display_name_norm = ?3 THEN 0
+                            WHEN e.item_id_norm = ?3 THEN 1
+                            WHEN {display_prefix_condition} THEN 2
+                            WHEN {item_prefix_condition} THEN 3
+                            ELSE 6
+                          END,
+                          length(e.display_name_norm), e.display_name_norm,
+                          e.item_id_norm, e.item_id
+                 LIMIT ?{limit_parameter}"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let row_mapper = |row: &rusqlite::Row<'_>| {
+                let item_id = row.get::<_, String>(0)?;
+                let display_name = row.get::<_, String>(1)?;
+                let display_name_norm = row.get::<_, String>(2)?;
+                let item_id_norm = row.get::<_, String>(3)?;
+                let kind = parse_indexed_kind(row.get::<_, i64>(4)?)?;
+                let breadcrumbs = parse_indexed_breadcrumbs(row.get::<_, String>(5)?)?;
+                let candidate = SearchCandidate {
+                    rank: SearchRank {
+                        tier: search_rank(normalized_query, &display_name_norm, &item_id_norm),
+                        display_name_len: display_name_norm.chars().count(),
+                        display_name_norm,
+                        item_id_norm,
+                    },
+                    item_id: item_id.clone(),
+                };
+                Ok((
+                    candidate,
+                    IndexedMatch {
+                        item_id,
+                        display_name,
+                        kind,
+                        breadcrumbs,
+                    },
+                ))
+            };
+            let rows = match upper_bound.as_deref() {
+                Some(upper_bound) => statement.query_map(
+                    params![
+                        server,
+                        generation,
+                        normalized_query,
+                        upper_bound,
+                        candidate_limit
+                    ],
+                    &row_mapper,
+                )?,
+                None => statement.query_map(
+                    params![server, generation, normalized_query, candidate_limit],
+                    &row_mapper,
+                )?,
+            };
+            for row in rows {
+                let (candidate, value) = row?;
+                candidates
+                    .entry(value.item_id.clone())
+                    .or_insert((candidate, value));
+            }
+        }
+
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        candidates.truncate(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX));
+        Ok(candidates.into_iter().map(|(_, value)| value).collect())
+    }
+
     fn search_exact(
         &self,
         server: &str,
@@ -1871,19 +1982,32 @@ impl IndexDb {
         let generation = i64::try_from(generation)
             .map_err(|_| anyhow::anyhow!("namespace index generation exceeds SQLite range"))?;
         let candidate_limit = i64::from(limit.saturating_add(1));
+        let candidate_limit_usize = usize::try_from(candidate_limit).unwrap_or(usize::MAX);
         let mut candidates: HashMap<String, (SearchCandidate, IndexedMatch)> = HashMap::new();
 
-        for column in ["display_name_norm", "item_id_norm"] {
-            let sql = format!(
-                "SELECT e.item_id, e.display_name, e.display_name_norm,
-                        e.item_id_norm, e.kind, e.breadcrumbs
-                 FROM entries e
-                 WHERE e.server = ?1 AND e.generation = ?2 AND e.{column} = ?3
-                 ORDER BY length(e.display_name_norm), e.display_name_norm,
-                          e.item_id_norm, e.item_id
-                 LIMIT ?4"
-            );
-            let mut statement = self.connection.prepare(&sql)?;
+        let exact_queries = [
+            "SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.display_name_norm = ?3
+             ORDER BY e.item_id_norm, e.item_id
+             LIMIT ?4",
+            "SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.item_id_norm = ?3
+               AND e.display_name_norm <> ?3
+             ORDER BY length(e.display_name_norm), e.display_name_norm,
+                      e.item_id_norm, e.item_id
+             LIMIT ?4",
+        ];
+        for (query_index, sql) in exact_queries.iter().enumerate() {
+            if query_index == 1 && candidates.len() >= candidate_limit_usize {
+                break;
+            }
+            let mut statement = self.connection.prepare(sql)?;
             let query_params = params![server, generation, normalized_query, candidate_limit];
             let row_mapper = |row: &rusqlite::Row<'_>| {
                 let item_id = row.get::<_, String>(0)?;
@@ -2026,6 +2150,24 @@ fn search_rank(query: &str, display_name_norm: &str, item_id_norm: &str) -> u8 {
     } else {
         6
     }
+}
+
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars = prefix.chars().collect::<Vec<_>>();
+    for index in (0..chars.len()).rev() {
+        let value = chars[index] as u32;
+        let next = match value {
+            0x10ffff => None,
+            0xd7ff => char::from_u32(0xe000),
+            _ => char::from_u32(value + 1),
+        };
+        if let Some(next) = next {
+            chars[index] = next;
+            chars.truncate(index + 1);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 fn build_fts_query(query: &str) -> String {
@@ -2718,6 +2860,7 @@ pub struct IndexManager<C: OpcClient> {
     pending_cancels: Arc<Mutex<HashSet<String>>>,
     promoting: Arc<Mutex<HashSet<String>>>,
     deleting: Arc<Mutex<HashSet<String>>>,
+    deletion_errors: Arc<Mutex<HashMap<String, String>>>,
     foreground_users: Arc<Mutex<HashMap<String, usize>>>,
     pause_overlays: Arc<Mutex<HashMap<String, PauseOverlayState>>>,
     foreground_metrics: Arc<Mutex<HashMap<String, ForegroundMetricState>>>,
@@ -2841,6 +2984,7 @@ impl<C: OpcClient> IndexManager<C> {
             pending_cancels: Arc::new(Mutex::new(HashSet::new())),
             promoting: Arc::new(Mutex::new(HashSet::new())),
             deleting: Arc::new(Mutex::new(HashSet::new())),
+            deletion_errors: Arc::new(Mutex::new(HashMap::new())),
             foreground_users: Arc::new(Mutex::new(HashMap::new())),
             pause_overlays: Arc::new(Mutex::new(HashMap::new())),
             foreground_metrics: Arc::new(Mutex::new(HashMap::new())),
@@ -3059,6 +3203,7 @@ impl<C: OpcClient> IndexManager<C> {
             IndexState::Promoting => Duration::from_secs(1),
             IndexState::Failed => retry_delay(server, 1, false, self.settings.circuit_open_seconds),
             IndexState::NotIndexed => Duration::from_secs(3600),
+            IndexState::Deleting => Duration::from_secs(30),
         }
     }
 
@@ -3403,6 +3548,18 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub async fn status(&self, server: &str) -> anyhow::Result<IndexStatus> {
+        let is_deleting = self.is_deleting(server)?;
+        let deletion_error = self.deletion_error(server)?;
+        if is_deleting {
+            let mut status = empty_status(server, false, IndexState::Deleting);
+            status.sentinel_configured = self.settings.sentinel_tag.is_some();
+            let storage = storage_diagnostics_for_path(&self.settings.database_path);
+            status.database_bytes = storage
+                .main_bytes
+                .saturating_add(storage.wal_bytes)
+                .saturating_add(storage.shm_bytes);
+            return Ok(status);
+        }
         let is_promoting = self
             .promoting
             .lock()
@@ -3429,6 +3586,10 @@ impl<C: OpcClient> IndexManager<C> {
         let Some(enrollment) = enrollment else {
             let mut status = empty_status(server, false, IndexState::NotIndexed);
             status.sentinel_configured = sentinel_configured;
+            if let Some(error) = deletion_error {
+                status.state = IndexState::Failed;
+                status.last_error = Some(format!("namespace index deletion failed: {error}"));
+            }
             return Ok(status);
         };
         let (rows, promotion_read_error) = self.load_status_rows(server, is_promoting)?;
@@ -3455,6 +3616,10 @@ impl<C: OpcClient> IndexManager<C> {
             runtime.last_error.as_deref(),
             promotion_read_error.as_deref(),
         );
+        if let Some(error) = deletion_error {
+            status.state = IndexState::Failed;
+            status.last_error = Some(format!("namespace index deletion failed: {error}"));
+        }
         status.foreground_metrics = self.foreground_metrics_snapshot(server);
         status.host_metrics = self.host_metrics.snapshot();
         status.storage = storage;
@@ -3761,7 +3926,7 @@ impl<C: OpcClient> IndexManager<C> {
             .is_deleting(server)
             .map_err(IndexOperationError::Internal)?
         {
-            return Err(IndexOperationError::NotEnrolled {
+            return Err(IndexOperationError::Deleting {
                 server: server.to_string(),
             });
         }
@@ -4292,23 +4457,24 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub async fn control(
-        &self,
+        self: &Arc<Self>,
         server: &str,
         action: IndexControlAction,
     ) -> Result<IndexStatus, IndexOperationError> {
         match action {
             IndexControlAction::EnableAutoRefresh => {
+                self.reject_if_deleting(server)?;
                 self.change_auto_refresh(server, true)?;
             }
             IndexControlAction::DisableAutoRefresh => {
+                self.reject_if_deleting(server)?;
                 self.change_auto_refresh(server, false)?;
             }
             IndexControlAction::Delete => {
-                self.delete_index(server)
-                    .await
-                    .map_err(IndexOperationError::Internal)?;
+                self.delete_index(server).await?;
             }
             IndexControlAction::Pause | IndexControlAction::Resume | IndexControlAction::Cancel => {
+                self.reject_if_deleting(server)?;
                 self.require_enrollment(server)?;
                 self.apply_control_action(server, action)
                     .map_err(IndexOperationError::Internal)?;
@@ -4323,6 +4489,7 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn require_enrollment(&self, server: &str) -> Result<(), IndexOperationError> {
+        self.reject_if_deleting(server)?;
         if self
             .with_database_read(|db| db.enrollment(server))
             .map_err(IndexOperationError::Internal)?
@@ -4337,6 +4504,7 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     fn change_auto_refresh(&self, server: &str, enabled: bool) -> Result<(), IndexOperationError> {
+        self.reject_if_deleting(server)?;
         let changed = self
             .with_database_write(|db| db.set_auto_refresh(server, enabled))
             .map_err(IndexOperationError::Internal)?;
@@ -4356,37 +4524,95 @@ impl<C: OpcClient> IndexManager<C> {
             .map_err(|_| anyhow::anyhow!("index deletion lock poisoned"))
     }
 
-    async fn delete_index(&self, server: &str) -> anyhow::Result<()> {
-        let enrolled = self.with_database_write(|db| db.set_auto_refresh(server, false))?;
+    fn deletion_error(&self, server: &str) -> anyhow::Result<Option<String>> {
+        self.deletion_errors
+            .lock()
+            .map(|errors| errors.get(server).cloned())
+            .map_err(|_| anyhow::anyhow!("index deletion error lock poisoned"))
+    }
+
+    fn reject_if_deleting(&self, server: &str) -> Result<(), IndexOperationError> {
+        if self
+            .is_deleting(server)
+            .map_err(IndexOperationError::Internal)?
+        {
+            Err(IndexOperationError::Deleting {
+                server: server.to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn delete_index(self: &Arc<Self>, server: &str) -> Result<(), IndexOperationError> {
+        self.reject_if_deleting(server)?;
+        let enrolled = self
+            .with_database_write(|db| db.set_auto_refresh(server, false))
+            .map_err(IndexOperationError::Internal)?;
         if !enrolled {
             return Ok(());
         }
         {
-            let mut deleting = self
-                .deleting
-                .lock()
-                .map_err(|_| anyhow::anyhow!("index deletion lock poisoned"))?;
-            deleting.insert(server.to_string());
-        }
-        let result = async {
-            self.cancel_active_build(server)?;
-            self.wait_for_build_to_finish(server).await;
-            let _lock = self.acquire_delete_lock(server).await?;
-            self.with_database_write(|db| db.delete_index(server))?;
-            if let Ok(mut cache) = self.cache.lock() {
-                cache.clear_server(server);
+            let mut deleting = self.deleting.lock().map_err(|_| {
+                IndexOperationError::Internal(anyhow::anyhow!("index deletion lock poisoned"))
+            })?;
+            if !deleting.insert(server.to_string()) {
+                return Err(IndexOperationError::Deleting {
+                    server: server.to_string(),
+                });
             }
-            if let Ok(mut runtime) = self.runtime.lock() {
-                runtime.remove(server);
+        }
+        if let Ok(mut errors) = self.deletion_errors.lock() {
+            errors.remove(server);
+        }
+        let manager = Arc::clone(self);
+        let server_name = server.to_string();
+        if !self.background_tasks.spawn(async move {
+            let result = manager.delete_index_background(&server_name).await;
+            if let Err(error) = result {
+                tracing::error!(
+                    process_id = std::process::id(),
+                    database = %manager.settings.database_path.display(),
+                    server = %server_name,
+                    error = %error,
+                    "namespace index deletion failed"
+                );
+                if let Ok(mut errors) = manager.deletion_errors.lock() {
+                    errors.insert(server_name.clone(), error.to_string());
+                }
             }
-            self.clear_pending_cancel(server);
-            Ok(())
+            if let Ok(mut deleting) = manager.deleting.lock() {
+                deleting.remove(&server_name);
+            }
+        }) {
+            if let Ok(mut deleting) = self.deleting.lock() {
+                deleting.remove(server);
+            }
+            return Err(IndexOperationError::Internal(anyhow::anyhow!(
+                "gateway is shutting down"
+            )));
         }
-        .await;
-        if let Ok(mut deleting) = self.deleting.lock() {
-            deleting.remove(server);
+        Ok(())
+    }
+
+    async fn delete_index_background(self: &Arc<Self>, server: &str) -> anyhow::Result<()> {
+        self.cancel_active_build(server)?;
+        self.wait_for_build_to_finish(server).await;
+        let _lock = self.acquire_delete_lock(server).await?;
+        let manager = Arc::clone(self);
+        let server_name = server.to_string();
+        tokio::task::spawn_blocking(move || {
+            manager.with_database_write(|db| db.delete_index(&server_name))
+        })
+        .await??;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear_server(server);
         }
-        result
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.remove(server);
+        }
+        self.clear_pending_cancel(server);
+        Ok(())
     }
 
     fn cancel_active_build(&self, server: &str) -> anyhow::Result<()> {
@@ -4493,6 +4719,13 @@ impl<C: OpcClient> IndexManager<C> {
         }
         let limit = limit.max(1).min(self.settings.max_results);
         let status = self.status(server).await?;
+        if status.state == IndexState::Deleting {
+            return Ok(IndexedSearch {
+                matches: Vec::new(),
+                has_more: false,
+                status,
+            });
+        }
         let normalized_query = normalize_query(query);
         let generation = if status.active_generation > 0 {
             Some(status.active_generation)
@@ -4546,6 +4779,14 @@ impl<C: OpcClient> IndexManager<C> {
             })
             .await??
         };
+        if self.is_deleting(server)? {
+            let status = self.status(server).await?;
+            return Ok(IndexedSearch {
+                matches: Vec::new(),
+                has_more: false,
+                status,
+            });
+        }
         let has_more = matches.len() > limit as usize;
         matches.truncate(limit as usize);
         tracing::debug!(
@@ -6448,6 +6689,13 @@ mod tests {
     fn normalization_and_timestamp_helpers_are_safe() {
         assert_eq!(normalize_query("  FCS0201   PV "), "fcs0201 pv");
         assert_eq!(escape_like(r"a%b_c\d"), r"a\%b\_c\\d");
+        assert_eq!(prefix_upper_bound("abc"), Some("abd".into()));
+        assert_eq!(prefix_upper_bound("a\u{10ffff}"), Some("b".into()));
+        assert_eq!(
+            prefix_upper_bound("\u{d7ff}\u{10ffff}"),
+            Some("\u{e000}".into())
+        );
+        assert_eq!(prefix_upper_bound("\u{10ffff}"), None);
         assert_eq!(build_fts_query("fcs0201 pv"), "\"fcs0201\" AND \"pv\"");
         assert_eq!(search_rank("219", "219", "display-exact"), 0);
         assert_eq!(search_rank("219", "ordinary", "219"), 1);
@@ -6500,6 +6748,15 @@ mod tests {
             "namespace index for OPC DA server \"Unenrolled.Server\" is not enrolled"
         );
         assert!(not_enrolled.source().is_none());
+
+        let deleting = IndexOperationError::Deleting {
+            server: "Deleting.Server".into(),
+        };
+        assert_eq!(
+            deleting.to_string(),
+            "namespace index for OPC DA server \"Deleting.Server\" is being deleted"
+        );
+        assert!(deleting.source().is_none());
 
         let internal = IndexOperationError::Internal(anyhow::anyhow!("database failed"));
         assert_eq!(internal.to_string(), "database failed");
@@ -9245,6 +9502,12 @@ mod tests {
             .unwrap();
         let ready_delay = manager.background_refresh_delay("S").await;
         assert!(ready_delay <= Duration::from_secs(604_800));
+
+        manager.deleting.lock().unwrap().insert("S".into());
+        assert_eq!(
+            manager.background_refresh_delay("S").await,
+            Duration::from_secs(30)
+        );
     }
 
     #[tokio::test]
@@ -9863,6 +10126,159 @@ mod tests {
                 .map(|value| value.item_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["a-display", "pump", "z-display"]
+        );
+    }
+
+    #[test]
+    fn exact_search_bounds_common_display_name_matches_with_equality_indexes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("broad-exact-search.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        let entries = (0..10_000)
+            .map(|index| inventory_entry("PV", &format!("Area.{index:05}.PV")))
+            .collect::<Vec<_>>();
+        db.insert_entries("S", generation, &entries).unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+
+        let plan_for = |sql: &str| {
+            db.connection
+                .prepare(sql)
+                .unwrap()
+                .query_map(params!["S", generation as i64, "pv", 4_i64], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let display_plan = plan_for(
+            "EXPLAIN QUERY PLAN
+             SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.display_name_norm = ?3
+             ORDER BY e.item_id_norm, e.item_id
+             LIMIT ?4",
+        );
+        assert!(
+            display_plan
+                .iter()
+                .any(|detail| detail.contains("entries_display_exact"))
+        );
+        assert!(
+            display_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE"))
+        );
+
+        let item_plan = plan_for(
+            "EXPLAIN QUERY PLAN
+             SELECT e.item_id, e.display_name, e.display_name_norm,
+                    e.item_id_norm, e.kind, e.breadcrumbs
+             FROM entries e
+             WHERE e.server = ?1 AND e.generation = ?2
+               AND e.item_id_norm = ?3
+               AND e.display_name_norm <> ?3
+             ORDER BY length(e.display_name_norm), e.display_name_norm,
+                      e.item_id_norm, e.item_id
+             LIMIT ?4",
+        );
+        assert!(
+            item_plan
+                .iter()
+                .any(|detail| detail.contains("entries_item_exact"))
+        );
+        assert!(
+            item_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE"))
+        );
+
+        let matches = db.search("S", generation, "PV", 1, 3).unwrap();
+        assert_eq!(matches.len(), 4);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Area.00000.PV",
+                "Area.00001.PV",
+                "Area.00002.PV",
+                "Area.00003.PV"
+            ]
+        );
+    }
+
+    #[test]
+    fn prefix_search_uses_indexed_ranges_and_preserves_ranking() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("prefix-search.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        let generation = db
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        db.insert_entries(
+            "S",
+            generation,
+            &[
+                inventory_entry("219 block", "display-prefix"),
+                inventory_entry("219", "display-exact"),
+                inventory_entry("ordinary", "219.item"),
+                inventory_entry("219 both", "219.both"),
+                inventory_entry("ordinary", "x219.item"),
+                inventory_entry("ordinary", "x%219.item"),
+                inventory_entry("éclair", "unicode-display"),
+                inventory_entry("ordinary", "\u{10ffff}item"),
+                inventory_entry("block 219", "display-contains"),
+            ],
+        )
+        .unwrap();
+        db.promote("S", generation, "2", &zero_progress()).unwrap();
+
+        assert_eq!(
+            db.search("S", generation, "219", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["display-exact", "219.both", "display-prefix", "219.item"]
+        );
+        assert_eq!(
+            db.search("S", generation, "219", 2, 2)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["display-exact", "219.both", "display-prefix"]
+        );
+        assert_eq!(
+            db.search("S", generation, "x%", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x%219.item"]
+        );
+        assert_eq!(
+            db.search("S", generation, "É", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unicode-display"]
+        );
+        assert_eq!(
+            db.search("S", generation, "\u{10ffff}", 2, 10)
+                .unwrap()
+                .iter()
+                .map(|value| value.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["\u{10ffff}item"]
         );
     }
 
@@ -12468,8 +12884,82 @@ mod tests {
 
         assert!(matches!(
             manager.refresh("S", true).await,
-            Err(IndexOperationError::NotEnrolled { server }) if server == "S"
+            Err(IndexOperationError::Deleting { server }) if server == "S"
         ));
+    }
+
+    #[tokio::test]
+    async fn all_lifecycle_controls_reject_a_server_marked_for_deletion() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("deleting-controls.sqlite3")),
+        ));
+        manager.deleting.lock().unwrap().insert("S".into());
+
+        for action in [
+            IndexControlAction::Pause,
+            IndexControlAction::Resume,
+            IndexControlAction::Cancel,
+            IndexControlAction::EnableAutoRefresh,
+            IndexControlAction::DisableAutoRefresh,
+            IndexControlAction::Delete,
+        ] {
+            assert!(matches!(
+                manager.control("S", action).await,
+                Err(IndexOperationError::Deleting { server }) if server == "S"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn search_does_not_return_stale_matches_while_deletion_is_active() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("deleting-search.sqlite3")),
+        ));
+        manager.refresh("S", true).await.unwrap();
+        wait_for_build(&manager, IndexState::Ready).await;
+
+        manager.deleting.lock().unwrap().insert("S".into());
+
+        let result = manager.search("S", "mock", 3, 10).await.unwrap();
+        assert!(result.matches.is_empty());
+        assert_eq!(result.status.state, IndexState::Deleting);
+    }
+
+    #[tokio::test]
+    async fn search_discards_matches_if_deletion_starts_during_query() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("deleting-during-search.sqlite3")),
+        ));
+        manager
+            .with_database(|db| {
+                let generation =
+                    db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+                db.insert_entries("S", generation, &[inventory_entry("Mock tag", "mock.tag")])?;
+                db.promote("S", generation, &timestamp_now(), &zero_progress())
+            })
+            .unwrap();
+
+        let (search_started, release_search) = manager.install_search_gate();
+        let search_manager = Arc::clone(&manager);
+        let search_task =
+            tokio::spawn(async move { search_manager.search("S", "mock", 3, 10).await });
+        tokio::time::timeout(Duration::from_secs(2), search_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        manager.deleting.lock().unwrap().insert("S".into());
+        release_search.send(()).unwrap();
+
+        let result = search_task.await.unwrap().unwrap();
+        assert!(result.matches.is_empty());
+        assert_eq!(result.status.state, IndexState::Deleting);
     }
 
     #[tokio::test]
@@ -12636,6 +13126,18 @@ mod tests {
             .control("S", IndexControlAction::Delete)
             .await
             .unwrap();
+        assert_eq!(status.state, IndexState::Deleting);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.status("S").await.unwrap().state == IndexState::NotIndexed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = manager.status("S").await.unwrap();
         assert_eq!(status.state, IndexState::NotIndexed);
         assert!(!status.auto_refresh_enabled);
         manager
@@ -12646,6 +13148,88 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_delete_is_rejected_while_cleanup_is_in_progress() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("duplicate-delete.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(database.clone()),
+        ));
+        manager.refresh("S", true).await.unwrap();
+        wait_for_build(&manager, IndexState::Ready).await;
+        let held_lock = BuildFileLock::acquire(&database, "S").unwrap();
+
+        let status = manager
+            .control("S", IndexControlAction::Delete)
+            .await
+            .unwrap();
+        assert_eq!(status.state, IndexState::Deleting);
+        assert!(matches!(
+            manager.control("S", IndexControlAction::Delete).await,
+            Err(IndexOperationError::Deleting { server }) if server == "S"
+        ));
+
+        drop(held_lock);
+        manager.background_tasks.wait_for_idle().await;
+    }
+
+    #[tokio::test]
+    async fn failed_background_delete_is_recorded_in_status() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("failed-delete.sqlite3");
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(database.clone()),
+        ));
+        manager.refresh("S", true).await.unwrap();
+        wait_for_build(&manager, IndexState::Ready).await;
+        let held_lock = BuildFileLock::acquire(&database, "S").unwrap();
+
+        let status = manager
+            .control("S", IndexControlAction::Delete)
+            .await
+            .unwrap();
+        assert_eq!(status.state, IndexState::Deleting);
+        manager
+            .with_database(|db| {
+                db.connection.execute_batch("DROP TABLE entries_fts")?;
+                Ok(())
+            })
+            .unwrap();
+
+        drop(held_lock);
+        manager.background_tasks.wait_for_idle().await;
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::Failed);
+        assert!(!status.auto_refresh_enabled);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("entries_fts"))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_index_reports_shutdown_when_background_task_cannot_start() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("index.sqlite3")),
+        ));
+        manager.refresh("S", true).await.unwrap();
+        wait_for_build(&manager, IndexState::Ready).await;
+        manager.shutdown_background_indexing().await;
+
+        let error = manager
+            .control("S", IndexControlAction::Delete)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("gateway is shutting down"));
+        assert_eq!(manager.status("S").await.unwrap().state, IndexState::Ready);
     }
 
     #[test]

@@ -82,11 +82,13 @@ Independent in-memory databases are isolated from the registry and do not create
 build-lock sidecars.
 Uncached indexed searches use a separate read-only SQLite connection and rank only bounded
 candidate sets in memory, so a broad query cannot hold the coordinator's foreground database
-mutex while it scans the FTS index. Exact searches use separate equality lookups on the
-normalized display-name and ItemID indexes, each bounded to `limit + 1` rows, then merge and
-deduplicate those candidates before ranking; prefix and contains searches retain their indexed/FTS
-paths. Status, discovery, reads, writes, and lazy browse therefore remain available while search
-work is in progress. Matching is case-insensitive with exact/prefix/contains ranking, and
+mutex while it scans the FTS index. Exact searches use separate covering equality lookups on the
+normalized display-name and ItemID indexes, each bounded to `limit + 1` rows, exclude lower-priority
+ItemID duplicates already found by the display-name probe, and then merge and deduplicate those
+candidates before ranking. Prefix searches use indexed lexicographic ranges rather than
+generation-wide `LIKE` scans; contains searches retain their FTS path. Status, discovery, reads,
+writes, and lazy browse therefore remain available while search work is in progress. Matching is
+case-insensitive with exact/prefix/contains ranking, and
 responses report when additional results exist beyond the requested limit. During promotion,
 searches use the active generation already returned by the promotion-safe status path instead of
 waiting for the writable database mutex.
@@ -107,8 +109,9 @@ servers and each server's auto-refresh setting; a fresh gateway has no enrolled 
 starts an automatic first build. A successful manually enrolled index is refreshed weekly by
 default when its per-server auto-refresh setting and global `index.enabled` switch permit it.
 Disabling per-server auto-refresh preserves its searchable generation; deleting an index removes
-its enrollment, generations, entries, and retry state after coordinating any active build. The
-gateway uses a service-writable SQLite database, conservative batch/rate/duty-cycle defaults, a
+its enrollment, generations, entries, and retry state after coordinating any active build. Delete
+returns a temporary `deleting` status while cleanup runs, then reaches `not-indexed`. The gateway
+uses a service-writable SQLite database, conservative batch/rate/duty-cycle defaults, a
 two-second foreground quiet period, and one build at a time.
 Native inventory batches are bounded to 1,000 entries by the OPC DA client contract.
 Native inventory slicing and SQLite commit batching are independently bounded, and adaptive

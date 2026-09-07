@@ -302,6 +302,7 @@ enum SearchIndexState {
   // Deprecated on the wire: gateways map promotion to REFRESHING and set the
   // additive promoting diagnostic so older clients remain compatible.
   SEARCH_INDEX_STATE_PROMOTING = 7;
+  SEARCH_INDEX_STATE_DELETING = 8;
 }
 
 enum SearchIndexControlAction {

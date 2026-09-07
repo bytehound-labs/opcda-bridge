@@ -43,6 +43,9 @@ pub enum Error {
     /// enrollment that does not exist.
     #[error("namespace index for OPC DA server {server:?} is not enrolled")]
     IndexNotEnrolled { server: String },
+    /// The requested lifecycle operation conflicts with an in-progress deletion.
+    #[error("namespace index for OPC DA server {server:?} is being deleted")]
+    IndexDeleting { server: String },
     /// The gateway returned a response that violates the negotiated protocol.
     #[error("protocol error: {0}")]
     Protocol(String),
