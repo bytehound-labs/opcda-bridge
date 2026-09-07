@@ -40,6 +40,10 @@ Example: `feat(gateway): add tag subscription support`.
 
 ## Code style
 
+- Use Rust's `stable` toolchain for local development to match the regular validation, coverage,
+  SonarQube, and release-plz jobs. The MSRV (Minimum Supported Rust Version) job separately checks
+  Rust 1.88.0; on rustup-managed hosts, run `rustup update stable` if the selected toolchain is
+  older. The cargo-fuzz smoke tests intentionally use nightly.
 - Format with `cargo fmt --all` (default rustfmt settings) before committing.
 - Lint with `cargo clippy --workspace --all-targets --all-features -- -D warnings`; fix every
   warning or justify an explicit `#[allow(...)]` with a comment.
