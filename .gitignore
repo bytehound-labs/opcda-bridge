@@ -36,3 +36,8 @@ copilot-instructions.md
 fuzz/artifacts
 fuzz/corpus
 fuzz/crashes
+
+# Python caches and test artifacts
+__pycache__/
+.pytest_cache/
+*.py[cod]

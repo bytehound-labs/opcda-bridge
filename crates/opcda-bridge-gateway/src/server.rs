@@ -1,7 +1,8 @@
 use crate::browse::{BrowseManager, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 use crate::config::{GatewayConfig, resolve_index_config};
 use crate::index::{
-    IndexControlAction, IndexManager, IndexState, IndexStatus, SearchMode, normalize_query,
+    IndexControlAction, IndexManager, IndexOperationError, IndexState, IndexStatus, SearchMode,
+    normalize_query,
 };
 use crate::opc::{
     BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource, InventoryProgress,
@@ -87,12 +88,15 @@ fn internal(error: impl std::fmt::Display) -> Status {
     Status::internal(message)
 }
 
-fn index_error(error: impl std::fmt::Display) -> Status {
-    let message = error.to_string();
-    if message.contains("not configured") {
-        Status::failed_precondition(message)
-    } else {
-        internal(message)
+fn index_error(error: IndexOperationError) -> Status {
+    match error {
+        IndexOperationError::UnknownServer { server } => {
+            Status::invalid_argument(format!("OPC DA server {server:?} is not registered"))
+        }
+        IndexOperationError::NotEnrolled { server } => Status::not_found(format!(
+            "namespace index for OPC DA server {server:?} is not enrolled"
+        )),
+        IndexOperationError::Internal(error) => internal(error),
     }
 }
 
@@ -263,7 +267,7 @@ fn map_index_status(status: IndexStatus) -> SearchIndexStatus {
     SearchIndexStatus {
         server: status.server,
         state: map_index_state(status.state) as i32,
-        configured: status.configured,
+        auto_refresh_enabled: status.auto_refresh_enabled,
         active_generation: status.active_generation,
         entry_count: status.entry_count,
         unique_item_count: status.unique_item_count,
@@ -839,6 +843,9 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
             SearchIndexControlAction::Pause => IndexControlAction::Pause,
             SearchIndexControlAction::Resume => IndexControlAction::Resume,
             SearchIndexControlAction::Cancel => IndexControlAction::Cancel,
+            SearchIndexControlAction::EnableAutoRefresh => IndexControlAction::EnableAutoRefresh,
+            SearchIndexControlAction::DisableAutoRefresh => IndexControlAction::DisableAutoRefresh,
+            SearchIndexControlAction::Delete => IndexControlAction::Delete,
             SearchIndexControlAction::Unspecified => {
                 return Err(Status::invalid_argument("index control action is required"));
             }
@@ -886,7 +893,7 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
                 request.max_results,
             )
             .await
-            .map_err(index_error)?;
+            .map_err(internal)?;
         let status = result.status;
         let matches = result.matches;
         Ok(Response::new(SearchIndexResponse {
@@ -1058,7 +1065,7 @@ mod tests {
         let mapped = map_index_status(IndexStatus {
             server: "S".into(),
             state: IndexState::Promoting,
-            configured: true,
+            auto_refresh_enabled: true,
             active_generation: 3,
             entry_count: 5,
             unique_item_count: 4,
@@ -1137,7 +1144,7 @@ mod tests {
         let base = IndexStatus {
             server: "S".into(),
             state: IndexState::Ready,
-            configured: true,
+            auto_refresh_enabled: true,
             active_generation: 1,
             entry_count: 0,
             unique_item_count: 0,
@@ -1249,10 +1256,16 @@ mod tests {
         }
 
         assert_eq!(
-            index_error("server is not configured").code(),
-            tonic::Code::FailedPrecondition
+            index_error(IndexOperationError::NotEnrolled { server: "S".into() }).code(),
+            tonic::Code::NotFound
         );
-        assert_eq!(index_error("database failed").code(), tonic::Code::Internal);
+        assert_eq!(
+            index_error(IndexOperationError::Internal(anyhow::anyhow!(
+                "database failed"
+            )))
+            .code(),
+            tonic::Code::Internal
+        );
     }
 
     #[test]
@@ -2013,7 +2026,6 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                 ),
-                servers: vec!["S".into()],
                 enabled: Some(false),
                 ..IndexConfig::default()
             },
@@ -2075,7 +2087,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code(),
-            tonic::Code::FailedPrecondition
+            tonic::Code::InvalidArgument
         );
 
         service
@@ -2123,6 +2135,25 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(controlled.state, SearchIndexState::Ready as i32);
+        let disabled = service
+            .control_search_index(Request::new(ControlSearchIndexRequest {
+                server: "S".into(),
+                action: SearchIndexControlAction::DisableAutoRefresh as i32,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!disabled.auto_refresh_enabled);
+        let deleted = service
+            .control_search_index(Request::new(ControlSearchIndexRequest {
+                server: "S".into(),
+                action: SearchIndexControlAction::Delete as i32,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(deleted.state, SearchIndexState::NotIndexed as i32);
+        assert!(!deleted.auto_refresh_enabled);
     }
 
     #[tokio::test]
@@ -2322,7 +2353,7 @@ mod tests {
         let status = IndexStatus {
             server: "S".into(),
             state: IndexState::NotIndexed,
-            configured: false,
+            auto_refresh_enabled: false,
             active_generation: 0,
             entry_count: 0,
             unique_item_count: 0,

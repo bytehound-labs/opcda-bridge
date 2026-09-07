@@ -35,6 +35,14 @@ pub enum Error {
         "gateway does not support {operation}; upgrade the gateway and client to compatible protocol versions"
     )]
     IncompatibleGateway { operation: &'static str },
+    /// The requested first-time namespace-index refresh named a ProgID that
+    /// gateway-side server discovery did not return.
+    #[error("OPC DA server {server:?} is not registered")]
+    UnknownIndexServer { server: String },
+    /// The requested namespace-index control operation requires a durable
+    /// enrollment that does not exist.
+    #[error("namespace index for OPC DA server {server:?} is not enrolled")]
+    IndexNotEnrolled { server: String },
     /// The gateway returned a response that violates the negotiated protocol.
     #[error("protocol error: {0}")]
     Protocol(String),

@@ -168,7 +168,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(response.into_inner().servers.is_empty());
+        assert_eq!(response.into_inner().servers, ["S", "T"]);
 
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), serve_task)
@@ -207,7 +207,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(response.into_inner().servers.is_empty());
+        assert_eq!(response.into_inner().servers, ["S", "T"]);
 
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), serve_task)

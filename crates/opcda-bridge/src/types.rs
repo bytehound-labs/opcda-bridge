@@ -282,6 +282,9 @@ pub enum SearchIndexControlAction {
     Pause,
     Resume,
     Cancel,
+    EnableAutoRefresh,
+    DisableAutoRefresh,
+    Delete,
 }
 
 /// Gateway and namespace features reported for one OPC server.
@@ -464,7 +467,8 @@ pub struct IndexedSearchProgress {
 pub struct SearchIndexStatus {
     pub server: String,
     pub state: SearchIndexState,
-    pub configured: bool,
+    /// Whether this enrolled server is eligible for scheduled refreshes.
+    pub auto_refresh_enabled: bool,
     pub active_generation: u64,
     pub entry_count: u64,
     pub unique_item_count: u64,
@@ -806,6 +810,9 @@ impl From<SearchIndexControlAction> for proto::SearchIndexControlAction {
             SearchIndexControlAction::Pause => Self::Pause,
             SearchIndexControlAction::Resume => Self::Resume,
             SearchIndexControlAction::Cancel => Self::Cancel,
+            SearchIndexControlAction::EnableAutoRefresh => Self::EnableAutoRefresh,
+            SearchIndexControlAction::DisableAutoRefresh => Self::DisableAutoRefresh,
+            SearchIndexControlAction::Delete => Self::Delete,
         }
     }
 }
@@ -831,7 +838,7 @@ impl TryFrom<proto::SearchIndexStatus> for SearchIndexStatus {
         Ok(Self {
             server: value.server,
             state: search_index_state(value.state)?,
-            configured: value.configured,
+            auto_refresh_enabled: value.auto_refresh_enabled,
             active_generation: value.active_generation,
             entry_count: value.entry_count,
             unique_item_count: value.unique_item_count,
@@ -1135,6 +1142,18 @@ mod tests {
                 SearchIndexControlAction::Cancel,
                 proto::SearchIndexControlAction::Cancel,
             ),
+            (
+                SearchIndexControlAction::EnableAutoRefresh,
+                proto::SearchIndexControlAction::EnableAutoRefresh,
+            ),
+            (
+                SearchIndexControlAction::DisableAutoRefresh,
+                proto::SearchIndexControlAction::DisableAutoRefresh,
+            ),
+            (
+                SearchIndexControlAction::Delete,
+                proto::SearchIndexControlAction::Delete,
+            ),
         ] {
             assert_eq!(proto::SearchIndexControlAction::from(action), expected);
         }
@@ -1407,7 +1426,7 @@ mod tests {
             status: Some(proto::SearchIndexStatus {
                 server: "Yokogawa.CSHIS_OPC.1".into(),
                 state: proto::SearchIndexState::Refreshing as i32,
-                configured: true,
+                auto_refresh_enabled: true,
                 active_generation: 7,
                 entry_count: 100_001,
                 unique_item_count: 100_000,

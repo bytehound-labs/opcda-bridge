@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replace configured-server indexed-search semantics with durable on-demand enrollment,
+  per-server auto-refresh controls, and index deletion.
+
 ## [0.4.6](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-proto-v0.4.5...opcda-bridge-proto-v0.4.6) - 2026-08-26
 
 ### Added

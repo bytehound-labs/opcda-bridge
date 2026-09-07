@@ -208,13 +208,14 @@ impl Client {
         server: impl Into<String>,
         force: bool,
     ) -> Result<SearchIndexStatus> {
+        let server = server.into();
         self.inner
             .refresh_search_index(RefreshSearchIndexRequest {
-                server: server.into(),
+                server: server.clone(),
                 force,
             })
             .await
-            .map_err(|status| feature_error("indexed-search refresh", status))?
+            .map_err(|status| index_operation_error("indexed-search refresh", server, status))?
             .into_inner()
             .try_into()
     }
@@ -225,15 +226,44 @@ impl Client {
         server: impl Into<String>,
         action: SearchIndexControlAction,
     ) -> Result<SearchIndexStatus> {
+        let server = server.into();
         self.inner
             .control_search_index(ControlSearchIndexRequest {
-                server: server.into(),
+                server: server.clone(),
                 action: opcda_bridge_proto::bridge::SearchIndexControlAction::from(action) as i32,
             })
             .await
-            .map_err(|status| feature_error("indexed-search control", status))?
+            .map_err(|status| index_operation_error("indexed-search control", server, status))?
             .into_inner()
             .try_into()
+    }
+
+    /// Enable or disable completion-time-based scheduled refreshes for an
+    /// enrolled namespace index. Disabling preserves searchable data.
+    pub async fn set_search_index_auto_refresh(
+        &mut self,
+        server: impl Into<String>,
+        enabled: bool,
+    ) -> Result<SearchIndexStatus> {
+        self.control_search_index(
+            server,
+            if enabled {
+                SearchIndexControlAction::EnableAutoRefresh
+            } else {
+                SearchIndexControlAction::DisableAutoRefresh
+            },
+        )
+        .await
+    }
+
+    /// Cancel any active build and permanently remove an enrolled namespace
+    /// index, including its generations and scheduler metadata.
+    pub async fn delete_search_index(
+        &mut self,
+        server: impl Into<String>,
+    ) -> Result<SearchIndexStatus> {
+        self.control_search_index(server, SearchIndexControlAction::Delete)
+            .await
     }
 
     /// Search the gateway-owned persistent namespace index.
@@ -313,6 +343,15 @@ fn feature_error(operation: &'static str, status: tonic::Status) -> Error {
     }
 }
 
+fn index_operation_error(operation: &'static str, server: String, status: tonic::Status) -> Error {
+    match status.code() {
+        Code::Unimplemented => Error::IncompatibleGateway { operation },
+        Code::InvalidArgument => Error::UnknownIndexServer { server },
+        Code::NotFound => Error::IndexNotEnrolled { server },
+        _ => Error::Rpc(status),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +382,19 @@ mod tests {
             kind: opcda_bridge_proto::bridge::BrowseNodeKind::Item as i32,
             item_id: Some("FCS!TAG.PV".into()),
         }
+    }
+
+    #[test]
+    fn index_operation_error_maps_unclassified_status_to_rpc() {
+        let error = index_operation_error(
+            "indexed-search refresh",
+            "S".into(),
+            tonic::Status::permission_denied("denied"),
+        );
+        assert!(matches!(
+            error,
+            Error::Rpc(status) if status.code() == tonic::Code::PermissionDenied
+        ));
     }
 
     #[tokio::test]
@@ -407,7 +459,7 @@ mod tests {
     async fn gateway_info_and_compatibility_report_are_typed() {
         let service = MockBridgeService {
             gateway_info_response: GetGatewayInfoResponse {
-                application_version: "0.4.3".into(),
+                application_version: "0.5.0".into(),
                 compatibility_schema_version: 1,
                 features: vec![
                     ProtocolFeature {
@@ -422,8 +474,8 @@ mod tests {
                     },
                     ProtocolFeature {
                         kind: ProtocolFeatureKind::IndexedSearch as i32,
-                        min_version: 1,
-                        max_version: 1,
+                        min_version: 2,
+                        max_version: 2,
                     },
                 ],
             },
@@ -433,9 +485,9 @@ mod tests {
         let host = start_mock_server(service).await;
         let mut client = Client::connect(&host).await.unwrap();
         let info = client.gateway_info().await.unwrap();
-        assert_eq!(info.application_version, "0.4.3");
+        assert_eq!(info.application_version, "0.5.0");
         let report = client
-            .compatibility_with_client_version(None, "0.4.3")
+            .compatibility_with_client_version(None, "0.5.0")
             .await
             .unwrap();
         assert_eq!(report.status, crate::CompatibilityStatus::Full);
@@ -447,7 +499,7 @@ mod tests {
     async fn compatibility_wrapper_and_gateway_info_errors_are_typed() {
         let host = start_mock_server(MockBridgeService {
             gateway_info_response: GetGatewayInfoResponse {
-                application_version: "0.4.3".into(),
+                application_version: "0.5.0".into(),
                 compatibility_schema_version: 1,
                 features: vec![
                     ProtocolFeature {
@@ -462,8 +514,8 @@ mod tests {
                     },
                     ProtocolFeature {
                         kind: ProtocolFeatureKind::IndexedSearch as i32,
-                        min_version: 1,
-                        max_version: 1,
+                        min_version: 2,
+                        max_version: 2,
                     },
                 ],
             },
@@ -763,7 +815,7 @@ mod tests {
         SearchIndexStatus {
             server: "S".into(),
             state: state as i32,
-            configured: true,
+            auto_refresh_enabled: true,
             active_generation: 4,
             entry_count: 100,
             unique_item_count: 99,
@@ -827,6 +879,15 @@ mod tests {
                 .state,
             SearchIndexState::Partial
         );
+        client
+            .set_search_index_auto_refresh("S", false)
+            .await
+            .unwrap();
+        client
+            .set_search_index_auto_refresh("S", true)
+            .await
+            .unwrap();
+        client.delete_search_index("S").await.unwrap();
         let mut request = SearchIndexRequest::new("S", "PV", SearchMatchMode::Contains);
         request.max_results = 25;
         let response = client.search_index(request).await.unwrap();
@@ -838,6 +899,18 @@ mod tests {
         assert_eq!(
             control_requests.lock().unwrap()[0].action,
             opcda_bridge_proto::bridge::SearchIndexControlAction::Pause as i32
+        );
+        assert_eq!(
+            control_requests.lock().unwrap()[1].action,
+            opcda_bridge_proto::bridge::SearchIndexControlAction::DisableAutoRefresh as i32
+        );
+        assert_eq!(
+            control_requests.lock().unwrap()[2].action,
+            opcda_bridge_proto::bridge::SearchIndexControlAction::EnableAutoRefresh as i32
+        );
+        assert_eq!(
+            control_requests.lock().unwrap()[3].action,
+            opcda_bridge_proto::bridge::SearchIndexControlAction::Delete as i32
         );
         assert_eq!(search_requests.lock().unwrap()[0].max_results, 25);
 
@@ -877,6 +950,50 @@ mod tests {
             };
             assert!(matches!(error, Error::IncompatibleGateway { .. }));
         }
+    }
+
+    #[tokio::test]
+    async fn index_enrollment_errors_are_typed() {
+        let host = start_mock_server(MockBridgeService {
+            refresh_search_index_error: Some(Status::invalid_argument("unknown server")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client.refresh_search_index("Typo.Server", false).await,
+            Err(Error::UnknownIndexServer { server }) if server == "Typo.Server"
+        ));
+
+        let host = start_mock_server(MockBridgeService {
+            control_search_index_error: Some(Status::not_found("not enrolled")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client
+                .set_search_index_auto_refresh("Known.Server", false)
+                .await,
+            Err(Error::IndexNotEnrolled { server }) if server == "Known.Server"
+        ));
+
+        let host = start_mock_server(MockBridgeService {
+            search_index_error: Some(Status::permission_denied("denied")),
+            ..Default::default()
+        })
+        .await;
+        let mut client = Client::connect(&host).await.unwrap();
+        assert!(matches!(
+            client
+                .search_index(SearchIndexRequest::new(
+                    "Known.Server",
+                    "PV",
+                    SearchMatchMode::Contains,
+                ))
+                .await,
+            Err(Error::Rpc(status)) if status.code() == Code::PermissionDenied
+        ));
     }
 
     #[tokio::test]

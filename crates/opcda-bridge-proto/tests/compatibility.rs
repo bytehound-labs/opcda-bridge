@@ -93,7 +93,7 @@ fn round_trips_indexed_search_response_without_session_tokens() {
         status: Some(SearchIndexStatus {
             server: "Yokogawa.CSHIS_OPC.1".into(),
             state: SearchIndexState::Ready as i32,
-            configured: true,
+            auto_refresh_enabled: true,
             active_generation: 3,
             ..Default::default()
         }),

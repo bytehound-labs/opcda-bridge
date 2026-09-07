@@ -760,7 +760,7 @@ impl From<IndexHealthDiagnostics> for IndexHealthOutput {
 struct IndexStatusOutput {
     server: String,
     state: String,
-    configured: bool,
+    auto_refresh_enabled: bool,
     active_generation: u64,
     entry_count: u64,
     unique_item_count: u64,
@@ -789,7 +789,7 @@ impl From<SearchIndexStatus> for IndexStatusOutput {
         Self {
             server: value.server,
             state: value.state.to_string(),
-            configured: value.configured,
+            auto_refresh_enabled: value.auto_refresh_enabled,
             active_generation: value.active_generation,
             entry_count: value.entry_count,
             unique_item_count: value.unique_item_count,
@@ -833,7 +833,10 @@ fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
         ("Server", status.server.clone()),
         ("State", status.state.clone()),
         ("Promoting", status.promoting.to_string()),
-        ("Configured", status.configured.to_string()),
+        (
+            "Auto refresh enabled",
+            status.auto_refresh_enabled.to_string(),
+        ),
         ("Active generation", status.active_generation.to_string()),
         ("Entries", status.entry_count.to_string()),
         ("Unique items", status.unique_item_count.to_string()),
@@ -1501,7 +1504,7 @@ mod tests {
     async fn compatibility_command_reports_full_and_rejects_missing_requirements() {
         let host = start_mock_server(MockBridgeService {
             gateway_info_response: GetGatewayInfoResponse {
-                application_version: "0.4.3".into(),
+                application_version: "0.5.0".into(),
                 compatibility_schema_version: 1,
                 features: vec![
                     ProtocolFeature {
@@ -1516,8 +1519,8 @@ mod tests {
                     },
                     ProtocolFeature {
                         kind: ProtocolFeatureKind::IndexedSearch as i32,
-                        min_version: 1,
-                        max_version: 1,
+                        min_version: 2,
+                        max_version: 2,
                     },
                 ],
             },
@@ -1920,7 +1923,7 @@ mod tests {
         SearchIndexStatus {
             server: "S".into(),
             state: state as i32,
-            configured: true,
+            auto_refresh_enabled: true,
             active_generation: 3,
             entry_count: 101,
             unique_item_count: 100,
@@ -2284,7 +2287,7 @@ mod tests {
         let status = opcda_bridge::SearchIndexStatus {
             server: "S".into(),
             state: SearchIndexState::Ready,
-            configured: true,
+            auto_refresh_enabled: true,
             active_generation: 2,
             entry_count: 1,
             unique_item_count: 1,
@@ -2341,7 +2344,7 @@ mod tests {
         let status = IndexStatusOutput {
             server: "S".into(),
             state: "ready".into(),
-            configured: true,
+            auto_refresh_enabled: true,
             active_generation: 1,
             entry_count: 1,
             unique_item_count: 1,

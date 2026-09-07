@@ -191,7 +191,7 @@ message SearchIndexRequest {
 message SearchIndexStatus {
   string server = 1;
   SearchIndexState state = 2;
-  bool configured = 3;
+  bool auto_refresh_enabled = 3;
   uint64 active_generation = 4;
   uint64 entry_count = 5;
   uint64 unique_item_count = 6;
@@ -309,6 +309,9 @@ enum SearchIndexControlAction {
   SEARCH_INDEX_CONTROL_ACTION_PAUSE = 1;
   SEARCH_INDEX_CONTROL_ACTION_RESUME = 2;
   SEARCH_INDEX_CONTROL_ACTION_CANCEL = 3;
+  SEARCH_INDEX_CONTROL_ACTION_ENABLE_AUTO_REFRESH = 4;
+  SEARCH_INDEX_CONTROL_ACTION_DISABLE_AUTO_REFRESH = 5;
+  SEARCH_INDEX_CONTROL_ACTION_DELETE = 6;
 }
 
 enum IndexControllerState {

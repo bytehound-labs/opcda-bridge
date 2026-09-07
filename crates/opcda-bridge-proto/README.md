@@ -20,6 +20,8 @@ The protocol is generated from the crate's bundled `bridge.proto` definition. Br
 one-level page operation with opaque session and continuation tokens; live namespace search is a
 separate progressive streaming operation. Persistent indexed discovery uses unary
 `GetSearchIndexStatus`, `RefreshSearchIndex`, `ControlSearchIndex`, and `SearchIndex` operations.
+The first refresh validates and enrolls a registered ProgID. `ControlSearchIndex` also enables or
+disables per-server scheduled refresh and deletes an enrolled index.
 Indexed matches contain exact ItemIDs and breadcrumb labels but never session-bound browse node
 keys.
 

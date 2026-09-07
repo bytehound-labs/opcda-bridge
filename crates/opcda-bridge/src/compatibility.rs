@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn current_profile_uses_generated_contract_versions() {
-        let profile = current_client_profile("0.4.3");
+        let profile = current_client_profile("0.5.0");
         assert_eq!(
             profile.feature(CompatibilityFeature::Core),
             Some(ProtocolVersionRange::exact(1))
@@ -575,14 +575,14 @@ mod tests {
         );
         assert_eq!(
             profile.feature(CompatibilityFeature::IndexedSearch),
-            Some(ProtocolVersionRange::exact(1))
+            Some(ProtocolVersionRange::exact(2))
         );
-        assert_eq!(profile.application_version.as_deref(), Some("0.4.3"));
+        assert_eq!(profile.application_version.as_deref(), Some("0.5.0"));
 
         let relabeled = current_client_profile("application-build");
         assert_eq!(
             relabeled.feature(CompatibilityFeature::IndexedSearch),
-            Some(ProtocolVersionRange::exact(1))
+            Some(ProtocolVersionRange::exact(2))
         );
     }
 

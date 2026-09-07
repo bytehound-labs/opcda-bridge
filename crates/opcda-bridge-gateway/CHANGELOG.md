@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replace the configured-server index allow-list with SQLite-backed on-demand enrollment,
+  per-server scheduled-refresh controls, and coordinated index deletion.
+
 ### Fixed
+
+- Remove Windows build-owner metadata on clean lock release while retaining it after forced
+  termination for the next acquisition's diagnostics.
 
 - Canonicalize existing index database identities for writer coordination and persistent build
   locks, while isolating independent in-memory databases from the shared registry and filesystem
