@@ -21,8 +21,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs2 = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 opc-da-client = { package = "bytehound-opc-da-client", version = "0.2.8" }
-opcda-bridge = { path = "crates/opcda-bridge", version = "0.4" }
-opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.4" }
+opcda-bridge = { path = "crates/opcda-bridge", version = "0.5" }
+opcda-bridge-proto = { path = "crates/opcda-bridge-proto", version = "0.5" }
 prost = "0.14"
 proptest = "1.11"
 regex = "1"

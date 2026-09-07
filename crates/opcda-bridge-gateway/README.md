@@ -31,9 +31,11 @@ DA3 root ItemIDs and unused filters are sent as required non-null empty strings.
 also supports DA2 falls back only when its first DA3 root browse returns
 `RPC_X_NULL_REF_POINTER` or `E_NOTIMPL`, and reports that compatibility decision explicitly.
 
-The gateway also exposes persistent indexed-search status, refresh, pause, resume, cancel, and
-query operations for explicitly configured OPC servers. Capability responses advertise indexed
-search support, its protocol version, the configured result limit, and the server's index state.
+The gateway also exposes persistent indexed-search status, refresh, pause, resume, cancel, delete,
+and query operations. A first manual refresh validates the exact ProgID against current server
+discovery, persists enrollment, and begins indexing immediately; an unknown ProgID is rejected
+without durable state. Capability responses advertise indexed-search support, its protocol version,
+the configured result limit, and the server's index state.
 Indexed results contain exact ItemIDs and breadcrumb labels, never browse-session node keys.
 Refreshes run asynchronously, and gateway shutdown cancels active indexing before the process exits.
 Foreground operations are reference-counted per server; indexing stays paused while any foreground
@@ -56,7 +58,9 @@ transition, and promotion status uses a read-only SQLite connection plus filesys
 status remains responsive even while the writer is in the promotion critical section.
 Only one build for a server can hold its gateway-wide file lock at a time; contention reports the
 owning process metadata. On Windows, that metadata is kept in an adjacent `.build.owner` sidecar
-because the locked file itself may be unreadable.
+because the locked file itself may be unreadable. The owner sidecar is removed on a clean lock
+release and can remain after forced termination until the next acquisition overwrites it; the
+operating-system advisory lock, not the sidecar's existence, determines whether a build is active.
 Superseded and abandoned data is reclaimed in bounded background batches through a separate
 SQLite WAL connection, coordinated by a database-wide writer gate shared with every build mutation
 for the same database file, including builds for other servers. Cleanup defers while any build is
@@ -66,6 +70,8 @@ from another manager instance sharing the database. Shutdown is also observed wh
 that deferred wait. An interrupted refresh is superseded when a complete active generation
 remains available, so status and search continue to use that snapshot while cleanup runs.
 An interrupted initial build remains failed and visible because no complete snapshot can replace it.
+If SQLite recovery quarantines an invalid index, the database and its `-wal`/`-shm` sidecars are
+kept together so committed data remains available for diagnosis.
 Status combines the persisted generation snapshot with runtime build, health, storage,
 foreground, and scheduler diagnostics. During promotion, persisted status is read through a
 read-only connection; a runtime error overrides the reported state only when no build is active.
@@ -76,11 +82,13 @@ Independent in-memory databases are isolated from the registry and do not create
 build-lock sidecars.
 Uncached indexed searches use a separate read-only SQLite connection and rank only bounded
 candidate sets in memory, so a broad query cannot hold the coordinator's foreground database
-mutex while it scans the FTS index. Exact searches use separate equality lookups on the
-normalized display-name and ItemID indexes, each bounded to `limit + 1` rows, then merge and
-deduplicate those candidates before ranking; prefix and contains searches retain their indexed/FTS
-paths. Status, discovery, reads, writes, and lazy browse therefore remain available while search
-work is in progress. Matching is case-insensitive with exact/prefix/contains ranking, and
+mutex while it scans the FTS index. Exact searches use separate covering equality lookups on the
+normalized display-name and ItemID indexes, each bounded to `limit + 1` rows, exclude lower-priority
+ItemID duplicates already found by the display-name probe, and then merge and deduplicate those
+candidates before ranking. Prefix searches use indexed lexicographic ranges rather than
+generation-wide `LIKE` scans; contains searches retain their FTS path. Status, discovery, reads,
+writes, and lazy browse therefore remain available while search work is in progress. Matching is
+case-insensitive with exact/prefix/contains ranking, and
 responses report when additional results exist beyond the requested limit. During promotion,
 searches use the active generation already returned by the promotion-safe status path instead of
 waiting for the writable database mutex.
@@ -96,25 +104,27 @@ Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway for
 BSTR contents without adding display quote characters; quotes remain only when present in the
 server value.
 
-Read responses contain semantic values. For an OPC DA `VT_BSTR`, the gateway forwards the exact
-BSTR contents without adding display quote characters; quotes remain only when present in the
-server value.
-
-Configure the index in the gateway TOML file under `[index]`. Automatic indexing is restricted to
-the explicit `servers` allow-list and uses a service-writable SQLite database, conservative
-batch/rate/duty-cycle defaults, a two-second foreground quiet period, and one build at a time.
+Configure index-wide behavior in the gateway TOML file under `[index]`. SQLite owns enrolled
+servers and each server's auto-refresh setting; a fresh gateway has no enrolled servers and never
+starts an automatic first build. A successful manually enrolled index is refreshed weekly by
+default when its per-server auto-refresh setting and global `index.enabled` switch permit it.
+Disabling per-server auto-refresh preserves its searchable generation; deleting an index removes
+its enrollment, generations, entries, and retry state after coordinating any active build. Delete
+returns a temporary `deleting` status while cleanup runs, then reaches `not-indexed`. The gateway
+uses a service-writable SQLite database, conservative batch/rate/duty-cycle defaults, a
+two-second foreground quiet period, and one build at a time.
 Native inventory batches are bounded to 1,000 entries by the OPC DA client contract.
 Native inventory slicing and SQLite commit batching are independently bounded, and adaptive
-controller decisions update both the native slice batch size and pacing interval; the commit
-interval provides a time limit for low-volume inventories. Runtime status includes rolling
+controller decisions update the native slice batch size and pacing interval; the commit interval
+provides a time limit for low-volume inventories.
+Runtime status includes rolling
 foreground latency/error/quality metrics, host/storage availability, and persisted scheduler
 backoff diagnostics.
 If the native client rejects an initial or adaptive pacing update, the build fails visibly and
 the previous complete generation remains active; pacing errors are never logged and ignored.
-Completed generations are refreshed weekly by default. The first automatic build waits for a
-configured maintenance window; when no window is configured, use the manual refresh operation.
-Startup grace and deterministic per-server schedule jitter prevent indexing from starting
-immediately after a restart or in lockstep across targets.
+Completed enrolled generations are refreshed weekly by default. Maintenance windows, startup grace,
+and deterministic per-server schedule jitter prevent scheduled work from starting at unsuitable
+times or in lockstep across targets.
 The default database path is `%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows and
 `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (falling back to
 `$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS. See the example file for all
@@ -128,3 +138,10 @@ An optional `sentinel_tag` is read during health probes; omitted or unavailable 
 configuration is reported explicitly rather than treated as a healthy zero value. Status also
 distinguishes a configured sentinel from its probe result, so an unprobed sentinel is not reported
 as absent.
+
+The gateway migrates the previous indexed-search database schema in place through the schema
+2 -> 3 -> 4 chain. Existing generations, relational entries, and full-text search data are
+preserved; servers with a usable active generation are enrolled for automatic refresh, while
+failed-only histories remain visible and require a manual retry before scheduled refresh is
+enabled. Each migration step is transactional, so a failed upgrade is reported without leaving a
+partially upgraded index database.

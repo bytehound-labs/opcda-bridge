@@ -49,22 +49,13 @@ rotation = "daily"
 # File existence alone does not indicate an active build; the OS advisory lock does.
 # database_path = "C:\\ProgramData\\opcda-bridge\\index.sqlite3"
 
-# Only these OPC DA server ProgIDs are eligible for automatic indexing.
-# A server must be listed here for status, manual operations, or automatic
-# scans; an empty list disables all index operations.
-servers = ["Kepware.KepServerEX.V5"]
-
-# Automatic indexing is enabled by default. Set false to disable startup and
-# scheduled refreshes without removing the server allow-list.
+# Automatic indexing is enabled by default. It only schedules enrolled servers
+# that have completed a successful manual build. Set false to stop startup and
+# scheduled work without affecting manual index operations.
 enabled = true
 
 # A successful generation is refreshed once per week by default.
 refresh_interval_seconds = 604800
-
-# The first automatic generation starts only inside a configured maintenance
-# window. Without a window, use the manual refresh operation. Set this to
-# "immediate" only when an automatic first crawl is explicitly acceptable.
-initial_build_policy = "maintenance_window"
 
 # Let the gateway become responsive before automatic indexing starts.
 startup_grace_period_seconds = 30

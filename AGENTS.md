@@ -88,7 +88,8 @@ a working opcda-bridge, not a redesign of it.
   database file so relative/symlink aliases cannot bypass the gate. For missing files, canonicalize
   the parent and reattach the filename; if that cannot be done, retain the original path spelling.
   Each `:memory:` database gets an independent coordination object and must not create or rely on a
-  filesystem build lock.
+  filesystem build lock. On Windows, cleanly released build locks remove their `.build.owner`
+  metadata sidecar; forced termination may leave it for the next acquisition to overwrite.
 - **Index status is an aggregation of durable and runtime state.** Status combines the persisted
   generation snapshot with runtime build, health, storage, foreground, and scheduler diagnostics.
   Promotion reads persisted rows through a read-only connection and filesystem diagnostics; a
@@ -169,7 +170,7 @@ without printing the token itself.
 The gateway crate is Windows-only (COM); the client crate is cross-platform. Tests that require
 the `OpcClient` trait use a mock implementation so they run on all platforms.
 
-The cross-version workflow exercises published 0.3.2 and 0.4.0 boundary clients against current
+The cross-version workflow exercises published 0.3.2 and 0.4.3 boundary clients against current
 and historical gateway services backed by mock `OpcClient` implementations. An exact package pair
 does not need prior CI evidence when its negotiated protocol ranges overlap, but the CLI reports
 such pairings as `unverified`. Release-plz pull requests regenerate the isolated test workspace's

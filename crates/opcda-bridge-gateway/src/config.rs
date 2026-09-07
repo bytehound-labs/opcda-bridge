@@ -94,15 +94,9 @@ pub struct IndexConfig {
     /// Service-writable SQLite path. If omitted, the platform data directory
     /// is used.
     pub database_path: Option<String>,
-    /// Only these OPC DA ProgIDs may be indexed automatically.
-    #[serde(default)]
-    pub servers: Vec<String>,
     /// Set false to disable automatic indexing while retaining manual APIs.
     pub enabled: Option<bool>,
     pub refresh_interval_seconds: Option<u64>,
-    /// Policy for creating the first generation when no complete index exists.
-    #[serde(default)]
-    pub initial_build_policy: Option<InitialBuildPolicy>,
     /// Delay after gateway startup before automatic indexing is considered.
     pub startup_grace_period_seconds: Option<u64>,
     /// Deterministic per-server delay added to scheduled refreshes.
@@ -153,10 +147,8 @@ pub struct IndexConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedIndexConfig {
     pub database_path: PathBuf,
-    pub servers: Vec<String>,
     pub enabled: bool,
     pub refresh_interval_seconds: u64,
-    pub initial_build_policy: InitialBuildPolicy,
     pub startup_grace_period_seconds: u64,
     pub schedule_jitter_seconds: u64,
     pub inventory_batch_size: u32,
@@ -226,20 +218,6 @@ pub const DEFAULT_INDEX_CONCURRENCY: u32 = 1;
 pub const DEFAULT_INDEX_QUERY_CACHE_CAPACITY: usize = 256;
 pub const DEFAULT_INDEX_MAX_RESULTS: u32 = 50;
 
-/// Controls whether the first automatic generation may start without a
-/// maintenance window.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum InitialBuildPolicy {
-    /// Start automatically only while a configured maintenance window is open.
-    #[default]
-    MaintenanceWindow,
-    /// Start automatically after startup grace, even without a window.
-    Immediate,
-    /// Never start the first generation automatically.
-    Manual,
-}
-
 /// Return the platform data path used for the gateway-owned index.
 pub fn index_path_from(
     xdg_data_home: Option<&str>,
@@ -279,12 +257,10 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
 
     ResolvedIndexConfig {
         database_path,
-        servers: config.servers.clone(),
         enabled: config.enabled.unwrap_or(true),
         refresh_interval_seconds: config
             .refresh_interval_seconds
             .unwrap_or(DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS),
-        initial_build_policy: config.initial_build_policy.unwrap_or_default(),
         startup_grace_period_seconds: config
             .startup_grace_period_seconds
             .unwrap_or(DEFAULT_INDEX_STARTUP_GRACE_PERIOD_SECONDS),
@@ -621,10 +597,8 @@ mod tests {
     fn test_resolve_index_config_applies_defaults_and_safe_bounds() {
         let config = IndexConfig {
             database_path: Some("custom.sqlite3".into()),
-            servers: vec!["S".into()],
             enabled: Some(false),
             refresh_interval_seconds: Some(12),
-            initial_build_policy: Some(InitialBuildPolicy::Immediate),
             startup_grace_period_seconds: Some(9),
             schedule_jitter_seconds: Some(8),
             inventory_batch_size: Some(11),
@@ -662,10 +636,8 @@ mod tests {
         };
         let resolved = resolve_index_config(&config);
         assert_eq!(resolved.database_path, PathBuf::from("custom.sqlite3"));
-        assert_eq!(resolved.servers, vec!["S".to_string()]);
         assert!(!resolved.enabled);
         assert_eq!(resolved.refresh_interval_seconds, 12);
-        assert_eq!(resolved.initial_build_policy, InitialBuildPolicy::Immediate);
         assert_eq!(resolved.startup_grace_period_seconds, 9);
         assert_eq!(resolved.schedule_jitter_seconds, 8);
         assert_eq!(resolved.inventory_batch_size, 11);
@@ -706,10 +678,6 @@ mod tests {
     fn test_resolve_index_config_uses_weekly_safe_scheduler_defaults() {
         let resolved = resolve_index_config(&IndexConfig::default());
         assert_eq!(resolved.refresh_interval_seconds, 604_800);
-        assert_eq!(
-            resolved.initial_build_policy,
-            InitialBuildPolicy::MaintenanceWindow
-        );
         assert_eq!(resolved.startup_grace_period_seconds, 30);
         assert_eq!(resolved.schedule_jitter_seconds, 21_600);
         assert_eq!(resolved.inventory_batch_size, 100);
@@ -744,10 +712,8 @@ mod tests {
     fn test_index_config_toml_round_trip() {
         let original = IndexConfig {
             database_path: Some("index.sqlite3".into()),
-            servers: vec!["S1".into(), "S2".into()],
             enabled: Some(true),
             refresh_interval_seconds: Some(60),
-            initial_build_policy: Some(InitialBuildPolicy::Manual),
             startup_grace_period_seconds: Some(45),
             schedule_jitter_seconds: Some(120),
             inventory_batch_size: Some(20),

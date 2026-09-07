@@ -46,7 +46,7 @@ pub(crate) struct MockOpcClient {
 impl Default for MockOpcClient {
     fn default() -> Self {
         Self {
-            list_servers_result: Mutex::new(Ok(vec![])),
+            list_servers_result: Mutex::new(Ok(vec!["S".into(), "T".into()])),
             list_servers_delay: Mutex::new(None),
             list_servers_started: Arc::new(Notify::new()),
             capabilities_result: Mutex::new(Ok(BrowseCapabilities {

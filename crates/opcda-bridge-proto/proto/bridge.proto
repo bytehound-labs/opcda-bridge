@@ -191,6 +191,8 @@ message SearchIndexRequest {
 message SearchIndexStatus {
   string server = 1;
   SearchIndexState state = 2;
+  // Field 3 retains its historical wire name for protobuf compatibility.
+  // In the 0.5 lifecycle contract it reports automatic-refresh eligibility.
   bool configured = 3;
   uint64 active_generation = 4;
   uint64 entry_count = 5;
@@ -302,6 +304,7 @@ enum SearchIndexState {
   // Deprecated on the wire: gateways map promotion to REFRESHING and set the
   // additive promoting diagnostic so older clients remain compatible.
   SEARCH_INDEX_STATE_PROMOTING = 7;
+  SEARCH_INDEX_STATE_DELETING = 8;
 }
 
 enum SearchIndexControlAction {
@@ -309,6 +312,9 @@ enum SearchIndexControlAction {
   SEARCH_INDEX_CONTROL_ACTION_PAUSE = 1;
   SEARCH_INDEX_CONTROL_ACTION_RESUME = 2;
   SEARCH_INDEX_CONTROL_ACTION_CANCEL = 3;
+  SEARCH_INDEX_CONTROL_ACTION_ENABLE_AUTO_REFRESH = 4;
+  SEARCH_INDEX_CONTROL_ACTION_DISABLE_AUTO_REFRESH = 5;
+  SEARCH_INDEX_CONTROL_ACTION_DELETE = 6;
 }
 
 enum IndexControllerState {

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Expose durable on-demand namespace-index enrollment, per-server auto-refresh controls, and
+  deletion through typed client APIs.
+
 ## [0.4.7](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-v0.4.6...opcda-bridge-v0.4.7) - 2026-08-27
 
 ### Other

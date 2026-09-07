@@ -85,6 +85,9 @@ mod tests {
         let indexed = crate::compatibility::release_line_for("0.4.3").unwrap();
         assert_eq!(indexed.name, "indexed");
         assert_eq!(indexed.indexed_search_protocol, 1);
+        let on_demand = crate::compatibility::release_line_for("0.5.0").unwrap();
+        assert_eq!(on_demand.name, "indexed-on-demand");
+        assert_eq!(on_demand.indexed_search_protocol, 2);
         assert!(crate::compatibility::release_line_for("1.0").is_none());
         assert!(crate::compatibility::release_line_for("0.x.3").is_none());
     }

@@ -59,17 +59,15 @@ while let Some(event) = search.message().await? {
 }
 
 let status = client.search_index_status("Kepware.KepServerEX.V5").await?;
-if status.configured {
-    let indexed = client
-        .search_index(SearchIndexRequest::new(
-            "Kepware.KepServerEX.V5",
-            "Device1 PV",
-            SearchMatchMode::Contains,
-        ))
-        .await?;
-    for found in indexed.matches {
-        println!("{}: {}", found.display_name, found.item_id);
-    }
+let indexed = client
+    .search_index(SearchIndexRequest::new(
+        "Kepware.KepServerEX.V5",
+        "Device1 PV",
+        SearchMatchMode::Contains,
+    ))
+    .await?;
+for found in indexed.matches {
+    println!("{}: {}", found.display_name, found.item_id);
 }
 client.close_browse_session(root.session_id).await?;
 # Ok(())
@@ -77,9 +75,11 @@ client.close_browse_session(root.session_id).await?;
 ```
 
 Indexed search never falls back to live namespace traversal. Each response includes the index
-readiness state and `has_more`; returned ItemIDs preserve the server's exact identity and do not
-contain browse-session node keys. Use `refresh_search_index` and `control_search_index` for
-explicit refresh, pause, resume, and cancel operations.
+readiness state, per-server `auto_refresh_enabled` setting, and `has_more`; returned ItemIDs
+preserve the server's exact identity and do not contain browse-session node keys. The first
+`refresh_search_index` validates and enrolls the exact registered ProgID. Use
+`set_search_index_auto_refresh` to change scheduled-refresh eligibility without removing data,
+and `delete_search_index` to remove an enrolled index and its history.
 
 See the crate documentation for method signatures and the repository README for gateway setup and
 protocol details.

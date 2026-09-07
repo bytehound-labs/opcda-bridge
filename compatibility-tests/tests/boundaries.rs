@@ -333,12 +333,12 @@ async fn historical_client_reads_writes_and_browses_current_gateway() {
 }
 
 #[tokio::test]
-async fn indexed_client_reaches_current_index_contract() {
+async fn indexed_043_client_reads_current_on_demand_gateway_status() {
     let (host, shutdown, _tempdir) = start_current_gateway().await;
-    let mut client = historical_client_040::Client::connect(&host).await.unwrap();
+    let mut client = historical_client_043::Client::connect(&host).await.unwrap();
 
     assert_eq!(
-        historical_proto_040::bridge::SearchIndexState::Ready as i32,
+        historical_proto_043::bridge::SearchIndexState::Ready as i32,
         3
     );
     let status = client.search_index_status(SERVER).await.unwrap();

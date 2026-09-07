@@ -7,53 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replace the configured-server index allow-list with SQLite-backed on-demand enrollment,
+  per-server scheduled-refresh controls, and coordinated index deletion.
+
+### Fixed
+
+- Remove Windows build-owner metadata on clean lock release while retaining it after forced
+  termination for the next acquisition's diagnostics.
+
+- Canonicalize existing index database identities for writer coordination and persistent build
+  locks, while isolating independent in-memory databases from the shared registry and filesystem
+  lock sidecars.
+
 ## [0.4.21](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.20...opcda-bridge-gateway-v0.4.21) - 2026-08-28
 
 ### Other
 
-- *(gateway)* finish health probe complexity cleanup
+- _(gateway)_ finish health probe complexity cleanup
 
 ## [0.4.20](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.19...opcda-bridge-gateway-v0.4.20) - 2026-08-28
 
 ### Other
 
-- *(gateway)* simplify index build orchestration ([#124](https://github.com/bytehound-labs/opcda-bridge/pull/124))
+- _(gateway)_ simplify index build orchestration ([#124](https://github.com/bytehound-labs/opcda-bridge/pull/124))
 
 ## [0.4.19](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.18...opcda-bridge-gateway-v0.4.19) - 2026-08-28
 
 ### Other
 
-- *(index)* simplify foreground cleanup
+- _(index)_ simplify foreground cleanup
 
 ## [0.4.18](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.17...opcda-bridge-gateway-v0.4.18) - 2026-08-28
 
 ### Other
 
-- *(gateway)* harden refresh cancellation paths
+- _(gateway)_ harden refresh cancellation paths
 
 ## [0.4.17](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.16...opcda-bridge-gateway-v0.4.17) - 2026-08-28
 
 ### Other
 
-- *(gateway)* split index status and lifecycle finalization ([#114](https://github.com/bytehound-labs/opcda-bridge/pull/114))
+- _(gateway)_ split index status and lifecycle finalization ([#114](https://github.com/bytehound-labs/opcda-bridge/pull/114))
 
 ## [0.4.16](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.15...opcda-bridge-gateway-v0.4.16) - 2026-08-28
 
 ### Other
 
-- *(gateway)* simplify cleanup scheduler
+- _(gateway)_ simplify cleanup scheduler
 
 ## [0.4.15](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.14...opcda-bridge-gateway-v0.4.15) - 2026-08-28
 
 ### Other
 
-- *(gateway)* simplify index scheduler
+- _(gateway)_ simplify index scheduler
 
 ## [0.4.14](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.13...opcda-bridge-gateway-v0.4.14) - 2026-08-28
 
 ### Other
 
-- *(gateway)* simplify live search flow
+- _(gateway)_ simplify live search flow
 
 ## [0.4.13](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.12...opcda-bridge-gateway-v0.4.13) - 2026-08-28
 
@@ -65,25 +79,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(gateway)* use indexed equality for exact search
+- _(gateway)_ use indexed equality for exact search
 
 ## [0.4.11](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.10...opcda-bridge-gateway-v0.4.11) - 2026-08-27
 
 ### Fixed
 
-- *(gateway)* canonicalize index database identity ([#87](https://github.com/bytehound-labs/opcda-bridge/pull/87))
-
-### Fixed
-
-- Canonicalize existing index database identities for writer coordination and persistent build
-  locks, while isolating independent in-memory databases from the shared registry and filesystem
-  lock sidecars.
+- _(gateway)_ canonicalize index database identity ([#87](https://github.com/bytehound-labs/opcda-bridge/pull/87))
 
 ## [0.4.10](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.9...opcda-bridge-gateway-v0.4.10) - 2026-08-27
 
 ### Fixed
 
-- *(gateway)* coordinate cleanup with index builds
+- _(gateway)_ coordinate cleanup with index builds
 
 ## [0.4.9](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.4.8...opcda-bridge-gateway-v0.4.9) - 2026-08-26
 

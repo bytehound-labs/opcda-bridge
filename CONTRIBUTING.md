@@ -105,6 +105,9 @@ The generated compatibility files must remain synchronized with
 python3 scripts/generate-compatibility-report.py --check
 ```
 
+`COMPATIBILITY.md` is generated output; do not run the repository's general
+Prettier hook over it, because the generator owns its Markdown table layout.
+
 The catalog describes protocol release lines rather than equal package versions. An intentional
 breaking Protobuf change requires the `breaking-protobuf` label, a new or changed compatibility
 boundary, updated boundary evidence, and regenerated reports. The Buf compatibility workflow

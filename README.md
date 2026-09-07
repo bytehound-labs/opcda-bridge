@@ -19,9 +19,12 @@ independently, and release-plz publishes only packages with releasable changes a
 metadata passes the required release integrity check.
 
 The indexed API line introduces indexed namespace search and extends the gRPC capabilities contract.
-The additive wire protocol remains compatible with older gateways and clients. Indexed-search
-availability is determined by the advertised protocol and capability versions, not by matching
-crate or binary version numbers.
+The protobuf additions are wire-compatible with older gateways and clients, while the 0.5
+indexed-on-demand lifecycle is advertised as a new negotiated feature boundary. Older pairs can
+continue to use overlapping core and namespace operations, but they must not assume that the
+indexed-search lifecycle or its enrollment semantics are available. Indexed-search availability
+is determined by the advertised protocol and capability versions, not by matching crate or binary
+version numbers.
 Public Rust struct additions in the pre-1.0 API are source-breaking for downstream struct
 literals, so releases containing those additions use the next minor API version rather than a
 patch version. The protobuf wire additions remain backward-compatible.
@@ -54,6 +57,27 @@ OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based 
 
 - **Gateway** — runs on the Windows host alongside the OPC DA server, speaks native COM.
 - **Client** — runs anywhere (Linux, macOS, Windows), talks to the gateway over the network.
+
+### Lightning-fast indexed tag search
+
+Large OPC DA namespaces can make live browse-tree searches slow because every query has to
+traverse the server. `opcda-bridge` can build a durable, gateway-owned SQLite/FTS index of a
+server's namespace; after the first build, repeated `index-search` queries run against that local
+snapshot and return the server's exact ItemIDs without walking the live namespace again. This makes
+interactive tag discovery lightning-fast compared with live traversal, while ordinary browse,
+read, and write operations remain available independently.
+
+Indexing is opt-in per server rather than controlled by a TOML allow-list. A fresh gateway has no
+enrolled servers; the first `index-refresh` validates the exact ProgID returned by server discovery,
+enrolls it, and starts the build. Successful generations are refreshed weekly by default, with the
+interval and gateway-wide safety limits configurable in TOML. The index is also exposed through the
+client CLI, reusable Rust library, gRPC protocol, and HTTP integrations.
+
+Among open-source OPC DA gateways reviewed for this feature, we have not found another project
+that combines gateway access with a durable on-disk namespace index and built-in indexed tag
+search. That makes `opcda-bridge`, to our knowledge, the only open-source OPC DA gateway with
+this capability; the distinction is intentionally qualified because no catalog of every private or
+unmaintained gateway can be exhaustive.
 
 ## Client/gateway compatibility
 
@@ -198,9 +222,9 @@ config file — see [Configuration](#configuration) below.
   A normal search stream starts with an initial progress event, emits matches in browse order
   with progress updates after each page, and ends with a completion event. Result or visit caps
   can terminate the stream early with a truncation warning.
-- Use the persistent gateway-owned index for fast interactive discovery. Only servers explicitly
-  allowed by the gateway configuration can be indexed, and indexed search never falls back to
-  live traversal:
+- Use the persistent gateway-owned index for fast interactive discovery. A fresh gateway has no
+  enrolled servers. The first manual refresh validates the exact ProgID against server discovery,
+  persists enrollment, and starts the build. Indexed search never falls back to live traversal:
   ```sh
   opcda-bridge-client --host 192.168.1.50:7600 index-status \
     --server Kepware.KepServerEX.V5
@@ -238,7 +262,9 @@ config file — see [Configuration](#configuration) below.
   interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
   generations do not make a newer active generation appear failed. If relational index rows and
   the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache
-  is quarantined rather than serving silently incomplete substring results.
+  is quarantined rather than serving silently incomplete substring results. SQLite recovery
+  quarantines the database together with its `-wal` and `-shm` sidecars so committed index data
+  remains available for diagnosis.
   Status combines the persisted generation snapshot with runtime build, health, storage,
   foreground, and scheduler diagnostics. During promotion, persisted status is read through a
   read-only connection; a runtime error overrides the reported state only when no build is active.
@@ -249,9 +275,11 @@ config file — see [Configuration](#configuration) below.
   build-lock sidecars.
   Indexed queries use a dedicated read-only SQLite connection and bounded candidate sets, keeping
   broad searches out of the foreground database mutex. Exact searches use separate equality
-  lookups on the normalized display-name and ItemID indexes, each bounded to `limit + 1` rows,
-  then merge and deduplicate those candidates before ranking; prefix and contains searches retain
-  their existing indexed/FTS paths.
+  lookups on covering normalized display-name and ItemID indexes, each bounded to `limit + 1`
+  rows, exclude lower-priority ItemID duplicates already found by the display-name probe, and then
+  merge and deduplicate those candidates before ranking. Prefix searches use indexed
+  lexicographic ranges rather than generation-wide `LIKE` scans; contains searches retain their FTS
+  path.
   During promotion, searches reuse the active generation reported by promotion-safe status rather
   than reacquiring the writable database mutex. Cancellation requests received while inventory
   startup is still acquiring its control handle are retained and applied as soon as that handle
@@ -397,18 +425,18 @@ for every available key.
 
 Logging settings (`log.*`) are also read from this file — see [Logging](#logging) below.
 
-The persistent namespace index is opt-in by server: index operations are accepted only for ProgIDs
-in `index.servers`, and automatic indexing never scans any other server. A valid complete
-generation remains available while a refresh runs, and failed or cancelled refreshes never replace
-it.
+The persistent namespace index is opt-in by manual enrollment. Its first `index-refresh` validates
+the exact ProgID returned by server discovery, persists the server in SQLite, and starts work
+immediately. Unknown ProgIDs leave no enrollment behind. A valid complete generation remains
+available while a refresh runs, and failed or cancelled refreshes never replace it. The gateway
+schedules only enrolled servers with a successful active generation and
+`auto_refresh_enabled = true`; a failed first build remains visible until manually retried.
 
 | Index setting              | Config key                            | Default                        |
 | -------------------------- | ------------------------------------- | ------------------------------ |
 | Database path              | `index.database_path`                 | Platform data directory        |
 | Automatic indexing         | `index.enabled`                       | `true`                         |
-| Indexed server allow-list  | `index.servers`                       | Empty                          |
 | Refresh interval           | `index.refresh_interval_seconds`      | `604800` (7 days)              |
-| First automatic build      | `index.initial_build_policy`          | `maintenance_window`           |
 | Startup grace period       | `index.startup_grace_period_seconds`  | `30` seconds                   |
 | Schedule jitter            | `index.schedule_jitter_seconds`       | `21600` seconds                |
 | Inventory slice batch      | `index.inventory_batch_size`          | `100` entries (max `1000`)     |
@@ -434,6 +462,13 @@ it.
 | Start paused               | `index.paused`                        | `false`                        |
 | Maximum indexed results    | `index.max_results`                   | `50`                           |
 
+`index.enabled` is an emergency switch for startup and scheduled work only. Manual status,
+browse, search, refresh, and read operations remain available when it is false. Per-server
+scheduled refresh can be disabled without deleting its searchable data through the indexed-search
+control API. Deleting an index cancels and coordinates any active build, then removes enrollment,
+generations, entries, and retry metadata asynchronously. The delete request returns a temporary
+`deleting` status while cleanup runs; its final status is `not-indexed`.
+
 The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (falling back to
 `$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS and
 `%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows. Maintenance-window entries are local
@@ -443,15 +478,23 @@ addition to latency and host/storage guardrails.
 The status reports whether a sentinel tag is configured separately from whether its latest probe
 is healthy or unavailable.
 
+When upgrading from the previous indexed-search schema, the gateway migrates the existing
+generations and full-text data in place through the schema 2 -> 3 -> 4 chain. Servers with a
+usable active generation are enrolled for weekly automatic refresh; servers with only failed or
+incomplete history remain visible but require an explicit manual retry before automatic refresh is
+enabled. Each migration step is transactional, so a failed upgrade is reported without leaving a
+partially upgraded index database.
+
 Run only one gateway process with a given index database path. A gateway automatically loads
 `opcda-bridge-gateway.toml` next to its executable, so launching a second copy from the same
 directory can otherwise start a second inventory against the same SQLite file. When multiple
 gateway instances are intentional, give each instance an explicit, different
 `index.database_path` and configure indexing on only the instance that should build that
-server's index. Each server's build uses a persistent sibling `.build.lock` file. The operating
-system's advisory lock, not the file's existence, determines whether a build is active; metadata
-from a forcibly terminated process is overwritten by the next successful acquisition. Do not
-delete the lock path while a gateway may still be running.
+server's index. Each server's build uses a persistent sibling `.build.lock` file. On Windows,
+`.build.owner` carries the same owner metadata because the locked file may be unreadable; it is
+removed on a clean lock release and may remain after forced termination until the next acquisition
+overwrites it. The operating-system advisory lock, not either file's existence, determines whether
+a build is active. Do not delete either path while a gateway may still be running.
 
 ### Client
 
