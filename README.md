@@ -83,6 +83,11 @@ deployment tooling. Client and gateway package versions are independent and do n
 Prebuilt client and gateway binaries are attached to their package-specific tags on the
 [Releases](https://github.com/bytehound-labs/opcda-bridge/releases) page.
 
+Source builds use Rust's `stable` toolchain to match the regular validation, coverage,
+SonarQube, and release-plz jobs. CI separately checks the MSRV (Minimum Supported Rust Version),
+which is Rust 1.88.0; on rustup-managed hosts, `rustup update stable` refreshes an older selected
+toolchain. The cargo-fuzz smoke tests intentionally use nightly.
+
 ### Gateway (Windows)
 
 The gateway runs on the Windows host alongside the OPC DA server(s) you want to expose.
