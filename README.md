@@ -116,24 +116,37 @@ toolchain. The cargo-fuzz smoke tests intentionally use nightly.
 
 The gateway runs on the Windows host alongside the OPC DA server(s) you want to expose.
 
+- **Supported architecture** — the gateway is intentionally built and distributed as
+  32-bit x86 (`i686-pc-windows-msvc`), including when it runs on 64-bit Windows. The gateway
+  loads the native OPC DA/COM stack on the server host, and legacy installations may expose
+  their OPC components only through the 32-bit COM and registry view. Windows runs the x86
+  gateway on a 64-bit host through WOW64. The x86 gateway is the supported Windows gateway;
+  a host-default x64 build is not a substitute.
 - **Prebuilt binary** — download `opcda-bridge-gateway-windows-x86.zip` from the latest
   `opcda-bridge-gateway-v*` release, extract it, and run `opcda-bridge-gateway.exe`. No installer
-  needed. The binary targets 32-bit Windows (`i686`), matching the architecture most legacy OPC DA
-  servers still require for COM interop.
+  needed. The archive is the 32-bit `i686` gateway described above.
 - **From source** (requires Rust 1.88+ and the
   Protocol Buffers compiler `protoc` on `PATH`):
-  ```sh
+  ```powershell
   git clone https://github.com/bytehound-labs/opcda-bridge.git
   cd opcda-bridge
-  cargo build --release -p opcda-bridge-gateway
-  ./target/release/opcda-bridge-gateway.exe
+  rustup target add i686-pc-windows-msvc
+  cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-msvc
+  .\target\i686-pc-windows-msvc\release\opcda-bridge-gateway.exe
   ```
+  The explicit target is required: a plain `cargo build --release` on a 64-bit Windows
+  development machine produces a host-target x64 binary instead of the supported gateway
+  build.
 - **Install from crates.io** (requires Rust 1.88+ and `protoc`):
-  ```sh
-  cargo install opcda-bridge-gateway
+  ```powershell
+  rustup target add i686-pc-windows-msvc
+  cargo install --locked --target i686-pc-windows-msvc opcda-bridge-gateway
   ```
 
 ### Client (Linux, macOS, Windows)
+
+The client is a separate network process, so its architecture does not need to match the
+gateway. A 64-bit Windows client can connect to the supported 32-bit gateway over the network.
 
 - **Prebuilt binary** — download the archive for your OS from the latest `opcda-bridge-client-v*`
   release, extract it, and run `opcda-bridge-client`:

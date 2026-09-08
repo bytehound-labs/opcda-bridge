@@ -142,6 +142,12 @@ target for early gateway development.
   release-plz jobs. The separate MSRV (Minimum Supported Rust Version) check uses Rust 1.88.0.
   Keep the cargo-fuzz smoke workflow on nightly unless stable support is verified independently.
 - **Build**: `cargo build`
+- **Windows gateway target**: the gateway is intentionally 32-bit x86, even on 64-bit Windows.
+  Install `i686-pc-windows-msvc` and pass it explicitly:
+  `rustup target add i686-pc-windows-msvc`
+  followed by `cargo build --release --locked -p opcda-bridge-gateway --target
+i686-pc-windows-msvc`. A plain host-target build is not release-equivalent; the client has
+  its own independent x86_64 Windows release target.
 - **Test**: `cargo test --workspace`
 - **Lint**: `cargo fmt --check --all` and
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`

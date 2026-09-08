@@ -44,6 +44,12 @@ Example: `feat(gateway): add tag subscription support`.
   SonarQube, and release-plz jobs. The MSRV (Minimum Supported Rust Version) job separately checks
   Rust 1.88.0; on rustup-managed hosts, run `rustup update stable` if the selected toolchain is
   older. The cargo-fuzz smoke tests intentionally use nightly.
+- **Build the Windows gateway for the release target, not the host target.** The gateway is
+  intentionally 32-bit x86 (`i686-pc-windows-msvc`) so it can load legacy OPC DA/COM
+  installations that use the 32-bit registry view, even when Windows itself is 64-bit:
+  `rustup target add i686-pc-windows-msvc` followed by
+  `cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-msvc`.
+  The cross-platform client has an independent architecture and remains x86_64 on Windows.
 - Format with `cargo fmt --all` (default rustfmt settings) before committing.
 - Lint with `cargo clippy --workspace --all-targets --all-features -- -D warnings`; fix every
   warning or justify an explicit `#[allow(...)]` with a comment.
