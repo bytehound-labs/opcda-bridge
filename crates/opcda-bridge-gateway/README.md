@@ -3,10 +3,18 @@
 Windows gateway that exposes native OPC DA (COM/DCOM) servers over the network to
 [`opcda-bridge-client`](https://github.com/bytehound-labs/opcda-bridge) and other gRPC clients.
 
+The supported Windows gateway target is 32-bit x86
+(`i686-pc-windows-msvc`), including on 64-bit Windows. This is deliberate: the gateway loads
+native OPC DA/COM components alongside the server, and legacy installations may expose those
+components only through the 32-bit COM and registry view. Windows runs this gateway through
+WOW64 on a 64-bit host. The x86 gateway is the supported Windows gateway; a host-default x64
+build is not a substitute.
+
 Install it with Cargo on a Windows host:
 
-```sh
-cargo install opcda-bridge-gateway
+```powershell
+rustup target add i686-pc-windows-msvc
+cargo install --locked --target i686-pc-windows-msvc opcda-bridge-gateway
 ```
 
 The gateway is versioned independently from the client and protocol crates. Prebuilt archives use
