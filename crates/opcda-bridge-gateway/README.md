@@ -61,6 +61,12 @@ build. Cancellation, health failure, or a rejected pacing update terminates the 
 replacing the last complete generation.
 Pending entries are flushed before terminal state is recorded, and successful completion with a
 non-fatal inventory warning remains searchable while the warning is exposed in status.
+Each terminal build emits one structured `namespace index build telemetry` log record. It includes
+the terminal outcome and timing, entries and unique items observed, active and paused time,
+inventory slice counts and elapsed-time totals, native operation totals, DA2/DA3 slice counts,
+entry-kind counts, SQLite commit counts and latency summaries, and any failure text. Successful
+generation promotion emits a separate log record with its duration. These records are diagnostic
+only and do not change the index schema or runtime pacing.
 Completed active generations are durable across gateway restarts. Activation is an atomic metadata
 transition, and promotion status uses a read-only SQLite connection plus filesystem diagnostics, so
 status remains responsive even while the writer is in the promotion critical section.
