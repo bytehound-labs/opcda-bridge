@@ -323,7 +323,8 @@ impl BuildRunState {
 struct BuildFinalizationContext<'a> {
     server: &'a str,
     generation: u64,
-    handle: &'a InventoryHandle,
+    control: &'a Arc<dyn InventoryControl>,
+    control_was_cancelled_before_cleanup: bool,
     ownership: &'a Arc<()>,
     build_started: Instant,
 }
@@ -4843,27 +4844,33 @@ impl<C: OpcClient> IndexManager<C> {
         self: Arc<Self>,
         server: String,
         generation: u64,
-        mut handle: InventoryHandle,
+        inventory_handle: InventoryHandle,
         ownership: Arc<()>,
     ) {
         let mut finalization = BuildFinalizationGuard::new(
             Arc::clone(&self),
             server.clone(),
             generation,
-            Arc::clone(&handle.control),
+            Arc::clone(&inventory_handle.control),
             Arc::clone(&ownership),
         );
+        // Keep the stream local to a scope declared after the finalization guard.
+        // If the build task unwinds, Rust drops this handle before the guard can
+        // release ownership and the file lock.
+        let mut handle = inventory_handle;
         let build_started = Instant::now();
         let maintenance_windows =
             match parse_maintenance_windows(&self.settings.maintenance_windows) {
                 Ok(windows) => windows,
                 Err(error) => {
                     handle.control.cancel();
+                    let control = Arc::clone(&handle.control);
+                    drop(handle);
                     let message = error.to_string();
                     self.fail_generation_and_schedule_cleanup(&server, generation, &message);
                     self.finish_build_for_control_owned(
                         &server,
-                        &handle.control,
+                        &control,
                         &ownership,
                         Some(message),
                     );
@@ -4889,11 +4896,15 @@ impl<C: OpcClient> IndexManager<C> {
                 &mut state,
             )
             .await;
+        let control = Arc::clone(&handle.control);
+        let control_was_cancelled_before_cleanup = control.is_cancelled();
+        drop(handle);
         self.finalize_build(
             BuildFinalizationContext {
                 server: &server,
                 generation,
-                handle: &handle,
+                control: &control,
+                control_was_cancelled_before_cleanup,
                 ownership: &ownership,
                 build_started,
             },
@@ -5247,7 +5258,7 @@ impl<C: OpcClient> IndexManager<C> {
                 self.finish_failed_build(
                     context.server,
                     context.generation,
-                    context.handle,
+                    context.control,
                     context.ownership,
                     context.build_started,
                     error,
@@ -5256,12 +5267,12 @@ impl<C: OpcClient> IndexManager<C> {
             BuildLoopOutcome::Finished
                 if state.completed
                     && !state.cancelled
-                    && !context.handle.control.is_cancelled() =>
+                    && !context.control_was_cancelled_before_cleanup =>
             {
                 self.finish_completed_build(
                     context.server,
                     context.generation,
-                    context.handle,
+                    context.control,
                     context.ownership,
                     context.build_started,
                     state,
@@ -5271,7 +5282,7 @@ impl<C: OpcClient> IndexManager<C> {
                 self.finish_cancelled_build(
                     context.server,
                     context.generation,
-                    context.handle,
+                    context.control,
                     context.ownership,
                     context.build_started,
                     state.cancelled,
@@ -5284,7 +5295,7 @@ impl<C: OpcClient> IndexManager<C> {
         &self,
         server: &str,
         generation: u64,
-        handle: &InventoryHandle,
+        control: &Arc<dyn InventoryControl>,
         ownership: &Arc<()>,
         build_started: Instant,
         error: String,
@@ -5299,14 +5310,14 @@ impl<C: OpcClient> IndexManager<C> {
             error = %error,
             "namespace index build failed"
         );
-        self.finish_build_for_control_owned(server, &handle.control, ownership, Some(error));
+        self.finish_build_for_control_owned(server, control, ownership, Some(error));
     }
 
     fn finish_completed_build(
         &self,
         server: &str,
         generation: u64,
-        handle: &InventoryHandle,
+        control: &Arc<dyn InventoryControl>,
         ownership: &Arc<()>,
         build_started: Instant,
         state: BuildRunState,
@@ -5322,13 +5333,13 @@ impl<C: OpcClient> IndexManager<C> {
             Ok(()) => self.finish_promoted_build(
                 server,
                 generation,
-                handle,
+                control,
                 ownership,
                 build_started,
                 state,
             ),
             Err(error) => {
-                self.finish_promotion_failure(server, generation, handle, ownership, error)
+                self.finish_promotion_failure(server, generation, control, ownership, error)
             }
         }
     }
@@ -5361,7 +5372,7 @@ impl<C: OpcClient> IndexManager<C> {
         &self,
         server: &str,
         generation: u64,
-        handle: &InventoryHandle,
+        control: &Arc<dyn InventoryControl>,
         ownership: &Arc<()>,
         build_started: Instant,
         state: BuildRunState,
@@ -5391,14 +5402,14 @@ impl<C: OpcClient> IndexManager<C> {
                 "namespace index completed with warning"
             );
         }
-        self.finish_build_for_control_owned(server, &handle.control, ownership, None);
+        self.finish_build_for_control_owned(server, control, ownership, None);
     }
 
     fn finish_promotion_failure(
         &self,
         server: &str,
         generation: u64,
-        handle: &InventoryHandle,
+        control: &Arc<dyn InventoryControl>,
         ownership: &Arc<()>,
         error: anyhow::Error,
     ) {
@@ -5412,19 +5423,14 @@ impl<C: OpcClient> IndexManager<C> {
             "namespace index database operation failed"
         );
         self.fail_generation_and_schedule_cleanup(server, generation, &error.to_string());
-        self.finish_build_for_control_owned(
-            server,
-            &handle.control,
-            ownership,
-            Some(error.to_string()),
-        );
+        self.finish_build_for_control_owned(server, control, ownership, Some(error.to_string()));
     }
 
     fn finish_cancelled_build(
         &self,
         server: &str,
         generation: u64,
-        handle: &InventoryHandle,
+        control: &Arc<dyn InventoryControl>,
         ownership: &Arc<()>,
         build_started: Instant,
         cancelled: bool,
@@ -5439,7 +5445,7 @@ impl<C: OpcClient> IndexManager<C> {
             cancelled,
             "namespace index build cancelled"
         );
-        self.finish_build_for_control_owned(server, &handle.control, ownership, None);
+        self.finish_build_for_control_owned(server, control, ownership, None);
     }
 
     fn commit_pending_entries(
@@ -10927,6 +10933,74 @@ mod tests {
         assert_eq!(rows[0].last_error.as_deref(), Some(warning));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_ownership_is_held_until_inventory_stream_cleanup_finishes() {
+        let directory = tempdir().unwrap();
+        let (started, started_receiver) = std::sync::mpsc::sync_channel(0);
+        let release = Arc::new(AtomicBool::new(false));
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        let client = Arc::new(LifecycleClient::new(
+            vec![Ok(InventoryHandle {
+                stream: Box::new(DropGateInventoryStream {
+                    started,
+                    release: Arc::clone(&release),
+                    control: Arc::clone(&control),
+                    event: Some(Ok(InventoryEvent::Completed(InventoryCompleted {
+                        complete: true,
+                        cancelled: false,
+                        truncated: false,
+                        warning: None,
+                        organization: NamespaceOrganization::Hierarchical,
+                        source: BrowseSource::Da2,
+                    }))),
+                }),
+                control,
+            })],
+            vec![],
+        ));
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("cleanup-order.sqlite3")),
+        ));
+
+        manager.refresh("S", true).await.unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("inventory stream cleanup did not start");
+
+        assert!(
+            manager
+                .coordination
+                .build_owners
+                .lock()
+                .unwrap()
+                .contains_key("S"),
+            "build ownership was released before inventory cleanup finished"
+        );
+        assert!(
+            manager.active_builds.lock().unwrap().contains("S"),
+            "active build state was released before inventory cleanup finished"
+        );
+        assert!(
+            manager.build_locks.lock().unwrap().contains_key("S"),
+            "build file lock was released before inventory cleanup finished"
+        );
+
+        release.store(true, Ordering::Release);
+        wait_for_state(&manager, "S", IndexState::Ready).await;
+
+        assert!(
+            !manager
+                .coordination
+                .build_owners
+                .lock()
+                .unwrap()
+                .contains_key("S")
+        );
+        assert!(!manager.active_builds.lock().unwrap().contains("S"));
+        assert!(manager.build_locks.lock().unwrap().get("S").is_none());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn build_terminal_error_and_cancellation_paths_preserve_consistent_status() {
         async fn run_case(
@@ -14788,7 +14862,31 @@ mod tests {
         events: VecDeque<anyhow::Result<InventoryEvent>>,
     }
 
+    struct DropGateInventoryStream {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Arc<AtomicBool>,
+        control: Arc<dyn InventoryControl>,
+        event: Option<anyhow::Result<InventoryEvent>>,
+    }
+
     struct PanickingInventoryStream;
+
+    #[async_trait::async_trait]
+    impl InventoryStream for DropGateInventoryStream {
+        async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+            self.event.take()
+        }
+    }
+
+    impl Drop for DropGateInventoryStream {
+        fn drop(&mut self) {
+            let _ = self.started.send(());
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.control.cancel();
+        }
+    }
 
     #[async_trait::async_trait]
     impl InventoryStream for PanickingInventoryStream {
