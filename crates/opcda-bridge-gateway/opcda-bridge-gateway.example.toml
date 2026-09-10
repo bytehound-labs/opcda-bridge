@@ -70,6 +70,12 @@ inventory_batch_size = 100
 commit_batch_size = 100
 commit_interval_ms = 1000
 
+# Diagnostic lifecycle-test cap. When set, an inventory that reaches this
+# entry count emits an explicit truncated completion and promotes the bounded
+# generation with a warning. Leave unset for normal indexing; this is not a
+# production namespace limit.
+# diagnostic_max_entries = 1000
+
 # Maximum native inventory entries requested per bounded operation.
 batch_size = 100
 

@@ -13,8 +13,8 @@ use crate::opc::{
     BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource, InventoryCompleted,
     InventoryControl, InventoryEntry, InventoryEvent, InventoryHandle, InventoryNodeKind,
     InventoryPacing, InventoryProgress, InventorySliceBackend, InventorySliceObservation,
-    InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization, OpcClient, OpcValue,
-    TagValue, WriteResult,
+    InventoryStartOptions, InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization,
+    OpcClient, OpcValue, TagValue, WriteResult,
 };
 
 #[derive(Default)]
@@ -119,9 +119,9 @@ impl OpcClient for OpcDaAdapter {
     async fn start_inventory(
         &self,
         server: &str,
-        batch_size: u32,
+        options: InventoryStartOptions,
     ) -> anyhow::Result<InventoryHandle> {
-        if !(1..=MAX_NATIVE_INVENTORY_BATCH_SIZE).contains(&batch_size) {
+        if !(1..=MAX_NATIVE_INVENTORY_BATCH_SIZE).contains(&options.batch_size) {
             anyhow::bail!(
                 "native inventory batch size must be between 1 and {}",
                 MAX_NATIVE_INVENTORY_BATCH_SIZE
@@ -132,8 +132,8 @@ impl OpcClient for OpcDaAdapter {
             .start_inventory(
                 server,
                 InventoryOptions {
-                    batch_size,
-                    max_entries: None,
+                    batch_size: options.batch_size,
+                    max_entries: options.max_entries,
                 },
             )
             .await?;

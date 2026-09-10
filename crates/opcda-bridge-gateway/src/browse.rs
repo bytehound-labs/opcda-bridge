@@ -565,7 +565,7 @@ mod tests {
         async fn start_inventory(
             &self,
             _server: &str,
-            _batch_size: u32,
+            _options: crate::opc::InventoryStartOptions,
         ) -> anyhow::Result<InventoryHandle> {
             Err(anyhow::anyhow!("inventory unused in browse tests"))
         }
@@ -1136,7 +1136,18 @@ mod tests {
                 .is_ok()
         );
         assert!(client.close_browse_session("native").await.is_ok());
-        assert!(client.start_inventory("S", 10).await.is_err());
+        assert!(
+            client
+                .start_inventory(
+                    "S",
+                    crate::opc::InventoryStartOptions {
+                        batch_size: 10,
+                        max_entries: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
         assert!(
             client
                 .read_tag_values("S", vec![])

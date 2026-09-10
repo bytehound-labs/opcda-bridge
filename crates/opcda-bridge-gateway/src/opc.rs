@@ -169,6 +169,12 @@ pub struct InventoryHandle {
     pub control: Arc<dyn InventoryControl>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryStartOptions {
+    pub batch_size: u32,
+    pub max_entries: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagValue {
     pub tag_id: String,
@@ -213,7 +219,7 @@ pub trait OpcClient: Send + Sync + 'static {
     async fn start_inventory(
         &self,
         server: &str,
-        batch_size: u32,
+        options: InventoryStartOptions,
     ) -> anyhow::Result<InventoryHandle>;
     async fn read_tag_values(
         &self,

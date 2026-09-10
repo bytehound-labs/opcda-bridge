@@ -131,6 +131,10 @@ Native inventory batches are bounded to 1,000 entries by the OPC DA client contr
 Native inventory slicing and SQLite commit batching are independently bounded, and adaptive
 controller decisions update the native slice batch size and pacing interval; the commit interval
 provides a time limit for low-volume inventories.
+For bounded lifecycle experiments, `index.diagnostic_max_entries` can request an explicit
+entry cap. Reaching that cap emits a terminal truncated event, promotes the bounded generation,
+and leaves it searchable with a warning in status. The setting is unset by default and is not a
+production namespace limit; remove it before normal indexing.
 Runtime status includes rolling
 foreground latency/error/quality metrics, host/storage availability, and persisted scheduler
 backoff diagnostics.

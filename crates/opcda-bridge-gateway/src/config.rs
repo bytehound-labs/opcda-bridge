@@ -105,6 +105,9 @@ pub struct IndexConfig {
     pub inventory_batch_size: Option<u32>,
     /// Maximum entries committed to SQLite in one transaction.
     pub commit_batch_size: Option<u32>,
+    /// Diagnostic-only cap for one complete inventory build. When set, the
+    /// resulting truncated generation is promoted with a warning.
+    pub diagnostic_max_entries: Option<u64>,
     /// Maximum time pending entries may wait before an SQLite commit.
     pub commit_interval_ms: Option<u64>,
     pub batch_size: Option<u32>,
@@ -153,6 +156,7 @@ pub struct ResolvedIndexConfig {
     pub schedule_jitter_seconds: u64,
     pub inventory_batch_size: u32,
     pub commit_batch_size: u32,
+    pub diagnostic_max_entries: Option<u64>,
     pub commit_interval_ms: u64,
     pub batch_size: u32,
     pub item_rate_limit: u32,
@@ -277,6 +281,7 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
             .or(config.batch_size)
             .unwrap_or(DEFAULT_INDEX_COMMIT_BATCH_SIZE)
             .max(1),
+        diagnostic_max_entries: config.diagnostic_max_entries,
         commit_interval_ms: config
             .commit_interval_ms
             .unwrap_or(DEFAULT_INDEX_COMMIT_INTERVAL_MS)
@@ -603,6 +608,7 @@ mod tests {
             schedule_jitter_seconds: Some(8),
             inventory_batch_size: Some(11),
             commit_batch_size: Some(12),
+            diagnostic_max_entries: Some(1_234),
             commit_interval_ms: Some(13),
             batch_size: Some(0),
             item_rate_limit: Some(0),
@@ -642,6 +648,7 @@ mod tests {
         assert_eq!(resolved.schedule_jitter_seconds, 8);
         assert_eq!(resolved.inventory_batch_size, 11);
         assert_eq!(resolved.commit_batch_size, 12);
+        assert_eq!(resolved.diagnostic_max_entries, Some(1_234));
         assert_eq!(resolved.commit_interval_ms, 13);
         assert_eq!(resolved.batch_size, 1);
         assert_eq!(resolved.item_rate_limit, 0);
@@ -682,6 +689,7 @@ mod tests {
         assert_eq!(resolved.schedule_jitter_seconds, 21_600);
         assert_eq!(resolved.inventory_batch_size, 100);
         assert_eq!(resolved.commit_batch_size, 100);
+        assert_eq!(resolved.diagnostic_max_entries, None);
         assert_eq!(resolved.commit_interval_ms, 1_000);
         assert_eq!(resolved.sentinel_tag, None);
         assert_eq!(resolved.operation_timeout_seconds, 30);
@@ -718,6 +726,7 @@ mod tests {
             schedule_jitter_seconds: Some(120),
             inventory_batch_size: Some(20),
             commit_batch_size: Some(7),
+            diagnostic_max_entries: Some(99),
             commit_interval_ms: Some(250),
             batch_size: Some(10),
             item_rate_limit: Some(20),

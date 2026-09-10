@@ -455,6 +455,7 @@ schedules only enrolled servers with a successful active generation and
 | Inventory slice batch      | `index.inventory_batch_size`          | `100` entries (max `1000`)     |
 | SQLite commit batch        | `index.commit_batch_size`             | `100` entries                  |
 | SQLite commit interval     | `index.commit_interval_ms`            | `1000` ms                      |
+| Diagnostic inventory cap   | `index.diagnostic_max_entries`        | Unset                          |
 | Legacy batch size fallback | `index.batch_size`                    | `100` (max `1000`)             |
 | Average item rate          | `index.item_rate_limit`               | `250` items/second             |
 | Burst allowance            | `index.burst_size`                    | `100` items                    |
@@ -474,6 +475,12 @@ schedules only enrolled servers with a successful active generation and
 | Query-cache capacity       | `index.query_cache_capacity`          | `256` entries                  |
 | Start paused               | `index.paused`                        | `false`                        |
 | Maximum indexed results    | `index.max_results`                   | `50`                           |
+
+`index.diagnostic_max_entries` is intended only for bounded lifecycle experiments. When the
+native inventory reaches the configured cap, the gateway accepts the explicit truncated terminal
+event, promotes the bounded generation, and reports the cap as a warning while keeping that
+partial generation searchable. Leave it unset for normal indexing; it is not a production
+namespace limit.
 
 `index.enabled` is an emergency switch for startup and scheduled work only. Manual status,
 browse, search, refresh, and read operations remain available when it is false. Per-server

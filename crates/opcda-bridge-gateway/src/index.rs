@@ -8,7 +8,8 @@ use crate::controller::{
 use crate::opc::{
     BrowseSource, InventoryCompleted, InventoryControl, InventoryEntry, InventoryEvent,
     InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress, InventorySliceBackend,
-    InventorySliceObservation, MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization, OpcClient,
+    InventorySliceObservation, InventoryStartOptions, MAX_NATIVE_INVENTORY_BATCH_SIZE,
+    NamespaceOrganization, OpcClient,
 };
 use chrono::{DateTime, Local, Timelike};
 use fs2::FileExt;
@@ -394,18 +395,26 @@ impl BuildRunState {
         }
     }
 
-    fn record_completion(&mut self, result: InventoryCompleted, elapsed: Duration) {
+    fn record_completion(
+        &mut self,
+        result: InventoryCompleted,
+        elapsed: Duration,
+        allow_truncated: bool,
+    ) {
         self.terminal = true;
         self.telemetry.record_terminal_event(elapsed);
-        self.completed = result.complete;
+        self.completed = result.complete || (allow_truncated && result.truncated);
         self.cancelled = result.cancelled;
         self.completion_profile = Some((result.organization, result.source));
         if result.truncated {
-            self.failed = Some(
-                result
-                    .warning
-                    .unwrap_or_else(|| "inventory was truncated".to_string()),
-            );
+            let warning = result
+                .warning
+                .unwrap_or_else(|| "inventory was truncated".to_string());
+            if allow_truncated && !result.cancelled {
+                self.completion_warning = Some(warning);
+            } else if !result.cancelled {
+                self.failed = Some(warning);
+            }
         } else {
             self.completion_warning = result.warning;
         }
@@ -4243,8 +4252,13 @@ impl<C: OpcClient> IndexManager<C> {
         match self
             .with_opc_timeout(
                 "start inventory",
-                self.client
-                    .start_inventory(server, initial_limits.batch_size),
+                self.client.start_inventory(
+                    server,
+                    InventoryStartOptions {
+                        batch_size: initial_limits.batch_size,
+                        max_entries: self.settings.diagnostic_max_entries,
+                    },
+                ),
             )
             .await
         {
@@ -5151,7 +5165,11 @@ impl<C: OpcClient> IndexManager<C> {
                 self.handle_slice_event(server, generation, control, state, slice)
             }
             Ok(InventoryEvent::Completed(result)) => {
-                state.record_completion(result, build_started.elapsed());
+                state.record_completion(
+                    result,
+                    build_started.elapsed(),
+                    self.settings.diagnostic_max_entries.is_some(),
+                );
                 BuildEventOutcome::Stop
             }
             Err(error) => {
@@ -6831,8 +6849,8 @@ mod tests {
     use super::*;
     use crate::opc::{
         BrowseCapabilities, BrowsePage, InventoryCompleted, InventoryEntry, InventoryEvent,
-        InventorySliceBackend, InventorySliceObservation, InventoryStream, OpcValue, TagValue,
-        WriteResult,
+        InventorySliceBackend, InventorySliceObservation, InventoryStartOptions, InventoryStream,
+        OpcValue, TagValue, WriteResult,
     };
     use crate::test_support::MockOpcClient;
     use chrono::TimeZone;
@@ -6853,6 +6871,7 @@ mod tests {
             schedule_jitter_seconds: 0,
             inventory_batch_size: 100,
             commit_batch_size: 100,
+            diagnostic_max_entries: None,
             commit_interval_ms: 1_000,
             batch_size: 100,
             item_rate_limit: 0,
@@ -11174,6 +11193,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn configured_inventory_cap_promotes_truncated_generation() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(LifecycleClient::new(
+            vec![Ok(handle_with_control(
+                VecDeque::from([
+                    Ok(InventoryEvent::Entry(inventory_entry("Capped", "S.Capped"))),
+                    Ok(InventoryEvent::Completed(InventoryCompleted {
+                        complete: false,
+                        cancelled: false,
+                        truncated: true,
+                        warning: Some("inventory entry limit reached".into()),
+                        organization: NamespaceOrganization::Hierarchical,
+                        source: BrowseSource::Da2,
+                    })),
+                ]),
+                Arc::new(RecordingInventoryControl::default()),
+            ))],
+            vec![],
+        ));
+        let mut config = settings(directory.path().join("index.sqlite3"));
+        config.diagnostic_max_entries = Some(1);
+        let manager = Arc::new(IndexManager::new(client, config));
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Ready).await;
+
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.active_generation, 1);
+        assert_eq!(status.entry_count, 1);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("inventory entry limit reached")
+        );
+        assert_eq!(
+            manager
+                .search("S", "capped", 3, 10)
+                .await
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+        assert!(manager.active_builds.lock().unwrap().is_empty());
+        assert!(manager.coordination.build_owners.lock().unwrap().is_empty());
+        assert!(manager.build_locks.lock().unwrap().is_empty());
+        assert!(build_lock_path(&directory.path().join("index.sqlite3"), "S").exists());
+    }
+
+    #[tokio::test]
+    async fn configured_zero_inventory_cap_is_forwarded_without_being_treated_as_unset() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(MockOpcClient::default());
+        let mut config = settings(directory.path().join("index.sqlite3"));
+        config.diagnostic_max_entries = Some(0);
+        let manager = Arc::new(IndexManager::new(Arc::clone(&client), config));
+
+        manager.refresh("S", true).await.unwrap();
+        wait_for_state(&manager, "S", IndexState::Ready).await;
+
+        assert_eq!(
+            client.inventory_max_entries.lock().unwrap().as_slice(),
+            &[Some(0)]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn build_terminal_error_and_cancellation_paths_preserve_consistent_status() {
         async fn run_case(
             events: VecDeque<anyhow::Result<InventoryEvent>>,
@@ -11231,6 +11316,20 @@ mod tests {
                 cancelled: true,
                 truncated: false,
                 warning: None,
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da2,
+            }))]),
+            vec![],
+            IndexState::NotIndexed,
+            None,
+        )
+        .await;
+        run_case(
+            VecDeque::from([Ok(InventoryEvent::Completed(InventoryCompleted {
+                complete: false,
+                cancelled: true,
+                truncated: true,
+                warning: Some("inventory entry limit reached before cancellation".into()),
                 organization: NamespaceOrganization::Hierarchical,
                 source: BrowseSource::Da2,
             }))]),
@@ -15178,7 +15277,7 @@ mod tests {
         async fn start_inventory(
             &self,
             _server: &str,
-            _batch_size: u32,
+            _options: InventoryStartOptions,
         ) -> anyhow::Result<InventoryHandle> {
             self.inventory_start_count.fetch_add(1, Ordering::Relaxed);
             let gate = self.inventory_gate.lock().unwrap().clone();

@@ -5,7 +5,8 @@
 use crate::opc::{
     BrowseCapabilities, BrowsePage, BrowseSource, InventoryCompleted, InventoryControl,
     InventoryEntry, InventoryEvent, InventoryHandle, InventoryNodeKind, InventoryProgress,
-    InventoryStream, NamespaceOrganization, OpcClient, OpcValue, TagValue, WriteResult,
+    InventoryStartOptions, InventoryStream, NamespaceOrganization, OpcClient, OpcValue, TagValue,
+    WriteResult,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -41,6 +42,7 @@ pub(crate) struct MockOpcClient {
     pub(crate) inventory_pacing_ns: Arc<AtomicUsize>,
     pub(crate) inventory_item_rate: Arc<AtomicUsize>,
     pub(crate) inventory_batch_size: Arc<AtomicUsize>,
+    pub(crate) inventory_max_entries: Arc<Mutex<Vec<Option<u64>>>>,
 }
 
 impl Default for MockOpcClient {
@@ -104,6 +106,7 @@ impl Default for MockOpcClient {
             inventory_pacing_ns: Arc::new(AtomicUsize::new(0)),
             inventory_item_rate: Arc::new(AtomicUsize::new(0)),
             inventory_batch_size: Arc::new(AtomicUsize::new(0)),
+            inventory_max_entries: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -168,9 +171,15 @@ impl OpcClient for MockOpcClient {
     async fn start_inventory(
         &self,
         _server: &str,
-        _batch_size: u32,
+        options: InventoryStartOptions,
     ) -> anyhow::Result<InventoryHandle> {
         self.inventory_start_count.fetch_add(1, Ordering::Relaxed);
+        self.inventory_batch_size
+            .store(options.batch_size as usize, Ordering::Release);
+        self.inventory_max_entries
+            .lock()
+            .unwrap()
+            .push(options.max_entries);
         let events = self
             .inventory_events
             .lock()
@@ -279,7 +288,16 @@ fn test_mock_opc_client_default() {
 #[tokio::test]
 async fn test_mock_inventory_stream_and_control() {
     let mock = MockOpcClient::default();
-    let mut handle = mock.start_inventory("S", 10).await.unwrap();
+    let mut handle = mock
+        .start_inventory(
+            "S",
+            InventoryStartOptions {
+                batch_size: 10,
+                max_entries: None,
+            },
+        )
+        .await
+        .unwrap();
 
     handle.control.pause();
     assert!(mock.inventory_paused.load(Ordering::Acquire));
