@@ -46,6 +46,9 @@ without durable state. Capability responses advertise indexed-search support, it
 the configured result limit, and the server's index state.
 Indexed results contain exact ItemIDs and breadcrumb labels, never browse-session node keys.
 Refreshes run asynchronously, and gateway shutdown cancels active indexing before the process exits.
+After an inventory reaches a terminal event, the gateway settles and drops the native inventory
+stream before it records the generation outcome or releases build ownership and the file lock.
+This keeps a subsequent build from starting while the previous native worker is still joining.
 Foreground operations are reference-counted per server; indexing stays paused while any foreground
 user is active and remains paused through the configured quiet period after the last foreground
 operation ends.
