@@ -7,7 +7,7 @@ use crate::controller::{
 };
 use crate::opc::{
     BrowseSource, InventoryCompleted, InventoryControl, InventoryEntry, InventoryEvent,
-    InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress,
+    InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress, InventorySliceBackend,
     InventorySliceObservation, InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE,
     NamespaceOrganization, OpcClient,
 };
@@ -259,6 +259,7 @@ struct HealthSentinelObservation {
 struct BuildRunState {
     pending: Vec<InventoryEntry>,
     last_progress: InventoryProgress,
+    telemetry: BuildTelemetry,
     completed: bool,
     cancelled: bool,
     failed: Option<String>,
@@ -267,12 +268,114 @@ struct BuildRunState {
     terminal: bool,
     accounted_active_time_ms: u64,
     persisted_item_count: u64,
+    drained_event_count: u64,
+    received_entry_count: u64,
     rate_limiter: ItemRateLimiter,
     controller: Option<AdaptiveIndexController>,
     effective_duty_cycle_percent: u8,
     last_commit_at: Instant,
     next_health_probe: Instant,
     health_backoff: Duration,
+}
+
+#[derive(Debug, Default)]
+struct BuildTelemetry {
+    slice_count: u64,
+    slice_nodes_returned: u64,
+    slice_native_operations: u64,
+    slice_elapsed_ms: u64,
+    slice_elapsed_max_ms: u64,
+    slice_entries_delta: u64,
+    slice_entries_delta_max: u64,
+    slice_unique_items_delta: u64,
+    da2_slices: u64,
+    da3_slices: u64,
+    last_slice_entries_seen: u64,
+    last_slice_unique_items: u64,
+    progress_events: u64,
+    item_entries: u64,
+    branch_and_item_entries: u64,
+    commit_attempts: u64,
+    commit_failures: u64,
+    committed_entries: u64,
+    commit_elapsed_ms: u64,
+    commit_elapsed_max_ms: u64,
+    commit_latency_samples_ms: VecDeque<u64>,
+    terminal_event_ms: Option<u64>,
+}
+
+impl BuildTelemetry {
+    fn record_entry(&mut self, kind: InventoryNodeKind) {
+        match kind {
+            InventoryNodeKind::Item => self.item_entries += 1,
+            InventoryNodeKind::BranchAndItem => self.branch_and_item_entries += 1,
+        }
+    }
+
+    fn record_progress(&mut self) {
+        self.progress_events += 1;
+    }
+
+    fn record_slice(&mut self, slice: &InventorySliceObservation) {
+        let entries_delta = slice
+            .entries_seen
+            .saturating_sub(self.last_slice_entries_seen);
+        let unique_items_delta = slice
+            .unique_items
+            .saturating_sub(self.last_slice_unique_items);
+        self.last_slice_entries_seen = slice.entries_seen;
+        self.last_slice_unique_items = slice.unique_items;
+        self.slice_count += 1;
+        self.slice_nodes_returned += slice.nodes_returned;
+        self.slice_native_operations += slice.native_operations;
+        self.slice_elapsed_ms += slice.elapsed_ms;
+        self.slice_elapsed_max_ms = self.slice_elapsed_max_ms.max(slice.elapsed_ms);
+        self.slice_entries_delta += entries_delta;
+        self.slice_entries_delta_max = self.slice_entries_delta_max.max(entries_delta);
+        self.slice_unique_items_delta += unique_items_delta;
+        match slice.backend {
+            InventorySliceBackend::Da2 => self.da2_slices += 1,
+            InventorySliceBackend::Da3 => self.da3_slices += 1,
+        }
+    }
+
+    fn record_commit(&mut self, inserted: u64, elapsed: Duration, failed: bool) {
+        let elapsed_ms = elapsed.as_millis().try_into().unwrap_or(u64::MAX);
+        self.commit_attempts += 1;
+        self.commit_failures += u64::from(failed);
+        self.committed_entries += inserted;
+        self.commit_elapsed_ms = self.commit_elapsed_ms.saturating_add(elapsed_ms);
+        self.commit_elapsed_max_ms = self.commit_elapsed_max_ms.max(elapsed_ms);
+        if self.commit_latency_samples_ms.len() == 256 {
+            self.commit_latency_samples_ms.pop_front();
+        }
+        self.commit_latency_samples_ms.push_back(elapsed_ms);
+    }
+
+    fn commit_latency_percentile(&self, percentile_value: usize) -> Option<u64> {
+        let mut values = self
+            .commit_latency_samples_ms
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        percentile(&values, percentile_value)
+    }
+
+    fn record_terminal_event(&mut self, elapsed: Duration) {
+        self.terminal_event_ms = Some(elapsed.as_millis().try_into().unwrap_or(u64::MAX));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalBuildCounts {
+    last_progress_entries_seen: u64,
+    last_progress_unique_items: u64,
+    persisted_items: u64,
+    drained_events: u64,
+    received_entry_events: u64,
+    pending_entries: u64,
+    pending_unique_items: u64,
 }
 
 impl BuildRunState {
@@ -288,6 +391,7 @@ impl BuildRunState {
                 items_per_second: 0.0,
                 estimated_remaining_ms: None,
             },
+            telemetry: BuildTelemetry::default(),
             completed: false,
             cancelled: false,
             failed: None,
@@ -296,6 +400,8 @@ impl BuildRunState {
             terminal: false,
             accounted_active_time_ms: 0,
             persisted_item_count: 0,
+            drained_event_count: 0,
+            received_entry_count: 0,
             rate_limiter: ItemRateLimiter::new(settings.item_rate_limit, settings.burst_size),
             controller,
             effective_duty_cycle_percent: settings.duty_cycle_percent,
@@ -305,8 +411,9 @@ impl BuildRunState {
         }
     }
 
-    fn record_completion(&mut self, result: InventoryCompleted) {
+    fn record_completion(&mut self, result: InventoryCompleted, elapsed: Duration) {
         self.terminal = true;
+        self.telemetry.record_terminal_event(elapsed);
         self.completed = result.complete;
         self.cancelled = result.cancelled;
         self.completion_profile = Some((result.organization, result.source));
@@ -318,6 +425,24 @@ impl BuildRunState {
             );
         } else {
             self.completion_warning = result.warning;
+        }
+    }
+
+    fn terminal_counts(&self) -> TerminalBuildCounts {
+        let pending_unique_items = self
+            .pending
+            .iter()
+            .map(|entry| entry.item_id.as_str())
+            .collect::<HashSet<_>>()
+            .len() as u64;
+        TerminalBuildCounts {
+            last_progress_entries_seen: self.last_progress.entries_seen,
+            last_progress_unique_items: self.last_progress.unique_items,
+            persisted_items: self.persisted_item_count,
+            drained_events: self.drained_event_count,
+            received_entry_events: self.received_entry_count,
+            pending_entries: self.pending.len() as u64,
+            pending_unique_items,
         }
     }
 }
@@ -5693,6 +5818,7 @@ impl<C: OpcClient> IndexManager<C> {
                 &mut handle,
                 &maintenance_windows,
                 &mut state,
+                build_started,
             )
             .await;
         let control = Arc::clone(&handle.control);
@@ -5720,6 +5846,7 @@ impl<C: OpcClient> IndexManager<C> {
         handle: &mut InventoryHandle,
         maintenance_windows: &[MaintenanceWindow],
         state: &mut BuildRunState,
+        build_started: Instant,
     ) -> BuildLoopOutcome {
         loop {
             if let Some(error) = self.commit_pending_if_due(server, generation, state) {
@@ -5759,8 +5886,16 @@ impl<C: OpcClient> IndexManager<C> {
             let Some(event) = event else {
                 break;
             };
+            state.drained_event_count = state.drained_event_count.saturating_add(1);
             match self
-                .handle_inventory_event(server, generation, &handle.control, state, event)
+                .handle_inventory_event(
+                    server,
+                    generation,
+                    &handle.control,
+                    state,
+                    build_started,
+                    event,
+                )
                 .await
             {
                 BuildEventOutcome::Continue => {}
@@ -5791,7 +5926,7 @@ impl<C: OpcClient> IndexManager<C> {
             state.failed = Some("inventory stream ended before completion".to_string());
         }
         if !state.pending.is_empty() && state.failed.is_none() {
-            match self.commit_pending_entries(server, generation, &mut state.pending) {
+            match self.commit_pending_entries_with_telemetry(server, generation, state) {
                 Ok(inserted) => {
                     state.persisted_item_count =
                         state.persisted_item_count.saturating_add(inserted);
@@ -5854,14 +5989,18 @@ impl<C: OpcClient> IndexManager<C> {
         generation: u64,
         control: &Arc<dyn InventoryControl>,
         state: &mut BuildRunState,
+        build_started: Instant,
         event: anyhow::Result<InventoryEvent>,
     ) -> BuildEventOutcome {
         match event {
             Ok(InventoryEvent::Entry(entry)) => {
+                state.received_entry_count = state.received_entry_count.saturating_add(1);
+                state.telemetry.record_entry(entry.kind);
                 self.handle_entry_event(server, generation, control, state, entry)
                     .await
             }
             Ok(InventoryEvent::Progress(progress)) => {
+                state.telemetry.record_progress();
                 self.handle_progress_event(server, generation, control, state, progress)
                     .await
             }
@@ -5869,7 +6008,7 @@ impl<C: OpcClient> IndexManager<C> {
                 self.handle_slice_event(server, generation, control, state, slice)
             }
             Ok(InventoryEvent::Completed(result)) => {
-                state.record_completion(result);
+                state.record_completion(result, build_started.elapsed());
                 BuildEventOutcome::Stop
             }
             Err(error) => {
@@ -5903,7 +6042,7 @@ impl<C: OpcClient> IndexManager<C> {
         if state.pending.len() < self.settings.commit_batch_size as usize {
             return BuildEventOutcome::Continue;
         }
-        match self.commit_pending_entries(server, generation, &mut state.pending) {
+        match self.commit_pending_entries_with_telemetry(server, generation, state) {
             Ok(inserted) => {
                 state.persisted_item_count = state.persisted_item_count.saturating_add(inserted);
                 state.last_commit_at = Instant::now();
@@ -5969,6 +6108,7 @@ impl<C: OpcClient> IndexManager<C> {
         state: &mut BuildRunState,
         slice: InventorySliceObservation,
     ) -> BuildEventOutcome {
+        state.telemetry.record_slice(&slice);
         let Some(controller) = state.controller.as_mut() else {
             return BuildEventOutcome::Continue;
         };
@@ -6026,7 +6166,7 @@ impl<C: OpcClient> IndexManager<C> {
         {
             return None;
         }
-        match self.commit_pending_entries(server, generation, &mut state.pending) {
+        match self.commit_pending_entries_with_telemetry(server, generation, state) {
             Ok(inserted) => {
                 state.persisted_item_count = state.persisted_item_count.saturating_add(inserted);
                 state.last_commit_at = Instant::now();
@@ -6064,6 +6204,25 @@ impl<C: OpcClient> IndexManager<C> {
         state: BuildRunState,
         outcome: BuildLoopOutcome,
     ) {
+        let completed =
+            state.completed && !state.cancelled && !context.control_was_cancelled_before_cleanup;
+        let outcome_label = match &outcome {
+            BuildLoopOutcome::Failed(_) => "failed",
+            BuildLoopOutcome::Finished if completed => "completed",
+            BuildLoopOutcome::Finished => "cancelled",
+        };
+        let error = match &outcome {
+            BuildLoopOutcome::Failed(error) => Some(error.as_str()),
+            BuildLoopOutcome::Finished => None,
+        };
+        self.log_build_telemetry(
+            context.server,
+            context.generation,
+            context.build_started,
+            &state,
+            outcome_label,
+            error,
+        );
         match outcome {
             BuildLoopOutcome::Failed(error) => {
                 self.finish_failed_build(
@@ -6075,11 +6234,7 @@ impl<C: OpcClient> IndexManager<C> {
                     error,
                 );
             }
-            BuildLoopOutcome::Finished
-                if state.completed
-                    && !state.cancelled
-                    && !context.control_was_cancelled_before_cleanup =>
-            {
+            BuildLoopOutcome::Finished if completed => {
                 self.finish_completed_build(
                     context.server,
                     context.generation,
@@ -6100,6 +6255,59 @@ impl<C: OpcClient> IndexManager<C> {
                 );
             }
         }
+    }
+
+    fn log_build_telemetry(
+        &self,
+        server: &str,
+        generation: u64,
+        build_started: Instant,
+        state: &BuildRunState,
+        outcome: &str,
+        error: Option<&str>,
+    ) {
+        let telemetry = &state.telemetry;
+        let counts = state.terminal_counts();
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server,
+            generation,
+            outcome,
+            error = ?error,
+            duration_ms = build_started.elapsed().as_millis() as u64,
+            terminal_event_ms = ?telemetry.terminal_event_ms,
+            last_progress_entries_seen = counts.last_progress_entries_seen,
+            last_progress_unique_items = counts.last_progress_unique_items,
+            persisted_items = counts.persisted_items,
+            drained_events = counts.drained_events,
+            received_entry_events = counts.received_entry_events,
+            pending_entries = counts.pending_entries,
+            pending_unique_items = counts.pending_unique_items,
+            active_time_ms = state.last_progress.active_time_ms,
+            paused_time_ms = state.last_progress.paused_time_ms,
+            progress_events = telemetry.progress_events,
+            slice_count = telemetry.slice_count,
+            slice_nodes_returned = telemetry.slice_nodes_returned,
+            slice_native_operations = telemetry.slice_native_operations,
+            slice_elapsed_ms = telemetry.slice_elapsed_ms,
+            slice_elapsed_max_ms = telemetry.slice_elapsed_max_ms,
+            slice_entries_delta = telemetry.slice_entries_delta,
+            slice_entries_delta_max = telemetry.slice_entries_delta_max,
+            slice_unique_items_delta = telemetry.slice_unique_items_delta,
+            da2_slices = telemetry.da2_slices,
+            da3_slices = telemetry.da3_slices,
+            item_entries = telemetry.item_entries,
+            branch_and_item_entries = telemetry.branch_and_item_entries,
+            commit_attempts = telemetry.commit_attempts,
+            commit_failures = telemetry.commit_failures,
+            committed_entries = telemetry.committed_entries,
+            commit_elapsed_ms = telemetry.commit_elapsed_ms,
+            commit_elapsed_max_ms = telemetry.commit_elapsed_max_ms,
+            commit_latency_p50_ms = ?telemetry.commit_latency_percentile(50),
+            commit_latency_p95_ms = ?telemetry.commit_latency_percentile(95),
+            "namespace index build telemetry"
+        );
     }
 
     fn finish_failed_build(
@@ -6163,6 +6371,7 @@ impl<C: OpcClient> IndexManager<C> {
         completion_profile: Option<(NamespaceOrganization, BrowseSource)>,
         completion_warning: Option<&str>,
     ) -> anyhow::Result<()> {
+        let promotion_started = Instant::now();
         self.mark_promoting(server)?;
         let completed_at = timestamp_now();
         let result = self.with_database_write(|db| {
@@ -6176,6 +6385,15 @@ impl<C: OpcClient> IndexManager<C> {
             )
         });
         self.clear_promoting(server);
+        tracing::info!(
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server,
+            generation,
+            promotion_duration_ms = promotion_started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "namespace index generation promotion finished"
+        );
         result
     }
 
@@ -6192,15 +6410,21 @@ impl<C: OpcClient> IndexManager<C> {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear_server(server);
         }
+        let counts = state.terminal_counts();
         tracing::info!(
             process_id = std::process::id(),
             database = %self.settings.database_path.display(),
             server = %server,
             generation,
             duration_ms = build_started.elapsed().as_millis() as u64,
-            entries_seen = state.last_progress.entries_seen,
-            unique_items = state.last_progress.unique_items,
-            persisted_items = state.persisted_item_count,
+            last_progress_entries_seen = counts.last_progress_entries_seen,
+            last_progress_unique_items = counts.last_progress_unique_items,
+            persisted_items = counts.persisted_items,
+            drained_events = counts.drained_events,
+            received_entry_events = counts.received_entry_events,
+            pending_entries = counts.pending_entries,
+            pending_unique_items = counts.pending_unique_items,
+            committed_entries = state.telemetry.committed_entries,
             "namespace index build completed"
         );
         if let Some(warning) = state.completion_warning {
@@ -6281,6 +6505,21 @@ impl<C: OpcClient> IndexManager<C> {
         if result.is_ok() {
             pending.clear();
         }
+        result
+    }
+
+    fn commit_pending_entries_with_telemetry(
+        &self,
+        server: &str,
+        generation: u64,
+        state: &mut BuildRunState,
+    ) -> anyhow::Result<u64> {
+        let started = Instant::now();
+        let result = self.commit_pending_entries(server, generation, &mut state.pending);
+        let inserted = result.as_ref().ok().copied().unwrap_or(0);
+        state
+            .telemetry
+            .record_commit(inserted, started.elapsed(), result.is_err());
         result
     }
 
@@ -9070,6 +9309,145 @@ mod tests {
         assert_eq!(SearchMode::try_from(2), Ok(SearchMode::Prefix));
         assert_eq!(SearchMode::try_from(3), Ok(SearchMode::Contains));
         assert_eq!(SearchMode::try_from(4), Err(()));
+    }
+
+    #[test]
+    fn build_telemetry_aggregates_slices_entries_and_commits() {
+        let mut telemetry = BuildTelemetry::default();
+        assert_eq!(telemetry.commit_latency_percentile(50), None);
+        telemetry.record_progress();
+        telemetry.record_entry(InventoryNodeKind::Item);
+        telemetry.record_entry(InventoryNodeKind::BranchAndItem);
+        telemetry.record_slice(&InventorySliceObservation {
+            sequence: 1,
+            backend: InventorySliceBackend::Da2,
+            nodes_returned: 10,
+            has_more: true,
+            native_operations: 4,
+            elapsed_ms: 25,
+            entries_seen: 10,
+            unique_items: 8,
+        });
+        telemetry.record_slice(&InventorySliceObservation {
+            sequence: 2,
+            backend: InventorySliceBackend::Da3,
+            nodes_returned: 5,
+            has_more: false,
+            native_operations: 2,
+            elapsed_ms: 40,
+            entries_seen: 14,
+            unique_items: 11,
+        });
+        telemetry.record_commit(10, Duration::from_millis(7), false);
+        telemetry.record_commit(0, Duration::from_millis(12), true);
+        telemetry.record_terminal_event(Duration::from_millis(123));
+
+        assert_eq!(telemetry.progress_events, 1);
+        assert_eq!(telemetry.item_entries, 1);
+        assert_eq!(telemetry.branch_and_item_entries, 1);
+        assert_eq!(telemetry.slice_count, 2);
+        assert_eq!(telemetry.slice_nodes_returned, 15);
+        assert_eq!(telemetry.slice_native_operations, 6);
+        assert_eq!(telemetry.slice_elapsed_ms, 65);
+        assert_eq!(telemetry.slice_elapsed_max_ms, 40);
+        assert_eq!(telemetry.slice_entries_delta, 14);
+        assert_eq!(telemetry.slice_entries_delta_max, 10);
+        assert_eq!(telemetry.slice_unique_items_delta, 11);
+        assert_eq!(telemetry.da2_slices, 1);
+        assert_eq!(telemetry.da3_slices, 1);
+        assert_eq!(telemetry.commit_attempts, 2);
+        assert_eq!(telemetry.commit_failures, 1);
+        assert_eq!(telemetry.committed_entries, 10);
+        assert_eq!(telemetry.commit_elapsed_ms, 19);
+        assert_eq!(telemetry.commit_elapsed_max_ms, 12);
+        assert_eq!(telemetry.commit_latency_percentile(50), Some(7));
+        assert_eq!(telemetry.commit_latency_percentile(95), Some(12));
+        assert_eq!(telemetry.terminal_event_ms, Some(123));
+    }
+
+    #[test]
+    fn build_telemetry_keeps_only_the_latest_commit_latency_samples() {
+        let mut telemetry = BuildTelemetry::default();
+        for elapsed_ms in 0..=256 {
+            telemetry.record_commit(0, Duration::from_millis(elapsed_ms), false);
+        }
+
+        assert_eq!(telemetry.commit_latency_samples_ms.len(), 256);
+        assert_eq!(telemetry.commit_latency_samples_ms.front(), Some(&1));
+        assert_eq!(telemetry.commit_latency_samples_ms.back(), Some(&256));
+        assert_eq!(telemetry.commit_latency_percentile(50), Some(128));
+    }
+
+    #[test]
+    fn terminal_counts_distinguish_progress_snapshot_from_persisted_rows() {
+        let config = settings(PathBuf::from("test-index.sqlite3"));
+        let mut state = BuildRunState::new(&config, None);
+        state.last_progress = InventoryProgress {
+            entries_seen: 11,
+            unique_items: 9,
+            ..zero_progress()
+        };
+        state.persisted_item_count = 10;
+        state.drained_event_count = 4;
+        state.received_entry_count = 3;
+        state.pending = vec![
+            inventory_entry("Pending A", "A.pending"),
+            inventory_entry("Pending A duplicate", "A.pending"),
+            inventory_entry("Pending B", "B.pending"),
+        ];
+
+        assert_eq!(
+            state.terminal_counts(),
+            TerminalBuildCounts {
+                last_progress_entries_seen: 11,
+                last_progress_unique_items: 9,
+                persisted_items: 10,
+                drained_events: 4,
+                received_entry_events: 3,
+                pending_entries: 3,
+                pending_unique_items: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_counts_reconcile_entries_drained_before_stream_termination() {
+        let manager = IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(PathBuf::from(":memory:")),
+        );
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        let mut handle = InventoryHandle {
+            stream: Box::new(VecInventoryStream {
+                events: VecDeque::from([
+                    Ok(InventoryEvent::Entry(inventory_entry("A", "A.item"))),
+                    Ok(InventoryEvent::Progress(zero_progress())),
+                    Ok(InventoryEvent::Entry(inventory_entry("B", "B.item"))),
+                ]),
+            }),
+            control,
+        };
+        let mut state = BuildRunState::new(&settings(PathBuf::from(":memory:")), None);
+
+        let outcome = manager
+            .run_build_loop("S", 1, &mut handle, &[], &mut state, Instant::now())
+            .await;
+
+        assert!(matches!(
+            outcome,
+            BuildLoopOutcome::Failed(error)
+                if error == "inventory stream ended before completion"
+        ));
+        let counts = state.terminal_counts();
+        assert_eq!(counts.drained_events, 3);
+        assert_eq!(counts.received_entry_events, 2);
+        assert_eq!(counts.persisted_items, 0);
+        assert_eq!(counts.pending_entries, 2);
+        assert_eq!(counts.pending_unique_items, 2);
+        assert_eq!(
+            counts.received_entry_events,
+            counts.persisted_items + counts.pending_entries
+        );
         assert_eq!(
             namespace_string(NamespaceOrganization::Unspecified),
             "unspecified"
@@ -14542,7 +14920,7 @@ mod tests {
         };
 
         let outcome = manager
-            .run_build_loop("S", 1, &mut handle, &[], &mut state)
+            .run_build_loop("S", 1, &mut handle, &[], &mut state, Instant::now())
             .await;
 
         match outcome {
@@ -14571,7 +14949,7 @@ mod tests {
         };
 
         let outcome = manager
-            .run_build_loop("S", 1, &mut handle, &[], &mut state)
+            .run_build_loop("S", 1, &mut handle, &[], &mut state, Instant::now())
             .await;
         assert!(matches!(
             outcome,
@@ -14597,7 +14975,7 @@ mod tests {
         };
 
         let outcome = manager
-            .run_build_loop("S", 1, &mut handle, &[], &mut state)
+            .run_build_loop("S", 1, &mut handle, &[], &mut state, Instant::now())
             .await;
         assert!(matches!(
             outcome,
