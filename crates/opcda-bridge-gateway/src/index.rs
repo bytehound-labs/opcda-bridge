@@ -8,7 +8,8 @@ use crate::controller::{
 use crate::opc::{
     BrowseSource, InventoryCompleted, InventoryControl, InventoryEntry, InventoryEvent,
     InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress,
-    InventorySliceObservation, MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization, OpcClient,
+    InventorySliceObservation, InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE,
+    NamespaceOrganization, OpcClient,
 };
 use chrono::{DateTime, Local, Timelike};
 use fs2::FileExt;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 4;
@@ -351,6 +353,244 @@ enum BuildEventOutcome {
 enum BuildLoopOutcome {
     Finished,
     Failed(String),
+}
+
+struct CoordinatedInventoryControl {
+    state: Arc<CoordinatedInventoryControlState>,
+}
+
+struct CoordinatedInventoryControlState {
+    controls: Mutex<HashMap<usize, Arc<dyn InventoryControl>>>,
+    cancelled: AtomicBool,
+    worker_stop_requested: AtomicBool,
+    paused: AtomicBool,
+    pacing: Mutex<InventoryPacing>,
+}
+
+struct CoordinatedInventoryStream {
+    receiver: UnboundedReceiver<anyhow::Result<InventoryEvent>>,
+    control: Arc<CoordinatedInventoryControl>,
+    coordinator: Option<tokio::task::JoinHandle<()>>,
+    terminal_event_seen: bool,
+}
+
+struct InventoryRootPlan {
+    root_entries: Vec<InventoryEntry>,
+    worker_roots: Vec<String>,
+    organization: NamespaceOrganization,
+    source: BrowseSource,
+}
+
+enum WorkerInventoryMessage {
+    Started {
+        worker_id: usize,
+    },
+    Entry(InventoryEntry),
+    Progress {
+        worker_id: usize,
+        progress: InventoryProgress,
+    },
+    Slice(InventorySliceObservation),
+    Completed {
+        worker_id: usize,
+        result: InventoryCompleted,
+    },
+    Failed {
+        worker_id: usize,
+        error: String,
+    },
+    Finished {
+        _worker_id: usize,
+    },
+}
+
+enum WorkerEventAction {
+    Continue,
+    Completed,
+    Stop,
+}
+
+struct WorkerFinishedGuard {
+    sender: UnboundedSender<WorkerInventoryMessage>,
+    worker_id: usize,
+}
+
+impl Drop for WorkerFinishedGuard {
+    fn drop(&mut self) {
+        let _ = self.sender.send(WorkerInventoryMessage::Finished {
+            _worker_id: self.worker_id,
+        });
+    }
+}
+
+impl CoordinatedInventoryControl {
+    fn new(initial_pacing: InventoryPacing) -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::new(CoordinatedInventoryControlState {
+                controls: Mutex::new(HashMap::new()),
+                cancelled: AtomicBool::new(false),
+                worker_stop_requested: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
+                pacing: Mutex::new(initial_pacing),
+            }),
+        })
+    }
+
+    fn register(
+        &self,
+        worker_id: usize,
+        control: Arc<dyn InventoryControl>,
+    ) -> anyhow::Result<bool> {
+        if self.should_stop_workers() {
+            control.cancel();
+            return Ok(false);
+        }
+        let pacing = self
+            .state
+            .pacing
+            .lock()
+            .map_err(|_| anyhow::anyhow!("coordinated inventory pacing lock poisoned"))?
+            .to_owned();
+        control.set_pacing(pacing)?;
+        if self.state.paused.load(Ordering::Acquire) {
+            control.pause();
+        }
+        let mut controls = self
+            .state
+            .controls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("coordinated inventory control lock poisoned"))?;
+        if self.should_stop_workers() {
+            control.cancel();
+            return Ok(false);
+        }
+        controls.insert(worker_id, Arc::clone(&control));
+        Ok(true)
+    }
+
+    fn unregister(&self, worker_id: usize) {
+        if let Ok(mut controls) = self.state.controls.lock() {
+            controls.remove(&worker_id);
+        }
+    }
+
+    fn snapshot_controls(&self) -> Vec<Arc<dyn InventoryControl>> {
+        self.state
+            .controls
+            .lock()
+            .map(|controls| controls.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn set_pacing(&self, pacing: InventoryPacing) -> anyhow::Result<()> {
+        *self
+            .state
+            .pacing
+            .lock()
+            .map_err(|_| anyhow::anyhow!("coordinated inventory pacing lock poisoned"))? = pacing;
+        for control in self.snapshot_controls() {
+            if let Err(error) = control.set_pacing(pacing) {
+                self.cancel();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn pause_all(&self) {
+        self.state.paused.store(true, Ordering::Release);
+        for control in self.snapshot_controls() {
+            control.pause();
+        }
+    }
+
+    fn resume_all(&self) {
+        self.state.paused.store(false, Ordering::Release);
+        for control in self.snapshot_controls() {
+            control.resume();
+        }
+    }
+
+    fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::Release);
+        self.state
+            .worker_stop_requested
+            .store(true, Ordering::Release);
+        self.stop_registered_workers();
+    }
+
+    fn stop_workers(&self) {
+        self.state
+            .worker_stop_requested
+            .store(true, Ordering::Release);
+        self.stop_registered_workers();
+    }
+
+    fn stop_registered_workers(&self) {
+        for control in self.snapshot_controls() {
+            control.cancel();
+        }
+    }
+
+    fn should_stop_workers(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+            || self.state.worker_stop_requested.load(Ordering::Acquire)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl InventoryControl for CoordinatedInventoryControl {
+    fn pause(&self) {
+        self.pause_all();
+    }
+
+    fn resume(&self) {
+        self.resume_all();
+    }
+
+    fn cancel(&self) {
+        self.cancel();
+    }
+
+    fn set_pacing(&self, pacing: InventoryPacing) -> anyhow::Result<()> {
+        self.set_pacing(pacing)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::opc::InventoryStream for CoordinatedInventoryStream {
+    async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+        let event = self.receiver.recv().await;
+        if matches!(event.as_ref(), Some(Ok(InventoryEvent::Completed(_)))) {
+            self.terminal_event_seen = true;
+        }
+        event
+    }
+
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        if !self.terminal_event_seen {
+            self.control.cancel();
+        }
+        let Some(coordinator) = self.coordinator.take() else {
+            return Ok(());
+        };
+        coordinator
+            .await
+            .map_err(|error| anyhow::anyhow!("coordinated inventory task failed: {error}"))
+    }
+}
+
+impl Drop for CoordinatedInventoryStream {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
 }
 
 struct BackgroundTasks {
@@ -4144,11 +4384,51 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     async fn start_refresh_inventory(
-        &self,
+        self: &Arc<Self>,
         server: &str,
         build_ownership: &Arc<()>,
         initial_limits: InventoryLimits,
     ) -> anyhow::Result<Option<InventoryHandle>> {
+        if let Some(root_item_id) = self.settings.inventory_root.as_deref() {
+            return match self
+                .with_opc_timeout(
+                    "start root-scoped inventory",
+                    self.client.start_inventory_at_root(
+                        server,
+                        root_item_id,
+                        initial_limits.batch_size,
+                    ),
+                )
+                .await
+            {
+                Ok(handle) => Ok(Some(handle)),
+                Err(error) => {
+                    if self.take_pending_cancel(server) {
+                        self.finish_build_owned(server, build_ownership, None);
+                        return Ok(None);
+                    }
+                    self.record_start_failure(server, build_ownership, &error.to_string())?;
+                    Err(error)
+                }
+            };
+        }
+        if self.settings.worker_count > 1 {
+            match self
+                .start_coordinated_inventory(server, initial_limits)
+                .await
+            {
+                Ok(Some(handle)) => return Ok(Some(handle)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        server,
+                        error = %error,
+                        worker_count = self.settings.worker_count,
+                        "root-partitioned inventory unavailable; falling back to one full-root worker"
+                    );
+                }
+            }
+        }
         match self
             .with_opc_timeout(
                 "start inventory",
@@ -4167,6 +4447,525 @@ impl<C: OpcClient> IndexManager<C> {
                 Err(error)
             }
         }
+    }
+
+    async fn start_coordinated_inventory(
+        self: &Arc<Self>,
+        server: &str,
+        initial_limits: InventoryLimits,
+    ) -> anyhow::Result<Option<InventoryHandle>> {
+        let Some(plan) = self.discover_inventory_roots(server).await? else {
+            return Ok(None);
+        };
+        if plan.worker_roots.len() < 2 {
+            return Ok(None);
+        }
+
+        let worker_count =
+            (self.settings.worker_count.max(1) as usize).min(plan.worker_roots.len());
+        let control = CoordinatedInventoryControl::new(pacing_for_limits(initial_limits));
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let coordinator_control = Arc::clone(&control);
+        let manager = Arc::clone(self);
+        let server_name = server.to_string();
+        let coordinator = tokio::spawn(async move {
+            manager
+                .run_coordinated_inventory(
+                    server_name,
+                    plan,
+                    worker_count,
+                    initial_limits,
+                    coordinator_control,
+                    sender,
+                )
+                .await;
+        });
+
+        Ok(Some(InventoryHandle {
+            stream: Box::new(CoordinatedInventoryStream {
+                receiver,
+                control: Arc::clone(&control),
+                coordinator: Some(coordinator),
+                terminal_event_seen: false,
+            }),
+            control,
+        }))
+    }
+
+    async fn discover_inventory_roots(
+        &self,
+        server: &str,
+    ) -> anyhow::Result<Option<InventoryRootPlan>> {
+        let capabilities = self
+            .with_opc_timeout(
+                "get inventory browse capabilities",
+                self.client.get_capabilities(server),
+            )
+            .await?;
+        if capabilities.organization != NamespaceOrganization::Hierarchical
+            || !capabilities.supports_browse_sessions
+        {
+            return Ok(None);
+        }
+
+        let session_id = self
+            .with_opc_timeout(
+                "open inventory root browse session",
+                self.client.open_browse_session(server),
+            )
+            .await?;
+        let page_size = capabilities
+            .max_page_size
+            .clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE);
+        let page_result = self
+            .with_opc_timeout(
+                "browse inventory root",
+                self.client
+                    .browse_page(&session_id, None, None, page_size, true),
+            )
+            .await;
+        let close_result = self
+            .with_opc_timeout(
+                "close inventory root browse session",
+                self.client.close_browse_session(&session_id),
+            )
+            .await;
+        let page = page_result?;
+        close_result?;
+        if !page.complete || page.next_page_token.is_some() {
+            anyhow::bail!("inventory root browse returned a continuation page");
+        }
+
+        let mut root_entries = Vec::new();
+        let mut worker_roots = Vec::new();
+        for node in page.nodes {
+            match node.kind {
+                crate::opc::BrowseNodeKind::Item => {
+                    if let Some(item_id) = node.item_id {
+                        root_entries.push(InventoryEntry {
+                            display_name: node.display_name,
+                            item_id,
+                            kind: InventoryNodeKind::Item,
+                            breadcrumbs: Vec::new(),
+                        });
+                    }
+                }
+                crate::opc::BrowseNodeKind::BranchAndItem => {
+                    if let Some(item_id) = node.item_id {
+                        root_entries.push(InventoryEntry {
+                            display_name: node.display_name.clone(),
+                            item_id: item_id.clone(),
+                            kind: InventoryNodeKind::BranchAndItem,
+                            breadcrumbs: Vec::new(),
+                        });
+                        worker_roots.push(item_id);
+                    }
+                }
+                crate::opc::BrowseNodeKind::Branch => {
+                    if let Some(item_id) = node.item_id {
+                        worker_roots.push(item_id);
+                    }
+                }
+            }
+        }
+        worker_roots.sort();
+        worker_roots.dedup();
+        if worker_roots.len() < 2 {
+            return Ok(None);
+        }
+        Ok(Some(InventoryRootPlan {
+            root_entries,
+            worker_roots,
+            organization: page.organization,
+            source: page.source,
+        }))
+    }
+
+    async fn run_coordinated_inventory(
+        self: Arc<Self>,
+        server: String,
+        plan: InventoryRootPlan,
+        worker_count: usize,
+        initial_limits: InventoryLimits,
+        control: Arc<CoordinatedInventoryControl>,
+        sender: UnboundedSender<anyhow::Result<InventoryEvent>>,
+    ) {
+        let queue = Arc::new(Mutex::new(VecDeque::from(plan.worker_roots.clone())));
+        let (worker_sender, mut worker_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<WorkerInventoryMessage>();
+        let mut workers = Vec::new();
+        for worker_id in 0..worker_count {
+            let manager = Arc::clone(&self);
+            let queue = Arc::clone(&queue);
+            let control = Arc::clone(&control);
+            let worker_sender = worker_sender.clone();
+            let server = server.clone();
+            workers.push(tokio::spawn(async move {
+                manager
+                    .run_inventory_worker(
+                        server,
+                        worker_id,
+                        queue,
+                        initial_limits,
+                        control,
+                        worker_sender,
+                    )
+                    .await;
+            }));
+        }
+        drop(worker_sender);
+
+        let mut seen = HashSet::new();
+        let mut worker_progress = HashMap::new();
+        let mut worker_last_progress = HashMap::new();
+        let mut next_slice_sequence = 0u64;
+
+        for entry in &plan.root_entries {
+            if !self.emit_coordinated_entry(entry.clone(), &mut seen, &control, &sender) {
+                control.cancel();
+                break;
+            }
+        }
+
+        while let Some(message) = worker_receiver.recv().await {
+            match message {
+                WorkerInventoryMessage::Started { worker_id } => {
+                    worker_progress
+                        .entry(worker_id)
+                        .or_insert_with(zero_inventory_progress);
+                    worker_last_progress.remove(&worker_id);
+                }
+                WorkerInventoryMessage::Entry(entry) => {
+                    let _ = self.emit_coordinated_entry(entry, &mut seen, &control, &sender);
+                }
+                WorkerInventoryMessage::Progress {
+                    worker_id,
+                    progress,
+                } => {
+                    let cumulative = worker_progress
+                        .entry(worker_id)
+                        .or_insert_with(zero_inventory_progress);
+                    accumulate_inventory_progress(
+                        cumulative,
+                        worker_last_progress.get(&worker_id),
+                        &progress,
+                    );
+                    worker_last_progress.insert(worker_id, progress);
+                    let aggregate =
+                        aggregate_inventory_progress(&worker_progress, seen.len() as u64);
+                    let _ = sender.send(Ok(InventoryEvent::Progress(aggregate)));
+                }
+                WorkerInventoryMessage::Slice(slice) => {
+                    let sequence = next_slice_sequence;
+                    next_slice_sequence = next_slice_sequence.saturating_add(1);
+                    let aggregate = InventorySliceObservation {
+                        sequence,
+                        entries_seen: slice.entries_seen,
+                        unique_items: seen.len() as u64,
+                        ..slice
+                    };
+                    let _ = sender.send(Ok(InventoryEvent::Slice(aggregate)));
+                }
+                WorkerInventoryMessage::Completed { worker_id, result } => {
+                    if !result.complete && !result.cancelled && !result.truncated {
+                        control.cancel();
+                        let _ = sender.send(Err(anyhow::anyhow!(
+                            "inventory worker {worker_id} ended before completion"
+                        )));
+                        for worker in workers {
+                            let _ = worker.await;
+                        }
+                        return;
+                    }
+                }
+                WorkerInventoryMessage::Failed { worker_id, error } => {
+                    control.cancel();
+                    let _ = sender.send(Err(anyhow::anyhow!(
+                        "inventory worker {worker_id} failed: {error}"
+                    )));
+                    for worker in workers {
+                        let _ = worker.await;
+                    }
+                    return;
+                }
+                WorkerInventoryMessage::Finished { .. } => {}
+            }
+        }
+        Self::finish_coordinated_inventory_after_channel_close(&plan, &control, workers, &sender)
+            .await;
+    }
+
+    async fn finish_coordinated_inventory_after_channel_close(
+        plan: &InventoryRootPlan,
+        control: &CoordinatedInventoryControl,
+        workers: Vec<tokio::task::JoinHandle<()>>,
+        sender: &UnboundedSender<anyhow::Result<InventoryEvent>>,
+    ) {
+        let mut worker_task_error = None;
+        control.stop_workers();
+        for worker in workers {
+            if let Err(error) = worker.await {
+                worker_task_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = worker_task_error {
+            let _ = sender.send(Err(anyhow::anyhow!(
+                "coordinated inventory worker task failed: {error}"
+            )));
+        } else {
+            let cancelled = control.is_cancelled();
+            let warning = cancelled.then(|| "inventory cancelled".to_string());
+            let _ = sender.send(Ok(InventoryEvent::Completed(InventoryCompleted {
+                complete: !cancelled,
+                cancelled,
+                truncated: false,
+                warning,
+                organization: plan.organization,
+                source: plan.source,
+            })));
+        }
+    }
+
+    fn emit_coordinated_entry(
+        &self,
+        entry: InventoryEntry,
+        seen: &mut HashSet<String>,
+        control: &CoordinatedInventoryControl,
+        sender: &UnboundedSender<anyhow::Result<InventoryEvent>>,
+    ) -> bool {
+        if !seen.insert(entry.item_id.clone()) {
+            return true;
+        }
+        if sender.send(Ok(InventoryEvent::Entry(entry))).is_err() {
+            control.cancel();
+            return false;
+        }
+        true
+    }
+
+    async fn run_inventory_worker(
+        self: Arc<Self>,
+        server: String,
+        worker_id: usize,
+        queue: Arc<Mutex<VecDeque<String>>>,
+        initial_limits: InventoryLimits,
+        control: Arc<CoordinatedInventoryControl>,
+        sender: UnboundedSender<WorkerInventoryMessage>,
+    ) {
+        let _finished = WorkerFinishedGuard {
+            sender: sender.clone(),
+            worker_id,
+        };
+        loop {
+            if control.should_stop_workers() {
+                break;
+            }
+            let root = match Self::pop_inventory_root(&queue) {
+                Ok(root) => root,
+                Err(error) => {
+                    let _ = sender.send(WorkerInventoryMessage::Failed {
+                        worker_id,
+                        error: error.to_string(),
+                    });
+                    return;
+                }
+            };
+            let Some(root) = root else {
+                break;
+            };
+            let Some(mut stream) = (match self
+                .start_inventory_worker_stream(
+                    &server,
+                    &root,
+                    worker_id,
+                    initial_limits,
+                    control.as_ref(),
+                    &sender,
+                )
+                .await
+            {
+                Ok(stream) => stream,
+                Err(()) => return,
+            }) else {
+                break;
+            };
+            let completed = Self::forward_inventory_worker_stream(
+                &mut *stream,
+                worker_id,
+                control.as_ref(),
+                &sender,
+            )
+            .await;
+            let _ = stream.shutdown().await;
+            self.unregister_coordinated_worker(&control, worker_id);
+            if !completed && !control.should_stop_workers() {
+                let _ = sender.send(WorkerInventoryMessage::Failed {
+                    worker_id,
+                    error: "inventory worker stream ended before completion".to_string(),
+                });
+                control.cancel();
+                break;
+            }
+        }
+    }
+
+    async fn start_inventory_worker_stream(
+        &self,
+        server: &str,
+        root: &str,
+        worker_id: usize,
+        initial_limits: InventoryLimits,
+        control: &CoordinatedInventoryControl,
+        sender: &UnboundedSender<WorkerInventoryMessage>,
+    ) -> Result<Option<Box<dyn InventoryStream>>, ()> {
+        let handle = match self
+            .with_opc_timeout(
+                "start root inventory",
+                self.client
+                    .start_inventory_at_root(server, root, initial_limits.batch_size),
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if control.should_stop_workers() {
+                    return Ok(None);
+                }
+                let _ = sender.send(WorkerInventoryMessage::Failed {
+                    worker_id,
+                    error: error.to_string(),
+                });
+                control.cancel();
+                return Err(());
+            }
+        };
+        let InventoryHandle {
+            stream,
+            control: worker_control,
+        } = handle;
+        match control.register(worker_id, worker_control) {
+            Ok(true) => {}
+            Ok(false) => {
+                let mut stream = stream;
+                let _ = stream.shutdown().await;
+                return Ok(None);
+            }
+            Err(error) => {
+                let mut stream = stream;
+                let _ = stream.shutdown().await;
+                if control.should_stop_workers() {
+                    return Ok(None);
+                }
+                let _ = sender.send(WorkerInventoryMessage::Failed {
+                    worker_id,
+                    error: error.to_string(),
+                });
+                control.cancel();
+                return Err(());
+            }
+        }
+        let mut stream = stream;
+        if sender
+            .send(WorkerInventoryMessage::Started { worker_id })
+            .is_err()
+        {
+            control.cancel();
+            let _ = stream.shutdown().await;
+            return Ok(None);
+        }
+        Ok(Some(stream))
+    }
+
+    async fn forward_inventory_worker_stream(
+        stream: &mut dyn InventoryStream,
+        worker_id: usize,
+        control: &CoordinatedInventoryControl,
+        sender: &UnboundedSender<WorkerInventoryMessage>,
+    ) -> bool {
+        while let Some(event) = stream.next().await {
+            match Self::forward_inventory_event(event, worker_id, control, sender) {
+                WorkerEventAction::Continue => {}
+                WorkerEventAction::Completed => return true,
+                WorkerEventAction::Stop => return false,
+            }
+        }
+        false
+    }
+
+    fn forward_inventory_event(
+        event: anyhow::Result<InventoryEvent>,
+        worker_id: usize,
+        control: &CoordinatedInventoryControl,
+        sender: &UnboundedSender<WorkerInventoryMessage>,
+    ) -> WorkerEventAction {
+        match event {
+            Ok(InventoryEvent::Entry(entry)) => {
+                if sender.send(WorkerInventoryMessage::Entry(entry)).is_err() {
+                    control.cancel();
+                    WorkerEventAction::Stop
+                } else {
+                    WorkerEventAction::Continue
+                }
+            }
+            Ok(InventoryEvent::Progress(progress)) => {
+                if sender
+                    .send(WorkerInventoryMessage::Progress {
+                        worker_id,
+                        progress,
+                    })
+                    .is_err()
+                {
+                    control.cancel();
+                    WorkerEventAction::Stop
+                } else {
+                    WorkerEventAction::Continue
+                }
+            }
+            Ok(InventoryEvent::Slice(slice)) => {
+                if sender.send(WorkerInventoryMessage::Slice(slice)).is_err() {
+                    control.cancel();
+                    WorkerEventAction::Stop
+                } else {
+                    WorkerEventAction::Continue
+                }
+            }
+            Ok(InventoryEvent::Completed(result)) => {
+                if sender
+                    .send(WorkerInventoryMessage::Completed { worker_id, result })
+                    .is_err()
+                {
+                    control.cancel();
+                    WorkerEventAction::Stop
+                } else {
+                    WorkerEventAction::Completed
+                }
+            }
+            Err(error) => {
+                if !control.should_stop_workers() {
+                    let _ = sender.send(WorkerInventoryMessage::Failed {
+                        worker_id,
+                        error: error.to_string(),
+                    });
+                    control.cancel();
+                }
+                WorkerEventAction::Stop
+            }
+        }
+    }
+
+    fn unregister_coordinated_worker(
+        &self,
+        control: &CoordinatedInventoryControl,
+        worker_id: usize,
+    ) {
+        control.unregister(worker_id);
+    }
+
+    fn pop_inventory_root(queue: &Mutex<VecDeque<String>>) -> anyhow::Result<Option<String>> {
+        queue
+            .lock()
+            .map(|mut roots| roots.pop_front())
+            .map_err(|error| anyhow::anyhow!("inventory root queue lock poisoned: {error}"))
     }
 
     fn attach_refresh_control(
@@ -4974,6 +5773,18 @@ impl<C: OpcClient> IndexManager<C> {
                     state.failed = Some(error);
                     break;
                 }
+            }
+        }
+        if let Err(error) = handle.stream.shutdown().await {
+            if state.failed.is_none() {
+                state.failed = Some(format!("inventory worker shutdown failed: {error}"));
+            } else {
+                tracing::warn!(
+                    server = %server,
+                    generation,
+                    error = %error,
+                    "inventory worker shutdown also failed after build failure"
+                );
             }
         }
         if !state.terminal && state.failed.is_none() {
@@ -6415,6 +7226,7 @@ fn quarantine_index_files(path: &Path, quarantine: &Path) -> anyhow::Result<bool
                 rollback_errors.len()
             ));
         }
+
         moved.push((source, destination));
     }
     Ok(!moved.is_empty())
@@ -6484,6 +7296,95 @@ fn pacing_for_limits(limits: InventoryLimits) -> InventoryPacing {
         item_rate_per_second: (limits.item_rate_per_second > 0)
             .then_some(limits.item_rate_per_second),
         batch_size: Some(limits.batch_size.clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE)),
+    }
+}
+
+fn zero_inventory_progress() -> InventoryProgress {
+    InventoryProgress {
+        branches_visited: 0,
+        entries_seen: 0,
+        unique_items: 0,
+        active_time_ms: 0,
+        paused_time_ms: 0,
+        items_per_second: 0.0,
+        estimated_remaining_ms: None,
+    }
+}
+
+fn accumulate_inventory_progress(
+    cumulative: &mut InventoryProgress,
+    previous: Option<&InventoryProgress>,
+    progress: &InventoryProgress,
+) {
+    let zero = zero_inventory_progress();
+    let previous = previous.unwrap_or(&zero);
+    cumulative.branches_visited = cumulative.branches_visited.saturating_add(
+        progress
+            .branches_visited
+            .saturating_sub(previous.branches_visited),
+    );
+    cumulative.entries_seen = cumulative
+        .entries_seen
+        .saturating_add(progress.entries_seen.saturating_sub(previous.entries_seen));
+    cumulative.unique_items = cumulative
+        .unique_items
+        .saturating_add(progress.unique_items.saturating_sub(previous.unique_items));
+    cumulative.active_time_ms = cumulative.active_time_ms.saturating_add(
+        progress
+            .active_time_ms
+            .saturating_sub(previous.active_time_ms),
+    );
+    cumulative.paused_time_ms = cumulative.paused_time_ms.saturating_add(
+        progress
+            .paused_time_ms
+            .saturating_sub(previous.paused_time_ms),
+    );
+    cumulative.items_per_second = if cumulative.active_time_ms == 0 {
+        0.0
+    } else {
+        cumulative.unique_items as f64
+            / Duration::from_millis(cumulative.active_time_ms).as_secs_f64()
+    };
+    cumulative.estimated_remaining_ms = progress.estimated_remaining_ms;
+}
+
+fn aggregate_inventory_progress(
+    progress_by_worker: &HashMap<usize, InventoryProgress>,
+    unique_items: u64,
+) -> InventoryProgress {
+    let branches_visited = progress_by_worker
+        .values()
+        .map(|progress| progress.branches_visited)
+        .sum();
+    let entries_seen = progress_by_worker
+        .values()
+        .map(|progress| progress.entries_seen)
+        .sum();
+    let active_time_ms = progress_by_worker
+        .values()
+        .map(|progress| progress.active_time_ms)
+        .sum();
+    let paused_time_ms = progress_by_worker
+        .values()
+        .map(|progress| progress.paused_time_ms)
+        .sum();
+    let estimated_remaining_ms = progress_by_worker
+        .values()
+        .filter_map(|progress| progress.estimated_remaining_ms)
+        .max();
+    let items_per_second = if active_time_ms == 0 {
+        0.0
+    } else {
+        unique_items as f64 / Duration::from_millis(active_time_ms).as_secs_f64()
+    };
+    InventoryProgress {
+        branches_visited,
+        entries_seen,
+        unique_items,
+        active_time_ms,
+        paused_time_ms,
+        items_per_second,
+        estimated_remaining_ms,
     }
 }
 
@@ -6643,13 +7544,13 @@ fn node_kind_number(value: InventoryNodeKind) -> i64 {
 mod tests {
     use super::*;
     use crate::opc::{
-        BrowseCapabilities, BrowsePage, InventoryCompleted, InventoryEntry, InventoryEvent,
-        InventorySliceBackend, InventorySliceObservation, InventoryStream, OpcValue, TagValue,
-        WriteResult,
+        BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, InventoryCompleted,
+        InventoryEntry, InventoryEvent, InventorySliceBackend, InventorySliceObservation,
+        InventoryStream, OpcValue, TagValue, WriteResult,
     };
     use crate::test_support::MockOpcClient;
     use chrono::TimeZone;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::error::Error;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -6665,6 +7566,7 @@ mod tests {
             startup_grace_period_seconds: 0,
             schedule_jitter_seconds: 0,
             inventory_batch_size: 100,
+            inventory_root: None,
             commit_batch_size: 100,
             commit_interval_ms: 1_000,
             batch_size: 100,
@@ -6693,6 +7595,7 @@ mod tests {
             operation_timeout_seconds: 30,
             maintenance_windows: Vec::new(),
             concurrency: 1,
+            worker_count: 1,
             query_cache_capacity: 256,
             paused: false,
             max_results: 50,
@@ -6713,6 +7616,1421 @@ mod tests {
                 inventory_entry(&format!("{prefix}-{index}"), &format!("{prefix}.{index}"))
             })
             .collect()
+    }
+
+    fn root_node(display_name: &str, kind: BrowseNodeKind, item_id: Option<&str>) -> BrowseNode {
+        BrowseNode {
+            node_key: display_name.into(),
+            display_name: display_name.into(),
+            kind,
+            item_id: item_id.map(str::to_owned),
+        }
+    }
+
+    fn completed_inventory() -> InventoryEvent {
+        InventoryEvent::Completed(InventoryCompleted {
+            complete: true,
+            cancelled: false,
+            truncated: false,
+            warning: None,
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+        })
+    }
+
+    #[tokio::test]
+    async fn configured_inventory_root_uses_root_scoped_start() {
+        let client = Arc::new(MockOpcClient::default());
+        client.inventory_root_events.lock().unwrap().insert(
+            "FCS0201".into(),
+            VecDeque::from([Ok(completed_inventory())]),
+        );
+        let mut config = settings(PathBuf::from(":memory:"));
+        config.inventory_root = Some("FCS0201".into());
+        config.worker_count = 4;
+        let manager = Arc::new(IndexManager::new(Arc::clone(&client), config));
+
+        let handle = manager
+            .start_refresh_inventory(
+                "S",
+                &Arc::new(()),
+                InventoryLimits {
+                    item_rate_per_second: 0,
+                    batch_size: 17,
+                    duty_cycle_percent: 100,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("configured root should start an inventory");
+        let InventoryHandle {
+            mut stream,
+            control,
+        } = handle;
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(InventoryEvent::Completed(_)))
+        ));
+        stream.shutdown().await.unwrap();
+        assert!(!control.is_cancelled());
+        assert_eq!(client.inventory_start_count.load(Ordering::Acquire), 0);
+        assert_eq!(client.inventory_root_start_count.load(Ordering::Acquire), 1);
+        assert_eq!(
+            client.inventory_started_roots.lock().unwrap().as_slice(),
+            ["FCS0201"]
+        );
+        assert_eq!(client.inventory_batch_size.load(Ordering::Acquire), 17);
+    }
+
+    #[test]
+    fn coordinated_control_handles_registration_and_pacing_edges() {
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        control.cancel();
+        let cancelled_worker = Arc::new(RecordingInventoryControl::default());
+        assert!(
+            !control
+                .register(
+                    0,
+                    Arc::clone(&cancelled_worker) as Arc<dyn InventoryControl>
+                )
+                .unwrap()
+        );
+        assert!(cancelled_worker.is_cancelled());
+
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        control.pause();
+        let paused_worker = Arc::new(RecordingInventoryControl::default());
+        assert!(
+            control
+                .register(1, Arc::clone(&paused_worker) as Arc<dyn InventoryControl>)
+                .unwrap()
+        );
+        assert_eq!(paused_worker.pause_count.load(Ordering::Acquire), 1);
+
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let racing_worker = Arc::new(RegisterCancellingControl {
+            parent: Arc::clone(&control),
+            cancelled: AtomicBool::new(false),
+        });
+        racing_worker.pause();
+        racing_worker.resume();
+        assert!(
+            !control
+                .register(2, Arc::clone(&racing_worker) as Arc<dyn InventoryControl>)
+                .unwrap()
+        );
+        assert!(racing_worker.is_cancelled());
+
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let pacing_worker = Arc::new(RecordingInventoryControl::default());
+        control
+            .register(3, Arc::clone(&pacing_worker) as Arc<dyn InventoryControl>)
+            .unwrap();
+        let trait_control: &dyn InventoryControl = &*control;
+        trait_control
+            .set_pacing(InventoryPacing {
+                min_interval: Duration::from_millis(5),
+                item_rate_per_second: Some(10),
+                batch_size: Some(20),
+            })
+            .unwrap();
+        assert_eq!(pacing_worker.pacing_calls.load(Ordering::Acquire), 2);
+        control.stop_workers();
+        assert!(control.should_stop_workers());
+
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let failing_worker = Arc::new(RecordingInventoryControl::default());
+        failing_worker.fail_pacing_on_call(2);
+        control
+            .register(4, Arc::clone(&failing_worker) as Arc<dyn InventoryControl>)
+            .unwrap();
+        let error = control
+            .set_pacing(InventoryPacing {
+                min_interval: Duration::from_millis(1),
+                item_rate_per_second: None,
+                batch_size: None,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("test pacing update failure"));
+        assert!(control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn coordinated_channel_close_reports_worker_failure_or_completion() {
+        let plan = InventoryRootPlan {
+            root_entries: Vec::new(),
+            worker_roots: Vec::new(),
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+        };
+
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<anyhow::Result<InventoryEvent>>();
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let worker = tokio::spawn(async {
+            panic!("injected coordinated worker task failure");
+        });
+        IndexManager::<MockOpcClient>::finish_coordinated_inventory_after_channel_close(
+            &plan,
+            &control,
+            vec![worker],
+            &sender,
+        )
+        .await;
+        let error = receiver
+            .recv()
+            .await
+            .expect("worker failure should produce an error")
+            .expect_err("worker task failure must be reported");
+        assert!(error.to_string().contains("worker task failed"));
+
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<anyhow::Result<InventoryEvent>>();
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        IndexManager::<MockOpcClient>::finish_coordinated_inventory_after_channel_close(
+            &plan,
+            &control,
+            Vec::new(),
+            &sender,
+        )
+        .await;
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Ok(InventoryEvent::Completed(InventoryCompleted {
+                complete: true,
+                cancelled: false,
+                warning: None,
+                ..
+            })))
+        ));
+
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<anyhow::Result<InventoryEvent>>();
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        control.cancel();
+        IndexManager::<MockOpcClient>::finish_coordinated_inventory_after_channel_close(
+            &plan,
+            &control,
+            Vec::new(),
+            &sender,
+        )
+        .await;
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Ok(InventoryEvent::Completed(InventoryCompleted {
+                complete: false,
+                cancelled: true,
+                warning: Some(_),
+                ..
+            })))
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordinated_stream_shutdown_reports_coordinator_join_failure() {
+        let (_sender, receiver) =
+            tokio::sync::mpsc::unbounded_channel::<anyhow::Result<InventoryEvent>>();
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let coordinator = tokio::spawn(async {
+            panic!("injected coordinator panic");
+        });
+        let mut stream = CoordinatedInventoryStream {
+            receiver,
+            control: Arc::clone(&control),
+            coordinator: Some(coordinator),
+            terminal_event_seen: false,
+        };
+        let error = stream.shutdown().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("coordinated inventory task failed")
+        );
+        assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn aggregate_inventory_progress_handles_zero_active_time() {
+        let mut progress = HashMap::new();
+        progress.insert(0, zero_inventory_progress());
+        let aggregate = aggregate_inventory_progress(&progress, 0);
+        assert_eq!(aggregate.items_per_second, 0.0);
+        assert_eq!(
+            aggregate_inventory_progress(&HashMap::new(), 0).items_per_second,
+            0.0
+        );
+    }
+
+    #[test]
+    fn accumulate_inventory_progress_handles_zero_active_time() {
+        let mut cumulative = zero_inventory_progress();
+        accumulate_inventory_progress(
+            &mut cumulative,
+            None,
+            &InventoryProgress {
+                unique_items: 3,
+                ..zero_inventory_progress()
+            },
+        );
+        assert_eq!(cumulative.unique_items, 3);
+        assert_eq!(cumulative.items_per_second, 0.0);
+    }
+
+    #[tokio::test]
+    async fn coordinated_inventory_deduplicates_roots_and_aggregates_progress() {
+        let client = Arc::new(MockOpcClient::default());
+        *client.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+            nodes: vec![
+                root_node("Branch A", BrowseNodeKind::Branch, Some("Root.A")),
+                root_node("Branch B", BrowseNodeKind::BranchAndItem, Some("Root.B")),
+                root_node("Root leaf", BrowseNodeKind::Item, Some("Root.Leaf")),
+            ],
+            next_page_token: None,
+            complete: true,
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+            warning: None,
+        });
+        *client.inventory_root_events.lock().unwrap() = HashMap::from([
+            (
+                "Root.A".into(),
+                VecDeque::from([
+                    Ok(InventoryEvent::Entry(inventory_entry("A", "A.Item"))),
+                    Ok(InventoryEvent::Progress(InventoryProgress {
+                        branches_visited: 1,
+                        entries_seen: 1,
+                        unique_items: 1,
+                        active_time_ms: 10,
+                        paused_time_ms: 2,
+                        items_per_second: 100.0,
+                        estimated_remaining_ms: Some(50),
+                    })),
+                    Ok(InventoryEvent::Slice(InventorySliceObservation {
+                        sequence: 11,
+                        backend: InventorySliceBackend::Da2,
+                        nodes_returned: 1,
+                        has_more: true,
+                        native_operations: 3,
+                        elapsed_ms: 20,
+                        entries_seen: 1,
+                        unique_items: 1,
+                    })),
+                    Ok(completed_inventory()),
+                ]),
+            ),
+            (
+                "Root.B".into(),
+                VecDeque::from([
+                    Ok(InventoryEvent::Entry(inventory_entry(
+                        "A duplicate",
+                        "A.Item",
+                    ))),
+                    Ok(InventoryEvent::Entry(inventory_entry("B", "B.Item"))),
+                    Ok(InventoryEvent::Progress(InventoryProgress {
+                        branches_visited: 2,
+                        entries_seen: 2,
+                        unique_items: 2,
+                        active_time_ms: 20,
+                        paused_time_ms: 3,
+                        items_per_second: 100.0,
+                        estimated_remaining_ms: None,
+                    })),
+                    Ok(InventoryEvent::Slice(InventorySliceObservation {
+                        sequence: 22,
+                        backend: InventorySliceBackend::Da2,
+                        nodes_returned: 2,
+                        has_more: false,
+                        native_operations: 4,
+                        elapsed_ms: 15,
+                        entries_seen: 2,
+                        unique_items: 2,
+                    })),
+                    Ok(completed_inventory()),
+                ]),
+            ),
+        ]);
+        let mut config = settings(PathBuf::from(":memory:"));
+        config.worker_count = 2;
+        let manager = Arc::new(IndexManager::new(Arc::clone(&client), config));
+
+        let InventoryHandle {
+            mut stream,
+            control,
+        } = manager
+            .start_refresh_inventory(
+                "S",
+                &Arc::new(()),
+                InventoryLimits {
+                    item_rate_per_second: 100,
+                    batch_size: 25,
+                    duty_cycle_percent: 100,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("two expandable roots should use coordinated inventory");
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.unwrap());
+        }
+        stream.shutdown().await.unwrap();
+        assert!(!control.is_cancelled());
+
+        let mut entries: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                InventoryEvent::Entry(entry) => Some(entry),
+                _ => None,
+            })
+            .collect();
+        entries.sort_by(|left, right| left.item_id.cmp(&right.item_id));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A.Item", "B.Item", "Root.B", "Root.Leaf"]
+        );
+        assert_eq!(entries[2].breadcrumbs, Vec::<String>::new());
+        assert_eq!(entries[2].kind, InventoryNodeKind::BranchAndItem);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                InventoryEvent::Progress(progress)
+                    if progress.branches_visited == 3
+                        && progress.entries_seen == 3
+                        && progress.active_time_ms == 30
+                        && progress.paused_time_ms == 5
+                        && (3..=4).contains(&progress.unique_items)
+            )
+        }));
+        let slices: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                InventoryEvent::Slice(slice) => Some(slice),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            slices.iter().map(|slice| slice.nodes_returned).sum::<u64>(),
+            3
+        );
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.native_operations)
+                .sum::<u64>(),
+            7
+        );
+        assert_eq!(slices.iter().map(|slice| slice.elapsed_ms).max(), Some(20));
+        assert!(slices.iter().any(|slice| slice.entries_seen == 2));
+        assert!(
+            slices
+                .iter()
+                .all(|slice| (3..=4).contains(&slice.unique_items))
+        );
+        assert_eq!(client.inventory_root_start_count.load(Ordering::Acquire), 2);
+        let mut started_roots = client.inventory_started_roots.lock().unwrap().clone();
+        started_roots.sort();
+        assert_eq!(started_roots, vec!["Root.A", "Root.B"]);
+        assert!(matches!(
+            events.last(),
+            Some(InventoryEvent::Completed(InventoryCompleted {
+                complete: true,
+                cancelled: false,
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_inventory_root_failure_is_fatal() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_inventories(vec![Err("configured root failed".into())]),
+        );
+        let mut config = settings(directory.path().join("configured-root-failure.sqlite3"));
+        config.inventory_root = Some("FCS0201".into());
+        let manager = Arc::new(IndexManager::new(client, config));
+        manager.with_database(|_| Ok(())).unwrap();
+        let ownership = Arc::new(());
+        let error = manager
+            .start_refresh_inventory("S", &ownership, coordinator_limits())
+            .await
+            .err()
+            .expect("configured root failure should be returned");
+        assert!(error.to_string().contains("configured root failed"));
+        assert!(manager.status("S").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn configured_inventory_root_failure_is_cleanly_cancelled_when_pending() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_inventories(vec![Err("configured root failed".into())]),
+        );
+        let mut config = settings(directory.path().join("configured-root-cancelled.sqlite3"));
+        config.inventory_root = Some("FCS0201".into());
+        let manager = Arc::new(IndexManager::new(client, config));
+        manager.with_database(|_| Ok(())).unwrap();
+        manager.pending_cancels.lock().unwrap().insert("S".into());
+
+        let ownership = Arc::new(());
+        let result = manager
+            .start_refresh_inventory("S", &ownership, coordinator_limits())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(manager.pending_cancels.lock().unwrap().is_empty());
+        assert!(manager.status("S").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn generation_start_failure_is_recorded_and_reported() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(LifecycleClient::new(
+            vec![],
+            vec![Ok(default_capabilities())],
+        ));
+        let manager = Arc::new(IndexManager::new(
+            Arc::clone(&client),
+            settings(directory.path().join("generation-lock-poisoned.sqlite3")),
+        ));
+        manager.with_database(|_| Ok(())).unwrap();
+        let ownership = manager
+            .reserve_refresh_build("S", true)
+            .unwrap()
+            .expect("build reservation should succeed");
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        manager
+            .with_database(|database| {
+                database
+                    .connection
+                    .execute_batch(
+                        "CREATE TRIGGER reject_staging_generation
+                     BEFORE INSERT ON generations
+                     WHEN NEW.state = 'staging'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'staging generation rejected');
+                     END;",
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+
+        let error = manager
+            .start_refresh_generation("S", &control, &ownership, false)
+            .await
+            .expect_err("the staging generation trigger should fail generation start");
+        assert!(error.to_string().contains("staging generation rejected"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_client_reports_missing_root_inventory_fixture() {
+        let client = LifecycleClient::new(vec![], vec![]);
+        let result = client.start_inventory_at_root("S", "Root", 1).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("no root inventory configured"))
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinated_start_falls_back_when_partitioning_is_not_safe() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(vec![Ok(immediate_inventory_handle())], vec![])
+                .with_root_browse_page(Ok(BrowsePage {
+                    nodes: vec![root_node(
+                        "Only branch",
+                        BrowseNodeKind::Branch,
+                        Some("Root.Only"),
+                    )],
+                    next_page_token: None,
+                    complete: true,
+                    organization: NamespaceOrganization::Hierarchical,
+                    source: BrowseSource::Da2,
+                    warning: None,
+                })),
+        );
+        let mut config = settings(directory.path().join("partition-unsafe.sqlite3"));
+        config.worker_count = 2;
+        let manager = Arc::new(IndexManager::new(client.clone(), config));
+
+        let handle = manager
+            .start_refresh_inventory("S", &Arc::new(()), coordinator_limits())
+            .await
+            .unwrap()
+            .expect("unsafe partitioning should fall back to full-root inventory");
+
+        assert_eq!(client.inventory_start_count.load(Ordering::Acquire), 1);
+        assert_eq!(client.root_inventory_start_count.load(Ordering::Acquire), 0);
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn coordinated_start_failure_falls_back_to_full_root_inventory() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(vec![Ok(immediate_inventory_handle())], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_close_result(Err("partition discovery failed".into())),
+        );
+        let mut config = settings(directory.path().join("partition-fallback.sqlite3"));
+        config.worker_count = 2;
+        let manager = Arc::new(IndexManager::new(client.clone(), config));
+        let handle = manager
+            .start_refresh_inventory("S", &Arc::new(()), coordinator_limits())
+            .await
+            .unwrap()
+            .expect("fallback should start a full-root inventory");
+        assert_eq!(client.inventory_start_count.load(Ordering::Acquire), 1);
+        assert_eq!(client.root_inventory_start_count.load(Ordering::Acquire), 0);
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn coordinated_inventory_reports_worker_failure() {
+        let client = Arc::new(MockOpcClient::default());
+        *client.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+            nodes: vec![
+                root_node("A", BrowseNodeKind::Branch, Some("Root.A")),
+                root_node("B", BrowseNodeKind::Branch, Some("Root.B")),
+            ],
+            next_page_token: None,
+            complete: true,
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+            warning: None,
+        });
+        *client.inventory_root_events.lock().unwrap() = HashMap::from([
+            (
+                "Root.A".into(),
+                VecDeque::from([Err("worker exploded".into())]),
+            ),
+            ("Root.B".into(), VecDeque::from([Ok(completed_inventory())])),
+        ]);
+        let mut config = settings(PathBuf::from(":memory:"));
+        config.worker_count = 2;
+        let manager = Arc::new(IndexManager::new(client, config));
+        let InventoryHandle { mut stream, .. } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .expect("two roots should use coordinated inventory");
+
+        let error = stream
+            .next()
+            .await
+            .expect("worker failure should produce an event")
+            .expect_err("worker failure must be terminal");
+        assert!(error.to_string().contains("worker exploded"));
+        stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinated_inventory_reports_worker_registration_failure() {
+        let control = Arc::new(RecordingInventoryControl::default());
+        control.fail_pacing_on_call(1);
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(BrowsePage {
+                    nodes: vec![
+                        root_node("A", BrowseNodeKind::Branch, Some("Root.A")),
+                        root_node("B", BrowseNodeKind::Branch, Some("Root.B")),
+                    ],
+                    next_page_token: None,
+                    complete: true,
+                    organization: NamespaceOrganization::Hierarchical,
+                    source: BrowseSource::Da2,
+                    warning: None,
+                }))
+                .with_root_inventories(vec![Ok(handle_with_control(VecDeque::new(), control))]),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(PathBuf::from(":memory:")),
+        ));
+        let InventoryHandle { mut stream, .. } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .expect("one root should use coordinated inventory");
+        let error = stream
+            .next()
+            .await
+            .expect("registration failure should produce an event")
+            .expect_err("registration failure must be terminal");
+        assert!(error.to_string().contains("test pacing update failure"));
+    }
+
+    #[tokio::test]
+    async fn coordinated_inventory_suppresses_registration_error_after_stop_request() {
+        let parent = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let control = Arc::new(RegisterStoppingControl {
+            parent: Arc::clone(&parent),
+        });
+        let control_for_handle = Arc::clone(&control);
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![]).with_root_inventories(vec![Ok(
+                handle_with_control(VecDeque::new(), control_for_handle),
+            )]),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(PathBuf::from(":memory:")),
+        ));
+        let queue = Arc::new(Mutex::new(VecDeque::from(["Root".to_string()])));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<WorkerInventoryMessage>();
+        let worker = tokio::spawn(Arc::clone(&manager).run_inventory_worker(
+            "S".into(),
+            0,
+            queue,
+            coordinator_limits(),
+            parent,
+            sender,
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(WorkerInventoryMessage::Finished { _worker_id: 0 })
+        ));
+        worker.await.unwrap();
+        control.pause();
+        control.resume();
+        control.cancel();
+    }
+
+    #[tokio::test]
+    async fn coordinated_inventory_cancels_after_outer_entry_send_failure() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_inventories(vec![Ok(InventoryHandle {
+                    stream: Box::new(BlockingInventoryStream {
+                        started: Arc::clone(&started),
+                        release: Arc::clone(&release),
+                        event: Some(Ok(InventoryEvent::Entry(inventory_entry(
+                            "Entry",
+                            "Root.A.Entry",
+                        )))),
+                    }),
+                    control: Arc::new(RecordingInventoryControl::default()),
+                })]),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(PathBuf::from(":memory:")),
+        ));
+        let InventoryHandle { stream, control } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .expect("two roots should use coordinated inventory");
+        started.notified().await;
+        drop(stream);
+        release.notify_one();
+        for _ in 0..100 {
+            if control.is_cancelled() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("coordinator did not observe the closed output channel");
+    }
+
+    #[tokio::test]
+    async fn coordinated_worker_sender_failures_stop_and_clean_up_the_worker() {
+        let events = vec![
+            (completed_inventory(), false),
+            (
+                InventoryEvent::Entry(inventory_entry("Entry", "Entry.Item")),
+                true,
+            ),
+            (InventoryEvent::Progress(zero_inventory_progress()), true),
+            (
+                InventoryEvent::Slice(InventorySliceObservation {
+                    sequence: 1,
+                    backend: InventorySliceBackend::Da2,
+                    nodes_returned: 1,
+                    has_more: false,
+                    native_operations: 1,
+                    elapsed_ms: 1,
+                    entries_seen: 1,
+                    unique_items: 1,
+                }),
+                true,
+            ),
+            (completed_inventory(), true),
+        ];
+        for (event, wait_for_started) in events {
+            let (stream, gate) = if wait_for_started {
+                let started = Arc::new(Notify::new());
+                let release = Arc::new(Notify::new());
+                (
+                    Box::new(BlockingInventoryStream {
+                        started: Arc::clone(&started),
+                        release: Arc::clone(&release),
+                        event: Some(Ok(event)),
+                    }) as Box<dyn InventoryStream>,
+                    Some((started, release)),
+                )
+            } else {
+                (
+                    Box::new(VecInventoryStream {
+                        events: VecDeque::from([Ok(event)]),
+                    }) as Box<dyn InventoryStream>,
+                    None,
+                )
+            };
+            let client = Arc::new(LifecycleClient::new(vec![], vec![]).with_root_inventories(
+                vec![Ok(InventoryHandle {
+                    stream,
+                    control: Arc::new(RecordingInventoryControl::default()),
+                })],
+            ));
+            let manager = Arc::new(IndexManager::new(
+                client,
+                settings(PathBuf::from(":memory:")),
+            ));
+            let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+            let queue = Arc::new(Mutex::new(VecDeque::from(["Root".to_string()])));
+            let (sender, mut receiver) =
+                tokio::sync::mpsc::unbounded_channel::<WorkerInventoryMessage>();
+            let worker = tokio::spawn(Arc::clone(&manager).run_inventory_worker(
+                "S".into(),
+                0,
+                queue,
+                coordinator_limits(),
+                control,
+                sender,
+            ));
+            if wait_for_started {
+                assert!(matches!(
+                    receiver.recv().await,
+                    Some(WorkerInventoryMessage::Started { worker_id: 0 })
+                ));
+                let (started, release) = gate.unwrap();
+                started.notified().await;
+                drop(receiver);
+                release.notify_one();
+            } else {
+                drop(receiver);
+            }
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinated_inventory_falls_back_without_safe_roots() {
+        let client = Arc::new(MockOpcClient::default());
+        *client.capabilities_result.lock().unwrap() = Ok(BrowseCapabilities {
+            organization: NamespaceOrganization::Flat,
+            source: BrowseSource::Flat,
+            supports_browse_sessions: false,
+            supports_search: false,
+            max_page_size: 100,
+        });
+        let mut config = settings(PathBuf::from(":memory:"));
+        config.worker_count = 4;
+        let manager = Arc::new(IndexManager::new(client.clone(), config));
+
+        assert!(
+            manager
+                .start_coordinated_inventory("S", coordinator_limits())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(client.inventory_root_start_count.load(Ordering::Acquire), 0);
+
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::clone(&client),
+            settings(directory.path().join("flat-fallback.sqlite3")),
+        ));
+        let handle = manager
+            .start_refresh_inventory("S", &Arc::new(()), coordinator_limits())
+            .await
+            .unwrap()
+            .expect("unsafe partitioning should fall back to full-root inventory");
+        assert_eq!(client.inventory_start_count.load(Ordering::Acquire), 1);
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn coordinated_inventory_falls_back_when_root_page_has_too_few_workers() {
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![]).with_root_browse_page(Ok(BrowsePage {
+                nodes: vec![root_node(
+                    "Only branch",
+                    BrowseNodeKind::Branch,
+                    Some("Root"),
+                )],
+                next_page_token: None,
+                complete: true,
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da2,
+                warning: None,
+            })),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(PathBuf::from(":memory:")),
+        ));
+        assert!(
+            manager
+                .start_coordinated_inventory("S", coordinator_limits())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinated_inventory_rejects_root_continuation_pages() {
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![]).with_root_browse_page(Ok(BrowsePage {
+                nodes: Vec::new(),
+                next_page_token: Some("next".into()),
+                complete: false,
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da2,
+                warning: None,
+            })),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(PathBuf::from(":memory:")),
+        ));
+        let error = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .err()
+            .expect("root continuation should be rejected");
+        assert!(error.to_string().contains("continuation page"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_inventory_forwards_control_to_all_root_workers() {
+        let directory = tempdir().unwrap();
+        let first_control = Arc::new(RecordingInventoryControl::default());
+        let second_control = Arc::new(RecordingInventoryControl::default());
+        let started = Arc::new(Notify::new());
+        let started_count = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_inventories(vec![
+                    Ok(InventoryHandle {
+                        stream: Box::new(ControlledInventoryStream {
+                            started: Arc::clone(&started),
+                            started_count: Arc::clone(&started_count),
+                            release: Arc::clone(&release),
+                            event: Some(Ok(completed_inventory())),
+                            shutdowns: Arc::clone(&shutdowns),
+                        }),
+                        control: Arc::clone(&first_control) as Arc<dyn InventoryControl>,
+                    }),
+                    Ok(InventoryHandle {
+                        stream: Box::new(ControlledInventoryStream {
+                            started: Arc::clone(&started),
+                            started_count: Arc::clone(&started_count),
+                            release: Arc::clone(&release),
+                            event: Some(Ok(completed_inventory())),
+                            shutdowns: Arc::clone(&shutdowns),
+                        }),
+                        control: Arc::clone(&second_control) as Arc<dyn InventoryControl>,
+                    }),
+                ]),
+        );
+        let mut config = settings(directory.path().join("control-forwarding.sqlite3"));
+        config.worker_count = 2;
+        let manager = Arc::new(IndexManager::new(client, config));
+        let InventoryHandle {
+            stream: mut inventory_stream,
+            control,
+        } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        let reader = tokio::spawn(async move { inventory_stream.next().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started_count.load(Ordering::Acquire) < 2 {
+                started.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        control.pause();
+        control.resume();
+        control.cancel();
+
+        assert!(!first_control.paused.load(Ordering::Acquire));
+        assert!(!second_control.paused.load(Ordering::Acquire));
+        assert_eq!(first_control.pause_count.load(Ordering::Acquire), 1);
+        assert_eq!(second_control.pause_count.load(Ordering::Acquire), 1);
+        assert_eq!(first_control.resume_count.load(Ordering::Acquire), 1);
+        assert_eq!(second_control.resume_count.load(Ordering::Acquire), 1);
+        assert!(first_control.is_cancelled());
+        assert!(second_control.is_cancelled());
+        release.notify_waiters();
+        assert!(reader.await.unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_inventory_cancellation_stops_active_workers_and_joins_them() {
+        let directory = tempdir().unwrap();
+        let started = Arc::new(Notify::new());
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let first_control = Arc::new(CancellationInventoryControl::default());
+        let second_control = Arc::new(CancellationInventoryControl::default());
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_inventories(vec![
+                    Ok(InventoryHandle {
+                        stream: Box::new(CancellationAwareInventoryStream {
+                            started: Arc::clone(&started),
+                            control: Arc::clone(&first_control),
+                            shutdowns: Arc::clone(&shutdowns),
+                            emitted: false,
+                        }),
+                        control: Arc::clone(&first_control) as Arc<dyn InventoryControl>,
+                    }),
+                    Ok(InventoryHandle {
+                        stream: Box::new(CancellationAwareInventoryStream {
+                            started: Arc::clone(&started),
+                            control: Arc::clone(&second_control),
+                            shutdowns: Arc::clone(&shutdowns),
+                            emitted: false,
+                        }),
+                        control: Arc::clone(&second_control) as Arc<dyn InventoryControl>,
+                    }),
+                ]),
+        );
+        let mut config = settings(directory.path().join("cancellation.sqlite3"));
+        config.worker_count = 2;
+        let manager = Arc::new(IndexManager::new(client, config));
+        let InventoryHandle {
+            stream: mut inventory_stream,
+            control,
+        } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        started.notified().await;
+        first_control.pause();
+        first_control.resume();
+        control.cancel();
+        let event = inventory_stream.next().await;
+        assert!(matches!(
+            event,
+            Some(Ok(InventoryEvent::Completed(result)))
+                if result.cancelled && !result.complete
+        ));
+        assert_eq!(shutdowns.load(Ordering::Acquire), 2);
+        assert!(first_control.is_cancelled());
+        assert!(second_control.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_inventory_handles_closed_coordinator_senders() {
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(PathBuf::from(":memory:")),
+        ));
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let (sender, receiver) =
+            tokio::sync::mpsc::unbounded_channel::<anyhow::Result<InventoryEvent>>();
+        drop(receiver);
+        manager
+            .run_coordinated_inventory(
+                "S".into(),
+                InventoryRootPlan {
+                    root_entries: vec![inventory_entry("Root", "Root.Item")],
+                    worker_roots: Vec::new(),
+                    organization: NamespaceOrganization::Hierarchical,
+                    source: BrowseSource::Da2,
+                },
+                1,
+                coordinator_limits(),
+                control,
+                sender,
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_worker_handles_registration_cancellation_and_failures() {
+        let cases = [
+            ("registration-cancelled", true, false),
+            ("registration-failed", false, true),
+        ];
+        for (name, cancel_during_start, fail_registration) in cases {
+            let directory = tempdir().unwrap();
+            let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+            let parent = Arc::clone(&control);
+            let inventory_control = Arc::new(RecordingInventoryControl::default());
+            if fail_registration {
+                inventory_control.fail_pacing_on_call(1);
+            }
+            let client = LifecycleClient::new(vec![], vec![])
+                .with_root_inventory_start_hook(move || {
+                    if cancel_during_start {
+                        parent.cancel();
+                    }
+                })
+                .with_root_inventories(vec![Ok(handle_with_control(
+                    VecDeque::new(),
+                    Arc::clone(&inventory_control),
+                ))]);
+            let manager = Arc::new(IndexManager::new(
+                Arc::new(client),
+                settings(directory.path().join(name)),
+            ));
+            let queue = Arc::new(Mutex::new(VecDeque::from(["Root".to_string()])));
+            let (sender, mut receiver) =
+                tokio::sync::mpsc::unbounded_channel::<WorkerInventoryMessage>();
+            let worker = tokio::spawn(manager.run_inventory_worker(
+                "S".into(),
+                0,
+                queue,
+                coordinator_limits(),
+                control,
+                sender,
+            ));
+            let mut saw_finished = false;
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    WorkerInventoryMessage::Failed { error, .. } => {
+                        assert!(fail_registration);
+                        assert!(error.contains("test pacing update failure"));
+                    }
+                    WorkerInventoryMessage::Finished { .. } => {
+                        saw_finished = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            worker.await.unwrap();
+            assert!(saw_finished);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_worker_stops_after_cancelled_root_start_failure() {
+        let directory = tempdir().unwrap();
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let parent = Arc::clone(&control);
+        let client = LifecycleClient::new(vec![], vec![])
+            .with_root_inventory_start_hook(move || parent.cancel())
+            .with_root_inventories(vec![Err("root start failed".into())]);
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(client),
+            settings(directory.path().join("cancelled-root-start.sqlite3")),
+        ));
+        let queue = Arc::new(Mutex::new(VecDeque::from(["Root".to_string()])));
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<WorkerInventoryMessage>();
+        let worker = tokio::spawn(manager.run_inventory_worker(
+            "S".into(),
+            0,
+            queue,
+            coordinator_limits(),
+            control,
+            sender,
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(WorkerInventoryMessage::Finished { _worker_id: 0 })
+        ));
+        assert!(receiver.recv().await.is_none());
+        worker.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_worker_handles_closed_event_senders() {
+        let events = vec![
+            Some(Ok(InventoryEvent::Entry(inventory_entry(
+                "Entry", "S.Entry",
+            )))),
+            Some(Ok(InventoryEvent::Progress(zero_progress()))),
+            Some(Ok(InventoryEvent::Slice(InventorySliceObservation {
+                sequence: 1,
+                backend: InventorySliceBackend::Da2,
+                nodes_returned: 1,
+                has_more: false,
+                native_operations: 1,
+                elapsed_ms: 1,
+                entries_seen: 1,
+                unique_items: 1,
+            }))),
+            Some(Ok(completed_inventory())),
+            Some(Err(anyhow::anyhow!("stream error"))),
+            None,
+        ];
+        for event in events {
+            let directory = tempdir().unwrap();
+            let client = LifecycleClient::new(vec![], vec![]).with_root_inventories(vec![Ok(
+                handle_with_control(
+                    event.into_iter().collect(),
+                    Arc::new(RecordingInventoryControl::default()),
+                ),
+            )]);
+            let manager = Arc::new(IndexManager::new(
+                Arc::new(client),
+                settings(directory.path().join("closed-sender.sqlite3")),
+            ));
+            let queue = Arc::new(Mutex::new(VecDeque::from(["Root".to_string()])));
+            let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+            let (sender, mut receiver) =
+                tokio::sync::mpsc::unbounded_channel::<WorkerInventoryMessage>();
+            let worker = tokio::spawn(manager.run_inventory_worker(
+                "S".into(),
+                0,
+                queue,
+                coordinator_limits(),
+                Arc::clone(&control),
+                sender,
+            ));
+            assert!(matches!(
+                receiver.recv().await,
+                Some(WorkerInventoryMessage::Started { worker_id: 0 })
+            ));
+            drop(receiver);
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_worker_reports_a_poisoned_root_queue() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("poisoned-queue.sqlite3")),
+        ));
+        let queue = Arc::new(Mutex::new(VecDeque::<String>::new()));
+        let poison_queue = Arc::clone(&queue);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_queue.lock().unwrap();
+            panic!("poison root queue");
+        })
+        .join();
+        let control = CoordinatedInventoryControl::new(InventoryPacing::default());
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<WorkerInventoryMessage>();
+        let worker = tokio::spawn(manager.run_inventory_worker(
+            "S".into(),
+            0,
+            queue,
+            coordinator_limits(),
+            control,
+            sender,
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(WorkerInventoryMessage::Failed { error, .. })
+                if error.contains("root queue lock poisoned")
+        ));
+        worker.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_inventory_detects_worker_task_panic() {
+        let directory = tempdir().unwrap();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_inventories(vec![
+                    Ok(InventoryHandle {
+                        stream: Box::new(PanicAfterReleaseInventoryStream {
+                            started: Arc::clone(&started),
+                            release: Arc::clone(&release),
+                        }),
+                        control: Arc::new(RecordingInventoryControl::default()),
+                    }),
+                    Ok(immediate_inventory_handle()),
+                ]),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("worker-panic.sqlite3")),
+        ));
+        let InventoryHandle {
+            stream: mut inventory_stream,
+            ..
+        } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        started.notified().await;
+        release.notify_one();
+        let event = inventory_stream.next().await;
+        assert!(matches!(
+            event,
+            Some(Err(error)) if error.to_string().contains("panicked")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_inventory_reports_root_worker_start_failure() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_inventories(vec![
+                    Err("root worker failed to start".into()),
+                    Ok(immediate_inventory_handle()),
+                ]),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("worker-start-failure.sqlite3")),
+        ));
+        let InventoryHandle {
+            stream: mut inventory_stream,
+            ..
+        } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        let event = inventory_stream.next().await;
+        assert!(matches!(
+            event,
+            Some(Err(error)) if error.to_string().contains("root worker failed to start")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_inventory_reports_incomplete_worker_termination() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_inventories(vec![
+                    Ok(InventoryHandle {
+                        stream: Box::new(VecInventoryStream {
+                            events: VecDeque::from([Ok(InventoryEvent::Completed(
+                                InventoryCompleted {
+                                    complete: false,
+                                    cancelled: false,
+                                    truncated: false,
+                                    warning: Some("worker ended early".into()),
+                                    organization: NamespaceOrganization::Hierarchical,
+                                    source: BrowseSource::Da2,
+                                },
+                            ))]),
+                        }),
+                        control: Arc::new(RecordingInventoryControl::default()),
+                    }),
+                    Ok(immediate_inventory_handle()),
+                ]),
+        );
+        let mut config = settings(directory.path().join("worker-incomplete.sqlite3"));
+        config.worker_count = 2;
+        let manager = Arc::new(IndexManager::new(client, config));
+        let InventoryHandle {
+            stream: mut inventory_stream,
+            ..
+        } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        let event = inventory_stream.next().await;
+        assert!(matches!(
+            event,
+            Some(Err(error)) if error.to_string().contains("ended before completion")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_inventory_reports_root_browse_close_failure() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_close_result(Err("root browse close failed".into())),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("root-close-failure.sqlite3")),
+        ));
+        let result = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await;
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("root browse close failed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinated_inventory_shutdown_panic_is_reported() {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(
+            LifecycleClient::new(vec![], vec![])
+                .with_root_browse_page(Ok(coordinator_root_page()))
+                .with_root_inventories(vec![Ok(InventoryHandle {
+                    stream: Box::new(CompletedThenShutdownPanicInventoryStream { emitted: false }),
+                    control: Arc::new(RecordingInventoryControl::default()),
+                })]),
+        );
+        let manager = Arc::new(IndexManager::new(
+            client,
+            settings(directory.path().join("shutdown-panic.sqlite3")),
+        ));
+        let InventoryHandle {
+            stream: mut inventory_stream,
+            ..
+        } = manager
+            .start_coordinated_inventory("S", coordinator_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        let event = inventory_stream.next().await;
+        assert!(matches!(
+            event,
+            Some(Err(error)) if error.to_string().contains("panicked")
+        ));
+    }
+
+    fn coordinator_limits() -> InventoryLimits {
+        InventoryLimits {
+            item_rate_per_second: 0,
+            batch_size: 25,
+            duty_cycle_percent: 100,
+        }
+    }
+
+    fn coordinator_root_page() -> BrowsePage {
+        BrowsePage {
+            nodes: vec![
+                root_node("Branch A", BrowseNodeKind::Branch, Some("Root.A")),
+                root_node("Branch B", BrowseNodeKind::Branch, Some("Root.B")),
+            ],
+            next_page_token: None,
+            complete: true,
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+            warning: None,
+        }
     }
 
     #[test]
@@ -12237,6 +14555,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_loop_records_inventory_shutdown_failure() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("shutdown-failure.sqlite3")),
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, Arc::clone(&trait_control));
+        let mut state = BuildRunState::new(&manager.settings, None);
+        let mut handle = InventoryHandle {
+            stream: Box::new(CompletedThenShutdownErrorInventoryStream { emitted: false }),
+            control: Arc::clone(&trait_control),
+        };
+
+        let outcome = manager
+            .run_build_loop("S", 1, &mut handle, &[], &mut state)
+            .await;
+        assert!(matches!(
+            outcome,
+            BuildLoopOutcome::Failed(error)
+                if error.contains("inventory worker shutdown failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_loop_keeps_build_failure_when_shutdown_also_fails() {
+        let directory = tempdir().unwrap();
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("shutdown-after-failure.sqlite3")),
+        ));
+        let control = Arc::new(RecordingInventoryControl::default());
+        let trait_control: Arc<dyn InventoryControl> = control.clone();
+        insert_runtime_build(&manager, Arc::clone(&trait_control));
+        let mut state = BuildRunState::new(&manager.settings, None);
+        let mut handle = InventoryHandle {
+            stream: Box::new(ErrorThenShutdownErrorInventoryStream { emitted: false }),
+            control: Arc::clone(&trait_control),
+        };
+
+        let outcome = manager
+            .run_build_loop("S", 1, &mut handle, &[], &mut state)
+            .await;
+        assert!(matches!(
+            outcome,
+            BuildLoopOutcome::Failed(error) if error == "injected inventory build failure"
+        ));
+    }
+
+    #[tokio::test]
     async fn build_readiness_reports_controller_recovery_cancellation() {
         let directory = tempdir().unwrap();
         let mut config = settings(directory.path().join("readiness-cancelled.sqlite3"));
@@ -14858,6 +17227,47 @@ mod tests {
         }
     }
 
+    struct RegisterCancellingControl {
+        parent: Arc<CoordinatedInventoryControl>,
+        cancelled: AtomicBool,
+    }
+
+    struct RegisterStoppingControl {
+        parent: Arc<CoordinatedInventoryControl>,
+    }
+
+    impl InventoryControl for RegisterStoppingControl {
+        fn pause(&self) {}
+
+        fn resume(&self) {}
+
+        fn cancel(&self) {}
+
+        fn set_pacing(&self, _pacing: InventoryPacing) -> anyhow::Result<()> {
+            self.parent.stop_workers();
+            anyhow::bail!("test registration stop");
+        }
+    }
+
+    impl InventoryControl for RegisterCancellingControl {
+        fn pause(&self) {}
+
+        fn resume(&self) {}
+
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::Release);
+        }
+
+        fn set_pacing(&self, _pacing: InventoryPacing) -> anyhow::Result<()> {
+            self.parent.cancel();
+            Ok(())
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
     struct VecInventoryStream {
         events: VecDeque<anyhow::Result<InventoryEvent>>,
     }
@@ -14870,6 +17280,44 @@ mod tests {
     }
 
     struct PanickingInventoryStream;
+
+    struct PanicAfterReleaseInventoryStream {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    struct CompletedThenShutdownPanicInventoryStream {
+        emitted: bool,
+    }
+
+    struct CompletedThenShutdownErrorInventoryStream {
+        emitted: bool,
+    }
+
+    struct ErrorThenShutdownErrorInventoryStream {
+        emitted: bool,
+    }
+
+    struct ControlledInventoryStream {
+        started: Arc<Notify>,
+        started_count: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+        event: Option<anyhow::Result<InventoryEvent>>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct CancellationInventoryControl {
+        cancelled: AtomicBool,
+        cancellation: Notify,
+    }
+
+    struct CancellationAwareInventoryStream {
+        started: Arc<Notify>,
+        control: Arc<CancellationInventoryControl>,
+        shutdowns: Arc<AtomicUsize>,
+        emitted: bool,
+    }
 
     #[async_trait::async_trait]
     impl InventoryStream for DropGateInventoryStream {
@@ -14892,6 +17340,122 @@ mod tests {
     impl InventoryStream for PanickingInventoryStream {
         async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
             panic!("injected inventory stream panic");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InventoryStream for PanicAfterReleaseInventoryStream {
+        async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+            self.started.notify_one();
+            self.release.notified().await;
+            panic!("injected coordinated inventory stream panic");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InventoryStream for CompletedThenShutdownPanicInventoryStream {
+        async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+            if self.emitted {
+                None
+            } else {
+                self.emitted = true;
+                Some(Ok(completed_inventory()))
+            }
+        }
+
+        async fn shutdown(&mut self) -> anyhow::Result<()> {
+            panic!("injected coordinated inventory shutdown panic");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InventoryStream for CompletedThenShutdownErrorInventoryStream {
+        async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+            if self.emitted {
+                None
+            } else {
+                self.emitted = true;
+                Some(Ok(completed_inventory()))
+            }
+        }
+
+        async fn shutdown(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("injected coordinated inventory shutdown failure")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InventoryStream for ErrorThenShutdownErrorInventoryStream {
+        async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+            if self.emitted {
+                None
+            } else {
+                self.emitted = true;
+                Some(Err(anyhow::anyhow!("injected inventory build failure")))
+            }
+        }
+
+        async fn shutdown(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("injected coordinated inventory shutdown failure")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InventoryStream for ControlledInventoryStream {
+        async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+            let event = self.event.take()?;
+            self.started_count.fetch_add(1, Ordering::AcqRel);
+            self.started.notify_one();
+            self.release.notified().await;
+            Some(event)
+        }
+
+        async fn shutdown(&mut self) -> anyhow::Result<()> {
+            self.shutdowns.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    impl InventoryControl for CancellationInventoryControl {
+        fn pause(&self) {}
+
+        fn resume(&self) {}
+
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::Release);
+            self.cancellation.notify_waiters();
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InventoryStream for CancellationAwareInventoryStream {
+        async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+            if self.emitted {
+                return None;
+            }
+            self.emitted = true;
+            self.started.notify_one();
+            let cancellation = self.control.cancellation.notified();
+            if !self.control.is_cancelled() {
+                cancellation.await;
+            }
+            Some(Ok(InventoryEvent::Completed(InventoryCompleted {
+                complete: false,
+                cancelled: true,
+                truncated: false,
+                warning: Some("test cancellation".into()),
+                organization: NamespaceOrganization::Hierarchical,
+                source: BrowseSource::Da2,
+            })))
+        }
+
+        async fn shutdown(&mut self) -> anyhow::Result<()> {
+            self.shutdowns.fetch_add(1, Ordering::AcqRel);
+            Ok(())
         }
     }
 
@@ -14947,6 +17511,11 @@ mod tests {
         inventory_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
         inventory_gate_used: AtomicBool,
         inventory_start_count: AtomicUsize,
+        root_browse_page: Mutex<Option<Result<BrowsePage, String>>>,
+        root_close_result: Mutex<Option<Result<(), String>>>,
+        root_inventories: Mutex<VecDeque<Result<InventoryHandle, String>>>,
+        root_inventory_start_count: AtomicUsize,
+        root_inventory_start_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     }
 
     impl LifecycleClient {
@@ -14963,6 +17532,11 @@ mod tests {
                 inventory_gate: Mutex::new(None),
                 inventory_gate_used: AtomicBool::new(false),
                 inventory_start_count: AtomicUsize::new(0),
+                root_browse_page: Mutex::new(None),
+                root_close_result: Mutex::new(None),
+                root_inventories: Mutex::new(VecDeque::new()),
+                root_inventory_start_count: AtomicUsize::new(0),
+                root_inventory_start_hook: Mutex::new(None),
             }
         }
 
@@ -14978,6 +17552,29 @@ mod tests {
 
         fn with_inventory_gate(self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
             *self.inventory_gate.lock().unwrap() = Some((started, release));
+            self
+        }
+
+        fn with_root_browse_page(self, page: Result<BrowsePage, String>) -> Self {
+            *self.root_browse_page.lock().unwrap() = Some(page);
+            self
+        }
+
+        fn with_root_close_result(self, result: Result<(), String>) -> Self {
+            *self.root_close_result.lock().unwrap() = Some(result);
+            self
+        }
+
+        fn with_root_inventories(self, inventories: Vec<Result<InventoryHandle, String>>) -> Self {
+            *self.root_inventories.lock().unwrap() = inventories.into();
+            self
+        }
+
+        fn with_root_inventory_start_hook<F>(self, hook: F) -> Self
+        where
+            F: Fn() + Send + Sync + 'static,
+        {
+            *self.root_inventory_start_hook.lock().unwrap() = Some(Arc::new(hook));
             self
         }
     }
@@ -15020,10 +17617,16 @@ mod tests {
             _page_size: u32,
             _refresh: bool,
         ) -> anyhow::Result<BrowsePage> {
+            if let Some(result) = self.root_browse_page.lock().unwrap().take() {
+                return result.map_err(anyhow::Error::msg);
+            }
             anyhow::bail!("unused in index tests")
         }
 
         async fn close_browse_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            if let Some(result) = self.root_close_result.lock().unwrap().take() {
+                return result.map_err(anyhow::Error::msg);
+            }
             Ok(())
         }
 
@@ -15045,6 +17648,25 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Err("no inventory configured".into()))
+                .map_err(anyhow::Error::msg)
+        }
+
+        async fn start_inventory_at_root(
+            &self,
+            _server: &str,
+            _root_item_id: &str,
+            _batch_size: u32,
+        ) -> anyhow::Result<InventoryHandle> {
+            self.root_inventory_start_count
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(hook) = self.root_inventory_start_hook.lock().unwrap().clone() {
+                hook();
+            }
+            self.root_inventories
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err("no root inventory configured".into()))
                 .map_err(anyhow::Error::msg)
         }
 
@@ -15102,10 +17724,13 @@ mod tests {
         )
     }
 
-    fn handle_with_control(
+    fn handle_with_control<T>(
         events: VecDeque<anyhow::Result<InventoryEvent>>,
-        control: Arc<RecordingInventoryControl>,
-    ) -> InventoryHandle {
+        control: Arc<T>,
+    ) -> InventoryHandle
+    where
+        T: InventoryControl + 'static,
+    {
         InventoryHandle {
             stream: Box::new(VecInventoryStream { events }),
             control,

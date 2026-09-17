@@ -128,6 +128,19 @@ Native inventory batches are bounded to 1,000 entries by the OPC DA client contr
 Native inventory slicing and SQLite commit batching are independently bounded, and adaptive
 controller decisions update the native slice batch size and pacing interval; the commit interval
 provides a time limit for low-volume inventories.
+`index.worker_count` controls independent namespace workers within one build
+(default `1`, maximum `4`). When it is greater than one, the gateway uses
+hierarchical root browsing to partition safe canonical branches across fresh
+root-scoped inventory streams. Root-level items are emitted directly and
+duplicate ItemIDs are suppressed. If the server cannot provide a complete,
+session-backed hierarchical root page with at least two expandable branches,
+the gateway falls back to one full-root inventory.
+Set `index.inventory_root` to an exact canonical ItemID to inventory only that
+subtree; this uses the client's root-scoped API directly and takes precedence
+over automatic root partitioning.
+Coordinated workers share pause, resume, pacing, and cancellation controls;
+all worker streams are shut down and joined before the build releases its
+ownership.
 Runtime status includes rolling
 foreground latency/error/quality metrics, host/storage availability, and persisted scheduler
 backoff diagnostics.

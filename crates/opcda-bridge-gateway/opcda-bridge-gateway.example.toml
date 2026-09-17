@@ -67,6 +67,9 @@ schedule_jitter_seconds = 21600
 # Native inventory slices and SQLite commits are independently bounded. Native
 # slices must not exceed the OPC DA client's 1,000-entry limit.
 inventory_batch_size = 100
+# Optional exact canonical ItemID to inventory instead of the complete namespace.
+# When set, automatic root partitioning is not used.
+# inventory_root = "FCS0201"
 commit_batch_size = 100
 commit_interval_ms = 1000
 
@@ -124,6 +127,9 @@ maintenance_windows = []
 
 # Number of inventories allowed at once and the in-memory query-cache bound.
 concurrency = 1
+# Independent OPC namespace workers within one build. Values above one require
+# safe root partitioning; unsupported servers fall back to one full-root worker.
+worker_count = 1
 query_cache_capacity = 256
 
 # Set true to keep automatic indexing paused after gateway startup.

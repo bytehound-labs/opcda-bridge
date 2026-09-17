@@ -7,7 +7,7 @@ use crate::opc::{
     InventoryEntry, InventoryEvent, InventoryHandle, InventoryNodeKind, InventoryProgress,
     InventoryStream, NamespaceOrganization, OpcClient, OpcValue, TagValue, WriteResult,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,11 @@ pub(crate) struct MockOpcClient {
     pub(crate) read_tag_values_result: Mutex<Result<Vec<TagValue>, String>>,
     pub(crate) write_tag_value_result: Mutex<Result<WriteResult, String>>,
     pub(crate) inventory_events: Mutex<VecDeque<Result<InventoryEvent, String>>>,
+    pub(crate) inventory_root_events:
+        Mutex<HashMap<String, VecDeque<Result<InventoryEvent, String>>>>,
     pub(crate) inventory_start_count: Arc<AtomicUsize>,
+    pub(crate) inventory_root_start_count: Arc<AtomicUsize>,
+    pub(crate) inventory_started_roots: Arc<Mutex<Vec<String>>>,
     pub(crate) inventory_paused: Arc<AtomicBool>,
     pub(crate) inventory_cancelled: Arc<AtomicBool>,
     pub(crate) inventory_pacing_ns: Arc<AtomicUsize>,
@@ -98,7 +102,10 @@ impl Default for MockOpcClient {
                     source: BrowseSource::Da2,
                 })),
             ])),
+            inventory_root_events: Mutex::new(HashMap::new()),
             inventory_start_count: Arc::new(AtomicUsize::new(0)),
+            inventory_root_start_count: Arc::new(AtomicUsize::new(0)),
+            inventory_started_roots: Arc::new(Mutex::new(Vec::new())),
             inventory_paused: Arc::new(AtomicBool::new(false)),
             inventory_cancelled: Arc::new(AtomicBool::new(false)),
             inventory_pacing_ns: Arc::new(AtomicUsize::new(0)),
@@ -176,6 +183,41 @@ impl OpcClient for MockOpcClient {
             .lock()
             .unwrap()
             .drain(..)
+            .map(|event| event.map_err(|error| anyhow::anyhow!("{error}")))
+            .collect();
+        Ok(InventoryHandle {
+            stream: Box::new(MockInventoryStream { events }),
+            control: Arc::new(MockInventoryControl {
+                paused: Arc::clone(&self.inventory_paused),
+                cancelled: Arc::clone(&self.inventory_cancelled),
+                pacing_ns: Arc::clone(&self.inventory_pacing_ns),
+                item_rate: Arc::clone(&self.inventory_item_rate),
+                batch_size: Arc::clone(&self.inventory_batch_size),
+            }),
+        })
+    }
+
+    async fn start_inventory_at_root(
+        &self,
+        _server: &str,
+        root_item_id: &str,
+        batch_size: u32,
+    ) -> anyhow::Result<InventoryHandle> {
+        self.inventory_root_start_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.inventory_started_roots
+            .lock()
+            .unwrap()
+            .push(root_item_id.to_owned());
+        self.inventory_batch_size
+            .store(batch_size as usize, Ordering::Release);
+        let events = self
+            .inventory_root_events
+            .lock()
+            .unwrap()
+            .remove(root_item_id)
+            .unwrap_or_default()
+            .into_iter()
             .map(|event| event.map_err(|error| anyhow::anyhow!("{error}")))
             .collect();
         Ok(InventoryHandle {

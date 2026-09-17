@@ -146,6 +146,15 @@ impl Default for InventoryPacing {
 #[async_trait::async_trait]
 pub trait InventoryStream: Send {
     async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>>;
+
+    /// Wait for internal worker tasks to stop after cancellation.
+    ///
+    /// Ordinary streams do not own additional tasks and therefore use the
+    /// default no-op implementation. Coordinated streams override this so
+    /// build ownership is not released before every worker has joined.
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub trait InventoryControl: Send + Sync {
@@ -215,6 +224,21 @@ pub trait OpcClient: Send + Sync + 'static {
         server: &str,
         batch_size: u32,
     ) -> anyhow::Result<InventoryHandle>;
+    /// Start an inventory rooted at one exact canonical ItemID.
+    ///
+    /// Providers that cannot isolate a subtree use the default error. The
+    /// coordinator uses that error only while attempting automatic root
+    /// partitioning; an explicitly configured `inventory_root` treats a
+    /// provider failure as fatal so the requested scope is never widened.
+    async fn start_inventory_at_root(
+        &self,
+        server: &str,
+        root_item_id: &str,
+        batch_size: u32,
+    ) -> anyhow::Result<InventoryHandle> {
+        let _ = (server, root_item_id, batch_size);
+        anyhow::bail!("root-scoped namespace inventory is not supported")
+    }
     async fn read_tag_values(
         &self,
         server: &str,
@@ -233,6 +257,63 @@ pub type SharedOpcClient<C> = Arc<C>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DefaultRootClient;
+
+    #[async_trait::async_trait]
+    impl OpcClient for DefaultRootClient {
+        async fn list_servers(&self, _host: &str) -> anyhow::Result<Vec<String>> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get_capabilities(&self, _server: &str) -> anyhow::Result<BrowseCapabilities> {
+            anyhow::bail!("unused")
+        }
+
+        async fn open_browse_session(&self, _server: &str) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn browse_page(
+            &self,
+            _session_id: &str,
+            _parent_node_key: Option<&str>,
+            _page_token: Option<&str>,
+            _page_size: u32,
+            _refresh: bool,
+        ) -> anyhow::Result<BrowsePage> {
+            anyhow::bail!("unused")
+        }
+
+        async fn close_browse_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+
+        async fn start_inventory(
+            &self,
+            _server: &str,
+            _batch_size: u32,
+        ) -> anyhow::Result<InventoryHandle> {
+            anyhow::bail!("unused")
+        }
+
+        async fn read_tag_values(
+            &self,
+            _server: &str,
+            _tag_ids: Vec<String>,
+        ) -> anyhow::Result<Vec<TagValue>> {
+            anyhow::bail!("unused")
+        }
+
+        async fn write_tag_value(
+            &self,
+            _server: &str,
+            _tag_id: &str,
+            _value: OpcValue,
+        ) -> anyhow::Result<WriteResult> {
+            anyhow::bail!("unused")
+        }
+    }
 
     struct DefaultInventoryControl;
 
@@ -258,5 +339,47 @@ mod tests {
         control.cancel();
         assert!(!control.is_cancelled());
         control.set_pacing(InventoryPacing::default()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn opc_client_default_root_inventory_is_unsupported() {
+        let client = DefaultRootClient;
+        assert!(client.list_servers("host").await.is_err());
+        assert!(client.get_capabilities("server").await.is_err());
+        assert!(client.open_browse_session("server").await.is_err());
+        assert!(
+            client
+                .browse_page("session", None, None, 10, false)
+                .await
+                .is_err()
+        );
+        assert!(client.close_browse_session("session").await.is_err());
+        assert!(client.start_inventory("server", 10).await.is_err());
+        assert!(
+            client
+                .start_inventory_at_root("server", "Area.Loop", 10)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .read_tag_values("server", vec!["tag".into()])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .write_tag_value("server", "tag", OpcValue::Float(1.0))
+                .await
+                .is_err()
+        );
+        let result = client
+            .start_inventory_at_root("server", "Area.Loop", 10)
+            .await;
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("not supported"))
+        );
     }
 }
