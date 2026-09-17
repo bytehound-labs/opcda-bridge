@@ -8,7 +8,8 @@ use crate::controller::{
 use crate::opc::{
     BrowseSource, InventoryCompleted, InventoryControl, InventoryEntry, InventoryEvent,
     InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress,
-    InventorySliceObservation, MAX_NATIVE_INVENTORY_BATCH_SIZE, NamespaceOrganization, OpcClient,
+    InventorySliceObservation, InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE,
+    NamespaceOrganization, OpcClient,
 };
 use chrono::{DateTime, Local, Timelike};
 use fs2::FileExt;
@@ -401,6 +402,12 @@ enum WorkerInventoryMessage {
     Finished {
         _worker_id: usize,
     },
+}
+
+enum WorkerEventAction {
+    Continue,
+    Completed,
+    Stop,
 }
 
 struct WorkerFinishedGuard {
@@ -4753,12 +4760,12 @@ impl<C: OpcClient> IndexManager<C> {
             if control.should_stop_workers() {
                 break;
             }
-            let root = match queue.lock() {
-                Ok(mut roots) => roots.pop_front(),
+            let root = match Self::pop_inventory_root(&queue) {
+                Ok(root) => root,
                 Err(error) => {
                     let _ = sender.send(WorkerInventoryMessage::Failed {
                         worker_id,
-                        error: format!("inventory root queue lock poisoned: {error}"),
+                        error: error.to_string(),
                     });
                     return;
                 }
@@ -4766,114 +4773,29 @@ impl<C: OpcClient> IndexManager<C> {
             let Some(root) = root else {
                 break;
             };
-            let handle = match self
-                .with_opc_timeout(
-                    "start root inventory",
-                    self.client
-                        .start_inventory_at_root(&server, &root, initial_limits.batch_size),
+            let Some(mut stream) = (match self
+                .start_inventory_worker_stream(
+                    &server,
+                    &root,
+                    worker_id,
+                    initial_limits,
+                    control.as_ref(),
+                    &sender,
                 )
                 .await
             {
-                Ok(handle) => handle,
-                Err(error) => {
-                    if control.should_stop_workers() {
-                        break;
-                    }
-                    let _ = sender.send(WorkerInventoryMessage::Failed {
-                        worker_id,
-                        error: error.to_string(),
-                    });
-                    control.cancel();
-                    return;
-                }
-            };
-            let worker_control = Arc::clone(&handle.control);
-            match control.register(worker_id, worker_control) {
-                Ok(true) => {}
-                Ok(false) => {
-                    let mut stream = handle.stream;
-                    let _ = stream.shutdown().await;
-                    break;
-                }
-                Err(error) => {
-                    if control.should_stop_workers() {
-                        let mut stream = handle.stream;
-                        let _ = stream.shutdown().await;
-                        break;
-                    }
-                    let _ = sender.send(WorkerInventoryMessage::Failed {
-                        worker_id,
-                        error: error.to_string(),
-                    });
-                    control.cancel();
-                    break;
-                }
-            }
-            let mut stream = handle.stream;
-            if sender
-                .send(WorkerInventoryMessage::Started { worker_id })
-                .is_err()
-            {
-                control.cancel();
-                let _ = stream.shutdown().await;
+                Ok(stream) => stream,
+                Err(()) => return,
+            }) else {
                 break;
-            }
-            let mut completed = false;
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(InventoryEvent::Entry(entry)) => {
-                        if sender.send(WorkerInventoryMessage::Entry(entry)).is_err() {
-                            control.cancel();
-                            break;
-                        }
-                    }
-                    Ok(InventoryEvent::Progress(progress)) => {
-                        if sender
-                            .send(WorkerInventoryMessage::Progress {
-                                worker_id,
-                                progress,
-                            })
-                            .is_err()
-                        {
-                            control.cancel();
-                            break;
-                        }
-                    }
-                    Ok(InventoryEvent::Slice(slice)) => {
-                        if sender.send(WorkerInventoryMessage::Slice(slice)).is_err() {
-                            control.cancel();
-                            break;
-                        }
-                    }
-                    Ok(InventoryEvent::Completed(result)) => {
-                        completed = true;
-                        let cancelled = result.cancelled;
-                        if sender
-                            .send(WorkerInventoryMessage::Completed { worker_id, result })
-                            .is_err()
-                        {
-                            control.cancel();
-                            break;
-                        }
-                        if cancelled || control.should_stop_workers() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        if !control.should_stop_workers() {
-                            let _ = sender.send(WorkerInventoryMessage::Failed {
-                                worker_id,
-                                error: error.to_string(),
-                            });
-                            control.cancel();
-                        }
-                        break;
-                    }
-                }
-                if completed {
-                    break;
-                }
-            }
+            };
+            let completed = Self::forward_inventory_worker_stream(
+                &mut *stream,
+                worker_id,
+                control.as_ref(),
+                &sender,
+            )
+            .await;
             let _ = stream.shutdown().await;
             self.unregister_coordinated_worker(&control, worker_id);
             if !completed && !control.should_stop_workers() {
@@ -4887,12 +4809,163 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    async fn start_inventory_worker_stream(
+        &self,
+        server: &str,
+        root: &str,
+        worker_id: usize,
+        initial_limits: InventoryLimits,
+        control: &CoordinatedInventoryControl,
+        sender: &UnboundedSender<WorkerInventoryMessage>,
+    ) -> Result<Option<Box<dyn InventoryStream>>, ()> {
+        let handle = match self
+            .with_opc_timeout(
+                "start root inventory",
+                self.client
+                    .start_inventory_at_root(server, root, initial_limits.batch_size),
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                if control.should_stop_workers() {
+                    return Ok(None);
+                }
+                let _ = sender.send(WorkerInventoryMessage::Failed {
+                    worker_id,
+                    error: error.to_string(),
+                });
+                control.cancel();
+                return Err(());
+            }
+        };
+        let InventoryHandle {
+            stream,
+            control: worker_control,
+        } = handle;
+        match control.register(worker_id, worker_control) {
+            Ok(true) => {}
+            Ok(false) => {
+                let mut stream = stream;
+                let _ = stream.shutdown().await;
+                return Ok(None);
+            }
+            Err(error) => {
+                let mut stream = stream;
+                let _ = stream.shutdown().await;
+                if control.should_stop_workers() {
+                    return Ok(None);
+                }
+                let _ = sender.send(WorkerInventoryMessage::Failed {
+                    worker_id,
+                    error: error.to_string(),
+                });
+                control.cancel();
+                return Err(());
+            }
+        }
+        let mut stream = stream;
+        if sender
+            .send(WorkerInventoryMessage::Started { worker_id })
+            .is_err()
+        {
+            control.cancel();
+            let _ = stream.shutdown().await;
+            return Ok(None);
+        }
+        Ok(Some(stream))
+    }
+
+    async fn forward_inventory_worker_stream(
+        stream: &mut dyn InventoryStream,
+        worker_id: usize,
+        control: &CoordinatedInventoryControl,
+        sender: &UnboundedSender<WorkerInventoryMessage>,
+    ) -> bool {
+        while let Some(event) = stream.next().await {
+            match Self::forward_inventory_event(event, worker_id, control, sender) {
+                WorkerEventAction::Continue => {}
+                WorkerEventAction::Completed => return true,
+                WorkerEventAction::Stop => return false,
+            }
+        }
+        false
+    }
+
+    fn forward_inventory_event(
+        event: anyhow::Result<InventoryEvent>,
+        worker_id: usize,
+        control: &CoordinatedInventoryControl,
+        sender: &UnboundedSender<WorkerInventoryMessage>,
+    ) -> WorkerEventAction {
+        match event {
+            Ok(InventoryEvent::Entry(entry)) => {
+                if sender.send(WorkerInventoryMessage::Entry(entry)).is_err() {
+                    control.cancel();
+                    WorkerEventAction::Stop
+                } else {
+                    WorkerEventAction::Continue
+                }
+            }
+            Ok(InventoryEvent::Progress(progress)) => {
+                if sender
+                    .send(WorkerInventoryMessage::Progress {
+                        worker_id,
+                        progress,
+                    })
+                    .is_err()
+                {
+                    control.cancel();
+                    WorkerEventAction::Stop
+                } else {
+                    WorkerEventAction::Continue
+                }
+            }
+            Ok(InventoryEvent::Slice(slice)) => {
+                if sender.send(WorkerInventoryMessage::Slice(slice)).is_err() {
+                    control.cancel();
+                    WorkerEventAction::Stop
+                } else {
+                    WorkerEventAction::Continue
+                }
+            }
+            Ok(InventoryEvent::Completed(result)) => {
+                if sender
+                    .send(WorkerInventoryMessage::Completed { worker_id, result })
+                    .is_err()
+                {
+                    control.cancel();
+                    WorkerEventAction::Stop
+                } else {
+                    WorkerEventAction::Completed
+                }
+            }
+            Err(error) => {
+                if !control.should_stop_workers() {
+                    let _ = sender.send(WorkerInventoryMessage::Failed {
+                        worker_id,
+                        error: error.to_string(),
+                    });
+                    control.cancel();
+                }
+                WorkerEventAction::Stop
+            }
+        }
+    }
+
     fn unregister_coordinated_worker(
         &self,
         control: &CoordinatedInventoryControl,
         worker_id: usize,
     ) {
         control.unregister(worker_id);
+    }
+
+    fn pop_inventory_root(queue: &Mutex<VecDeque<String>>) -> anyhow::Result<Option<String>> {
+        queue
+            .lock()
+            .map(|mut roots| roots.pop_front())
+            .map_err(|error| anyhow::anyhow!("inventory root queue lock poisoned: {error}"))
     }
 
     fn attach_refresh_control(
@@ -7269,7 +7342,8 @@ fn accumulate_inventory_progress(
     cumulative.items_per_second = if cumulative.active_time_ms == 0 {
         0.0
     } else {
-        cumulative.unique_items as f64 / (cumulative.active_time_ms as f64 / 1_000.0)
+        cumulative.unique_items as f64
+            / Duration::from_millis(cumulative.active_time_ms).as_secs_f64()
     };
     cumulative.estimated_remaining_ms = progress.estimated_remaining_ms;
 }
@@ -7301,7 +7375,7 @@ fn aggregate_inventory_progress(
     let items_per_second = if active_time_ms == 0 {
         0.0
     } else {
-        unique_items as f64 / (active_time_ms as f64 / 1_000.0)
+        unique_items as f64 / Duration::from_millis(active_time_ms).as_secs_f64()
     };
     InventoryProgress {
         branches_visited,
