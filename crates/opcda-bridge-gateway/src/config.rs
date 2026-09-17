@@ -201,7 +201,7 @@ pub const DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS: u64 = 604_800;
 pub const DEFAULT_INDEX_STARTUP_GRACE_PERIOD_SECONDS: u64 = 30;
 pub const DEFAULT_INDEX_SCHEDULE_JITTER_SECONDS: u64 = 21_600;
 pub const DEFAULT_INDEX_INVENTORY_BATCH_SIZE: u32 = 100;
-pub const DEFAULT_INDEX_COMMIT_BATCH_SIZE: u32 = 100;
+pub const DEFAULT_INDEX_COMMIT_BATCH_SIZE: u32 = 1_024;
 pub const DEFAULT_INDEX_COMMIT_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_INDEX_BATCH_SIZE: u32 = 100;
 pub const DEFAULT_INDEX_ITEM_RATE: u32 = 250;
@@ -704,10 +704,33 @@ mod tests {
         assert_eq!(resolved.startup_grace_period_seconds, 30);
         assert_eq!(resolved.schedule_jitter_seconds, 21_600);
         assert_eq!(resolved.inventory_batch_size, 100);
-        assert_eq!(resolved.commit_batch_size, 100);
+        assert_eq!(resolved.commit_batch_size, 1_024);
         assert_eq!(resolved.commit_interval_ms, 1_000);
         assert_eq!(resolved.sentinel_tag, None);
         assert_eq!(resolved.operation_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn test_resolve_index_config_uses_legacy_batch_size_for_commit_batching() {
+        let resolved = resolve_index_config(&IndexConfig {
+            batch_size: Some(7),
+            ..IndexConfig::default()
+        });
+
+        assert_eq!(resolved.inventory_batch_size, 7);
+        assert_eq!(resolved.commit_batch_size, 7);
+    }
+
+    #[test]
+    fn test_resolve_index_config_clamps_commit_batch_and_interval_to_one() {
+        let resolved = resolve_index_config(&IndexConfig {
+            commit_batch_size: Some(0),
+            commit_interval_ms: Some(0),
+            ..IndexConfig::default()
+        });
+
+        assert_eq!(resolved.commit_batch_size, 1);
+        assert_eq!(resolved.commit_interval_ms, 1);
     }
 
     #[test]

@@ -17204,6 +17204,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn commit_batching_flushes_thresholds_and_final_pending_entries() {
+        let directory = tempdir().unwrap();
+        let mut config = settings(directory.path().join("commit-boundaries.sqlite3"));
+        config.commit_batch_size = 3;
+        config.commit_interval_ms = 60_000;
+        let manager = Arc::new(IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            config.clone(),
+        ));
+        let generation = manager
+            .with_database(|db| {
+                db.start_generation(
+                    "S",
+                    NamespaceOrganization::Hierarchical,
+                    BrowseSource::Da2,
+                    "1",
+                )
+            })
+            .unwrap();
+        let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+        insert_runtime_build(&manager, Arc::clone(&control));
+        let mut state = BuildRunState::new(&config, None);
+
+        for index in 0..7 {
+            assert!(matches!(
+                manager
+                    .handle_entry_event(
+                        "S",
+                        generation,
+                        &control,
+                        &mut state,
+                        inventory_entry(&format!("Entry {index}"), &format!("S.Entry{index}"),),
+                    )
+                    .await,
+                BuildEventOutcome::Continue
+            ));
+
+            match index {
+                2 => {
+                    assert!(state.pending.is_empty());
+                    assert_eq!(state.persisted_item_count, 3);
+                }
+                5 => {
+                    assert!(state.pending.is_empty());
+                    assert_eq!(state.persisted_item_count, 6);
+                }
+                6 => {
+                    assert_eq!(state.pending.len(), 1);
+                    assert_eq!(state.persisted_item_count, 6);
+                }
+                _ => {}
+            }
+        }
+
+        let inserted = manager
+            .commit_pending_entries("S", generation, &mut state.pending)
+            .unwrap();
+        state.persisted_item_count = state.persisted_item_count.saturating_add(inserted);
+        assert_eq!(inserted, 1);
+        assert!(state.pending.is_empty());
+        assert_eq!(state.persisted_item_count, 7);
+
+        let stored_entries = manager
+            .with_database(|db| {
+                db.connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries
+                         WHERE server = ?1 AND generation = ?2",
+                        rusqlite::params!["S", generation as i64],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(stored_entries, 7);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn unexpected_build_unwind_releases_ownership_and_resumes_cleanup() {
         let directory = tempdir().unwrap();

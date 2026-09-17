@@ -455,7 +455,7 @@ schedules only enrolled servers with a successful active generation and
 | Inventory slice batch      | `index.inventory_batch_size`          | `100` entries (max `1000`)     |
 | Inventory root             | `index.inventory_root`                | None (full namespace)          |
 | Namespace workers          | `index.worker_count`                  | `1` (maximum `4`)              |
-| SQLite commit batch        | `index.commit_batch_size`             | `100` entries                  |
+| SQLite commit batch        | `index.commit_batch_size`             | `1024` entries (recommended)   |
 | SQLite commit interval     | `index.commit_interval_ms`            | `1000` ms                      |
 | Legacy batch size fallback | `index.batch_size`                    | `100` (max `1000`)             |
 | Average item rate          | `index.item_rate_limit`               | `250` items/second             |
