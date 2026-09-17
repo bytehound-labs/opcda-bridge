@@ -453,6 +453,8 @@ schedules only enrolled servers with a successful active generation and
 | Startup grace period       | `index.startup_grace_period_seconds`  | `30` seconds                   |
 | Schedule jitter            | `index.schedule_jitter_seconds`       | `21600` seconds                |
 | Inventory slice batch      | `index.inventory_batch_size`          | `100` entries (max `1000`)     |
+| Inventory root             | `index.inventory_root`                | None (full namespace)          |
+| Namespace workers          | `index.worker_count`                  | `1` (maximum `4`)              |
 | SQLite commit batch        | `index.commit_batch_size`             | `100` entries                  |
 | SQLite commit interval     | `index.commit_interval_ms`            | `1000` ms                      |
 | Legacy batch size fallback | `index.batch_size`                    | `100` (max `1000`)             |
@@ -474,6 +476,19 @@ schedules only enrolled servers with a successful active generation and
 | Query-cache capacity       | `index.query_cache_capacity`          | `256` entries                  |
 | Start paused               | `index.paused`                        | `false`                        |
 | Maximum indexed results    | `index.max_results`                   | `50`                           |
+
+When `index.inventory_root` is set, indexing starts at that exact canonical OPC ItemID
+instead of the server root. This is useful for building an index for one controller or
+subtree without traversing the rest of a large namespace. The configured root takes
+precedence over automatic root partitioning.
+
+When `index.worker_count` is greater than one, a hierarchical server is partitioned into
+independent root-scoped workers only when the gateway can obtain a complete, single-page
+root browse through a supported browse session and finds at least two expandable roots.
+Root-level items are emitted directly, and duplicate ItemIDs are suppressed across workers.
+If those conditions are not met, the gateway falls back to one full-root inventory. Workers
+share pause, resume, pacing, and cancellation controls, and all worker streams are joined
+before the build releases its ownership.
 
 `index.enabled` is an emergency switch for startup and scheduled work only. Manual status,
 browse, search, refresh, and read operations remain available when it is false. Per-server

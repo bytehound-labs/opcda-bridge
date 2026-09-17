@@ -103,6 +103,11 @@ pub struct IndexConfig {
     pub schedule_jitter_seconds: Option<u64>,
     /// Maximum entries requested from one native inventory slice.
     pub inventory_batch_size: Option<u32>,
+    /// Optional exact canonical ItemID at which inventory should begin.
+    ///
+    /// When set, the gateway uses the client's root-scoped inventory API
+    /// directly instead of discovering and partitioning the server root.
+    pub inventory_root: Option<String>,
     /// Maximum entries committed to SQLite in one transaction.
     pub commit_batch_size: Option<u32>,
     /// Maximum time pending entries may wait before an SQLite commit.
@@ -138,6 +143,11 @@ pub struct IndexConfig {
     #[serde(default)]
     pub maintenance_windows: Vec<String>,
     pub concurrency: Option<u32>,
+    /// Maximum number of independent OPC namespace workers within one build.
+    ///
+    /// This is separate from `concurrency`, which limits builds across
+    /// different servers.
+    pub worker_count: Option<u32>,
     pub query_cache_capacity: Option<usize>,
     pub paused: Option<bool>,
     pub max_results: Option<u32>,
@@ -152,6 +162,7 @@ pub struct ResolvedIndexConfig {
     pub startup_grace_period_seconds: u64,
     pub schedule_jitter_seconds: u64,
     pub inventory_batch_size: u32,
+    pub inventory_root: Option<String>,
     pub commit_batch_size: u32,
     pub commit_interval_ms: u64,
     pub batch_size: u32,
@@ -180,6 +191,7 @@ pub struct ResolvedIndexConfig {
     pub operation_timeout_seconds: u64,
     pub maintenance_windows: Vec<String>,
     pub concurrency: u32,
+    pub worker_count: u32,
     pub query_cache_capacity: usize,
     pub paused: bool,
     pub max_results: u32,
@@ -215,6 +227,8 @@ pub const DEFAULT_INDEX_HEALTH_PROBE_INTERVAL_SECONDS: u64 = 30;
 pub const DEFAULT_INDEX_HEALTH_LATENCY_THRESHOLD_MS: u64 = 500;
 pub const DEFAULT_INDEX_OPERATION_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_INDEX_CONCURRENCY: u32 = 1;
+pub const DEFAULT_INDEX_WORKER_COUNT: u32 = 1;
+pub const MAX_INDEX_WORKER_COUNT: u32 = 4;
 pub const DEFAULT_INDEX_QUERY_CACHE_CAPACITY: usize = 256;
 pub const DEFAULT_INDEX_MAX_RESULTS: u32 = 50;
 
@@ -272,6 +286,7 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
             .or(config.batch_size)
             .unwrap_or(DEFAULT_INDEX_INVENTORY_BATCH_SIZE)
             .clamp(1, MAX_NATIVE_INVENTORY_BATCH_SIZE),
+        inventory_root: config.inventory_root.clone(),
         commit_batch_size: config
             .commit_batch_size
             .or(config.batch_size)
@@ -367,6 +382,10 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
             .concurrency
             .unwrap_or(DEFAULT_INDEX_CONCURRENCY)
             .max(1),
+        worker_count: config
+            .worker_count
+            .unwrap_or(DEFAULT_INDEX_WORKER_COUNT)
+            .clamp(1, MAX_INDEX_WORKER_COUNT),
         query_cache_capacity: config
             .query_cache_capacity
             .unwrap_or(DEFAULT_INDEX_QUERY_CACHE_CAPACITY)
@@ -602,6 +621,8 @@ mod tests {
             startup_grace_period_seconds: Some(9),
             schedule_jitter_seconds: Some(8),
             inventory_batch_size: Some(11),
+            inventory_root: Some("FCS0201".into()),
+            worker_count: Some(2),
             commit_batch_size: Some(12),
             commit_interval_ms: Some(13),
             batch_size: Some(0),
@@ -641,6 +662,8 @@ mod tests {
         assert_eq!(resolved.startup_grace_period_seconds, 9);
         assert_eq!(resolved.schedule_jitter_seconds, 8);
         assert_eq!(resolved.inventory_batch_size, 11);
+        assert_eq!(resolved.inventory_root.as_deref(), Some("FCS0201"));
+        assert_eq!(resolved.worker_count, 2);
         assert_eq!(resolved.commit_batch_size, 12);
         assert_eq!(resolved.commit_interval_ms, 13);
         assert_eq!(resolved.batch_size, 1);
@@ -717,6 +740,8 @@ mod tests {
             startup_grace_period_seconds: Some(45),
             schedule_jitter_seconds: Some(120),
             inventory_batch_size: Some(20),
+            inventory_root: Some("FCS0201".into()),
+            worker_count: Some(3),
             commit_batch_size: Some(7),
             commit_interval_ms: Some(250),
             batch_size: Some(10),

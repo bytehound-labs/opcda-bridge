@@ -1,6 +1,6 @@
 use opc_da_client::{
     BrowseNamespace, BrowseNodeFilter, BrowseNodeKind as ExtBrowseNodeKind, BrowseNodeToken,
-    BrowsePageRequest, BrowsePageToken, BrowseSessionToken,
+    BrowsePageRequest, BrowsePageToken, BrowseSessionToken, ComConnector,
     InventoryControl as ExtInventoryControl, InventoryEvent as ExtInventoryEvent, InventoryOptions,
     InventoryPacing as ExtInventoryPacing, InventorySliceBackend as ExtInventorySliceBackend,
     InventoryStream as ExtInventoryStream, OpcDaClient, OpcProvider, OpcValue as ExtOpcValue,
@@ -139,7 +139,45 @@ impl OpcClient for OpcDaAdapter {
             .await?;
         let control = stream.control();
         Ok(InventoryHandle {
-            stream: Box::new(AdapterInventoryStream { inner: stream }),
+            stream: Box::new(AdapterInventoryStream {
+                inner: Some(stream),
+                _client: None,
+                terminal_event_seen: false,
+            }),
+            control: Arc::new(AdapterInventoryControl { inner: control }),
+        })
+    }
+
+    async fn start_inventory_at_root(
+        &self,
+        server: &str,
+        root_item_id: &str,
+        batch_size: u32,
+    ) -> anyhow::Result<InventoryHandle> {
+        if !(1..=MAX_NATIVE_INVENTORY_BATCH_SIZE).contains(&batch_size) {
+            anyhow::bail!(
+                "native inventory batch size must be between 1 and {}",
+                MAX_NATIVE_INVENTORY_BATCH_SIZE
+            );
+        }
+        let worker_client = OpcDaClient::new(ComConnector)?;
+        let stream = worker_client
+            .start_inventory_at_root(
+                server,
+                root_item_id,
+                InventoryOptions {
+                    batch_size,
+                    max_entries: None,
+                },
+            )
+            .await?;
+        let control = stream.control();
+        Ok(InventoryHandle {
+            stream: Box::new(AdapterInventoryStream {
+                inner: Some(stream),
+                _client: Some(worker_client),
+                terminal_event_seen: false,
+            }),
             control: Arc::new(AdapterInventoryControl { inner: control }),
         })
     }
@@ -209,16 +247,40 @@ impl AdapterInventoryControl {
 }
 
 struct AdapterInventoryStream {
-    inner: ExtInventoryStream,
+    inner: Option<ExtInventoryStream>,
+    /// Root-scoped streams own their independent native client. Keeping it
+    /// beside the stream keeps the COM worker alive until the stream is
+    /// explicitly shut down.
+    _client: Option<OpcDaClient>,
+    terminal_event_seen: bool,
 }
 
 #[async_trait::async_trait]
 impl InventoryStream for AdapterInventoryStream {
     async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
-        self.inner
+        let event = self
+            .inner
+            .as_mut()?
             .message()
             .await
-            .map(|result| result.map(map_inventory_event).map_err(anyhow::Error::from))
+            .map(|result| result.map(map_inventory_event).map_err(anyhow::Error::from));
+        if matches!(event.as_ref(), Some(Ok(InventoryEvent::Completed(_)))) {
+            self.terminal_event_seen = true;
+        }
+        event
+    }
+
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        let Some(stream) = self.inner.take() else {
+            return Ok(());
+        };
+        if !self.terminal_event_seen {
+            stream.cancel();
+        }
+        tokio::task::spawn_blocking(move || drop(stream))
+            .await
+            .map_err(|error| anyhow::anyhow!("native inventory stream shutdown failed: {error}"))?;
+        Ok(())
     }
 }
 
