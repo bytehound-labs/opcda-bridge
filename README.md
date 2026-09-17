@@ -477,6 +477,13 @@ schedules only enrolled servers with a successful active generation and
 | Start paused               | `index.paused`                        | `false`                        |
 | Maximum indexed results    | `index.max_results`                   | `50`                           |
 
+The item-rate limit and native minimum operation interval are independent controls. The
+`index.item_rate_limit` setting is forwarded to the native item-rate limiter and charges each
+inventory operation by its item cost; it does not derive a native sleep from
+`batch_size / item_rate_limit`. The gateway leaves the native minimum interval at zero and
+applies the native batch size independently. Set `index.item_rate_limit` to `0` for the raw
+profile with no item-rate pacing.
+
 When `index.inventory_root` is set, indexing starts at that exact canonical OPC ItemID
 instead of the server root. This is useful for building an index for one controller or
 subtree without traversing the rest of a large namespace. The configured root takes

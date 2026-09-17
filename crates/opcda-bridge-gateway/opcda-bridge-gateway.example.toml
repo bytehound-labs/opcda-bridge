@@ -76,7 +76,10 @@ commit_interval_ms = 1000
 # Maximum native inventory entries requested per bounded operation.
 batch_size = 100
 
-# Average inventory item rate and initial burst allowance.
+# Average inventory item rate and initial burst allowance. Set item_rate_limit
+# to 0 for the raw profile with no item-rate pacing. The native minimum
+# operation interval is independent and remains zero for gateway-generated
+# inventory pacing.
 item_rate_limit = 250
 burst_size = 100
 

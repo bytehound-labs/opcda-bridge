@@ -126,8 +126,11 @@ uses a service-writable SQLite database, conservative batch/rate/duty-cycle defa
 two-second foreground quiet period, and one build at a time.
 Native inventory batches are bounded to 1,000 entries by the OPC DA client contract.
 Native inventory slicing and SQLite commit batching are independently bounded, and adaptive
-controller decisions update the native slice batch size and pacing interval; the commit interval
-provides a time limit for low-volume inventories.
+controller decisions update the native slice batch size and item-rate limiter; the native
+minimum operation interval remains a separate control and is zero for gateway-generated
+inventory pacing. The item-rate limiter is charged by the native operation's item cost and must
+not be converted into a batch-size-derived sleep; the commit interval provides a time limit for
+low-volume inventories.
 `index.worker_count` controls independent namespace workers within one build
 (default `1`, maximum `4`). When it is greater than one, the gateway uses
 hierarchical root browsing to partition safe canonical branches across fresh
