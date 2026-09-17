@@ -138,6 +138,14 @@ pub struct IndexConfig {
     pub quiet_period_seconds: Option<u64>,
     pub health_probe_interval_seconds: Option<u64>,
     pub health_latency_threshold_ms: Option<u64>,
+    /// Soft foreground-latency threshold used by adaptive indexing.
+    ///
+    /// When omitted, the gateway uses twice `health_latency_threshold_ms`.
+    pub adaptive_foreground_soft_latency_ms: Option<u64>,
+    /// Hard foreground-latency threshold used by adaptive indexing.
+    ///
+    /// When omitted, the gateway uses four times `health_latency_threshold_ms`.
+    pub adaptive_foreground_hard_latency_ms: Option<u64>,
     /// Maximum time allowed for one pre-build or health OPC operation.
     pub operation_timeout_seconds: Option<u64>,
     #[serde(default)]
@@ -188,6 +196,8 @@ pub struct ResolvedIndexConfig {
     pub quiet_period_seconds: u64,
     pub health_probe_interval_seconds: u64,
     pub health_latency_threshold_ms: u64,
+    pub adaptive_foreground_soft_latency_ms: u64,
+    pub adaptive_foreground_hard_latency_ms: u64,
     pub operation_timeout_seconds: u64,
     pub maintenance_windows: Vec<String>,
     pub concurrency: u32,
@@ -268,6 +278,18 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
             )
         })
         .unwrap_or_else(|| PathBuf::from("opcda-bridge-index.sqlite3"));
+    let health_latency_threshold_ms = config
+        .health_latency_threshold_ms
+        .unwrap_or(DEFAULT_INDEX_HEALTH_LATENCY_THRESHOLD_MS)
+        .max(1);
+    let adaptive_foreground_soft_latency_ms = config
+        .adaptive_foreground_soft_latency_ms
+        .unwrap_or_else(|| health_latency_threshold_ms.saturating_mul(2))
+        .max(1);
+    let adaptive_foreground_hard_latency_ms = config
+        .adaptive_foreground_hard_latency_ms
+        .unwrap_or_else(|| health_latency_threshold_ms.saturating_mul(4))
+        .max(adaptive_foreground_soft_latency_ms);
 
     ResolvedIndexConfig {
         database_path,
@@ -369,10 +391,9 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
             .health_probe_interval_seconds
             .unwrap_or(DEFAULT_INDEX_HEALTH_PROBE_INTERVAL_SECONDS)
             .max(1),
-        health_latency_threshold_ms: config
-            .health_latency_threshold_ms
-            .unwrap_or(DEFAULT_INDEX_HEALTH_LATENCY_THRESHOLD_MS)
-            .max(1),
+        health_latency_threshold_ms,
+        adaptive_foreground_soft_latency_ms,
+        adaptive_foreground_hard_latency_ms,
         operation_timeout_seconds: config
             .operation_timeout_seconds
             .unwrap_or(DEFAULT_INDEX_OPERATION_TIMEOUT_SECONDS)
@@ -648,6 +669,8 @@ mod tests {
             quiet_period_seconds: Some(3),
             health_probe_interval_seconds: Some(0),
             health_latency_threshold_ms: Some(4),
+            adaptive_foreground_soft_latency_ms: Some(6),
+            adaptive_foreground_hard_latency_ms: Some(8),
             operation_timeout_seconds: Some(0),
             maintenance_windows: vec!["22:00-06:00".into()],
             concurrency: Some(0),
@@ -689,6 +712,8 @@ mod tests {
         assert_eq!(resolved.quiet_period_seconds, 3);
         assert_eq!(resolved.health_probe_interval_seconds, 1);
         assert_eq!(resolved.health_latency_threshold_ms, 4);
+        assert_eq!(resolved.adaptive_foreground_soft_latency_ms, 6);
+        assert_eq!(resolved.adaptive_foreground_hard_latency_ms, 8);
         assert_eq!(resolved.operation_timeout_seconds, 1);
         assert_eq!(resolved.maintenance_windows, vec!["22:00-06:00"]);
         assert_eq!(resolved.concurrency, 1);
@@ -708,6 +733,21 @@ mod tests {
         assert_eq!(resolved.commit_interval_ms, 1_000);
         assert_eq!(resolved.sentinel_tag, None);
         assert_eq!(resolved.operation_timeout_seconds, 30);
+        assert_eq!(resolved.health_latency_threshold_ms, 500);
+        assert_eq!(resolved.adaptive_foreground_soft_latency_ms, 1_000);
+        assert_eq!(resolved.adaptive_foreground_hard_latency_ms, 2_000);
+    }
+
+    #[test]
+    fn test_resolve_index_config_keeps_adaptive_thresholds_above_soft_limit() {
+        let resolved = resolve_index_config(&IndexConfig {
+            health_latency_threshold_ms: Some(500),
+            adaptive_foreground_soft_latency_ms: Some(2_000),
+            adaptive_foreground_hard_latency_ms: Some(1_000),
+            ..IndexConfig::default()
+        });
+        assert_eq!(resolved.adaptive_foreground_soft_latency_ms, 2_000);
+        assert_eq!(resolved.adaptive_foreground_hard_latency_ms, 2_000);
     }
 
     #[test]
@@ -790,6 +830,8 @@ mod tests {
             quiet_period_seconds: Some(2),
             health_probe_interval_seconds: Some(30),
             health_latency_threshold_ms: Some(500),
+            adaptive_foreground_soft_latency_ms: Some(750),
+            adaptive_foreground_hard_latency_ms: Some(1_500),
             operation_timeout_seconds: Some(45),
             maintenance_windows: vec!["00:00-06:00".into()],
             concurrency: Some(1),

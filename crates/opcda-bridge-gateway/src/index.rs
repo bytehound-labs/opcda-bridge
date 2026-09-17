@@ -3230,6 +3230,7 @@ pub struct IndexManager<C: OpcClient> {
     foreground_users: Arc<Mutex<HashMap<String, usize>>>,
     pause_overlays: Arc<Mutex<HashMap<String, PauseOverlayState>>>,
     foreground_metrics: Arc<Mutex<HashMap<String, ForegroundMetricState>>>,
+    commit_latency_recorded_at: Arc<Mutex<HashMap<String, Instant>>>,
     cache: Arc<Mutex<QueryCache>>,
     host_metrics: Arc<dyn HostMetricsProvider>,
     background_tasks: Arc<BackgroundTasks>,
@@ -3354,6 +3355,7 @@ impl<C: OpcClient> IndexManager<C> {
             foreground_users: Arc::new(Mutex::new(HashMap::new())),
             pause_overlays: Arc::new(Mutex::new(HashMap::new())),
             foreground_metrics: Arc::new(Mutex::new(HashMap::new())),
+            commit_latency_recorded_at: Arc::new(Mutex::new(HashMap::new())),
             cache: Arc::new(Mutex::new(QueryCache {
                 values: HashMap::new(),
                 order: VecDeque::new(),
@@ -4011,7 +4013,7 @@ impl<C: OpcClient> IndexManager<C> {
             status.last_error = Some(format!("namespace index deletion failed: {error}"));
         }
         status.foreground_metrics = self.foreground_metrics_snapshot(server);
-        status.host_metrics = self.host_metrics.snapshot();
+        status.host_metrics = self.host_metrics.latest();
         status.storage = storage;
         self.apply_runtime_status(&mut status, &runtime);
         status.scheduler = self.scheduler_diagnostics(
@@ -4504,6 +4506,9 @@ impl<C: OpcClient> IndexManager<C> {
             recovery_deadline: None,
             last_commit_latency_ms: None,
         });
+        if let Ok(mut recorded_at) = self.commit_latency_recorded_at.lock() {
+            recorded_at.remove(server);
+        }
         state.last_error = None;
         Ok(Some(ownership))
     }
@@ -5298,7 +5303,11 @@ impl<C: OpcClient> IndexManager<C> {
             maximum_recovery_delay: Duration::from_secs(
                 self.settings.adaptive_max_recovery_delay_seconds.max(1),
             ),
-            foreground_latency_absolute_ms: self.settings.health_latency_threshold_ms.max(1),
+            foreground_latency_soft_ms: self.settings.adaptive_foreground_soft_latency_ms.max(1),
+            foreground_latency_hard_ms: self
+                .settings
+                .adaptive_foreground_hard_latency_ms
+                .max(self.settings.adaptive_foreground_soft_latency_ms.max(1)),
         }
     }
 
@@ -6502,6 +6511,9 @@ impl<C: OpcClient> IndexManager<C> {
             build.last_commit_latency_ms =
                 Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
         }
+        if let Ok(mut recorded_at) = self.commit_latency_recorded_at.lock() {
+            recorded_at.insert(server.to_string(), Instant::now());
+        }
         if result.is_ok() {
             pending.clear();
         }
@@ -6869,6 +6881,15 @@ impl<C: OpcClient> IndexManager<C> {
                 .and_then(|state| state.build.as_ref())
                 .and_then(|build| build.last_commit_latency_ms)
         });
+        let commit_latency_is_fresh = self
+            .commit_latency_recorded_at
+            .lock()
+            .ok()
+            .and_then(|recorded_at| recorded_at.get(server).copied())
+            .is_some_and(|recorded_at| {
+                now.saturating_duration_since(recorded_at)
+                    <= Duration::from_secs(self.settings.adaptive_recovery_delay_seconds.max(1))
+            });
         ControllerObservation {
             foreground_active: self.foreground_active(server),
             foreground_error: recent_foreground_failure,
@@ -6880,7 +6901,9 @@ impl<C: OpcClient> IndexManager<C> {
             available_memory_percent: host.available_memory_percent,
             disk_active_percent: host.disk_active_percent,
             disk_queue: host.disk_queue,
-            database_commit_p95_ms: storage.last_commit_latency_ms,
+            database_commit_p95_ms: commit_latency_is_fresh
+                .then_some(storage.last_commit_latency_ms)
+                .flatten(),
             insufficient_disk_space: storage.free_bytes.is_some_and(|free| {
                 free < self
                     .settings
@@ -7827,6 +7850,8 @@ mod tests {
             quiet_period_seconds: 0,
             health_probe_interval_seconds: 30,
             health_latency_threshold_ms: 500,
+            adaptive_foreground_soft_latency_ms: 1_000,
+            adaptive_foreground_hard_latency_ms: 2_000,
             operation_timeout_seconds: 30,
             maintenance_windows: Vec::new(),
             concurrency: 1,
@@ -7843,6 +7868,76 @@ mod tests {
             unique_items: count,
             ..zero_progress()
         }
+    }
+
+    #[test]
+    fn controller_observation_expires_stale_commit_latency() {
+        let manager = IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            ResolvedIndexConfig {
+                adaptive_recovery_delay_seconds: 1,
+                ..settings(PathBuf::from(":memory:"))
+            },
+        );
+        manager.runtime.lock().unwrap().insert(
+            "S".into(),
+            RuntimeState {
+                build: Some(RuntimeBuild {
+                    control: None,
+                    progress: None,
+                    started_at: "test".into(),
+                    foreground_users: 0,
+                    operator_paused: false,
+                    quiet_until: None,
+                    effective_limits: None,
+                    controller_state: None,
+                    pause_reason: None,
+                    recovery_deadline: None,
+                    last_commit_latency_ms: Some(2_000),
+                }),
+                ..RuntimeState::default()
+            },
+        );
+        manager
+            .commit_latency_recorded_at
+            .lock()
+            .unwrap()
+            .insert("S".into(), Instant::now() - Duration::from_secs(2));
+
+        let stale = manager.controller_observation("S", false);
+        assert_eq!(stale.database_commit_p95_ms, None);
+
+        manager
+            .commit_latency_recorded_at
+            .lock()
+            .unwrap()
+            .insert("S".into(), Instant::now());
+        let fresh = manager.controller_observation("S", false);
+        assert_eq!(fresh.database_commit_p95_ms, Some(2_000));
+    }
+
+    #[test]
+    fn reserving_a_new_build_clears_previous_commit_latency_timestamp() {
+        let directory = tempdir().unwrap();
+        let manager = IndexManager::new(
+            Arc::new(MockOpcClient::default()),
+            settings(directory.path().join("index.sqlite3")),
+        );
+        manager
+            .commit_latency_recorded_at
+            .lock()
+            .unwrap()
+            .insert("S".into(), Instant::now());
+
+        let ownership = manager.reserve_refresh_build("S", true).unwrap().unwrap();
+        assert!(
+            !manager
+                .commit_latency_recorded_at
+                .lock()
+                .unwrap()
+                .contains_key("S")
+        );
+        manager.finish_build_owned("S", &ownership, None);
     }
 
     fn synthetic_entries(prefix: &str, count: usize) -> Vec<InventoryEntry> {
@@ -16485,13 +16580,20 @@ mod tests {
                     ..HostMetrics::default()
                 }
             }
+
+            fn latest(&self) -> HostMetrics {
+                self.snapshot()
+            }
         }
+
+        let fixed = FixedHostMetrics;
+        assert_eq!(fixed.latest(), fixed.snapshot());
 
         let manager = IndexManager::new(
             Arc::new(MockOpcClient::default()),
             settings(PathBuf::from(":memory:")),
         )
-        .with_host_metrics_provider(Arc::new(FixedHostMetrics));
+        .with_host_metrics_provider(Arc::new(fixed));
         manager.record_foreground_operation("S", Duration::from_millis(2), true, true);
         let observation = manager.controller_observation("S", false);
         assert!(observation.foreground_error);

@@ -445,37 +445,40 @@ available while a refresh runs, and failed or cancelled refreshes never replace 
 schedules only enrolled servers with a successful active generation and
 `auto_refresh_enabled = true`; a failed first build remains visible until manually retried.
 
-| Index setting              | Config key                            | Default                        |
-| -------------------------- | ------------------------------------- | ------------------------------ |
-| Database path              | `index.database_path`                 | Platform data directory        |
-| Automatic indexing         | `index.enabled`                       | `true`                         |
-| Refresh interval           | `index.refresh_interval_seconds`      | `604800` (7 days)              |
-| Startup grace period       | `index.startup_grace_period_seconds`  | `30` seconds                   |
-| Schedule jitter            | `index.schedule_jitter_seconds`       | `21600` seconds                |
-| Inventory slice batch      | `index.inventory_batch_size`          | `100` entries (max `1000`)     |
-| Inventory root             | `index.inventory_root`                | None (full namespace)          |
-| Namespace workers          | `index.worker_count`                  | `1` (maximum `4`)              |
-| SQLite commit batch        | `index.commit_batch_size`             | `1024` entries (recommended)   |
-| SQLite commit interval     | `index.commit_interval_ms`            | `1000` ms                      |
-| Legacy batch size fallback | `index.batch_size`                    | `100` (max `1000`)             |
-| Average item rate          | `index.item_rate_limit`               | `250` items/second             |
-| Burst allowance            | `index.burst_size`                    | `100` items                    |
-| Active duty cycle          | `index.duty_cycle_percent`            | `20`%                          |
-| Adaptive pacing            | `index.adaptive`                      | `true`                         |
-| Adaptive canary profile    | `index.canary_*`                      | `50` items/s, batch `25`, `5`% |
-| Adaptive floor profile     | `index.minimum_*`                     | `10` items/s, batch `1`, `1`%  |
-| Foreground quiet period    | `index.quiet_period_seconds`          | `2` seconds                    |
-| Health probe interval      | `index.health_probe_interval_seconds` | `30` seconds                   |
-| Health latency threshold   | `index.health_latency_threshold_ms`   | `500` ms                       |
-| OPC operation timeout      | `index.operation_timeout_seconds`     | `30` seconds                   |
-| Sentinel health tag        | `index.sentinel_tag`                  | Unavailable when omitted       |
-| Minimum free space         | `index.minimum_free_space_bytes`      | `100 MiB`                      |
-| Storage headroom           | `index.storage_headroom_bytes`        | `10 MiB`                       |
-| Maintenance windows        | `index.maintenance_windows`           | Empty                          |
-| Concurrent builds          | `index.concurrency`                   | `1`                            |
-| Query-cache capacity       | `index.query_cache_capacity`          | `256` entries                  |
-| Start paused               | `index.paused`                        | `false`                        |
-| Maximum indexed results    | `index.max_results`                   | `50`                           |
+| Index setting                      | Config key                                  | Default                        |
+| ---------------------------------- | ------------------------------------------- | ------------------------------ |
+| Database path                      | `index.database_path`                       | Platform data directory        |
+| Automatic indexing                 | `index.enabled`                             | `true`                         |
+| Refresh interval                   | `index.refresh_interval_seconds`            | `604800` (7 days)              |
+| Startup grace period               | `index.startup_grace_period_seconds`        | `30` seconds                   |
+| Schedule jitter                    | `index.schedule_jitter_seconds`             | `21600` seconds                |
+| Inventory slice batch              | `index.inventory_batch_size`                | `100` entries (max `1000`)     |
+| Inventory root                     | `index.inventory_root`                      | None (full namespace)          |
+| Namespace workers                  | `index.worker_count`                        | `1` (maximum `4`)              |
+| SQLite commit batch                | `index.commit_batch_size`                   | `100` entries                  |
+| SQLite commit interval             | `index.commit_interval_ms`                  | `1000` ms                      |
+| Legacy batch size fallback         | `index.batch_size`                          | `100` (max `1000`)             |
+| Average item rate                  | `index.item_rate_limit`                     | `250` items/second             |
+| Burst allowance                    | `index.burst_size`                          | `100` items                    |
+| Active duty cycle                  | `index.duty_cycle_percent`                  | `20`%                          |
+| Adaptive pacing                    | `index.adaptive`                            | `true`                         |
+| Adaptive canary profile            | `index.canary_*`                            | `50` items/s, batch `25`, `5`% |
+| Adaptive floor profile             | `index.minimum_*`                           | `10` items/s, batch `1`, `1`%  |
+| Foreground quiet period            | `index.quiet_period_seconds`                | `2` seconds                    |
+| Health probe interval              | `index.health_probe_interval_seconds`       | `30` seconds                   |
+| Health latency threshold           | `index.health_latency_threshold_ms`         | `500` ms                       |
+| Adaptive foreground soft threshold | `index.adaptive_foreground_soft_latency_ms` | `2 × health threshold`         |
+| Adaptive foreground hard threshold | `index.adaptive_foreground_hard_latency_ms` | `4 × health threshold`         |
+| Adaptive recovery window           | `index.adaptive_recovery_delay_seconds`     | `30` seconds                   |
+| OPC operation timeout              | `index.operation_timeout_seconds`           | `30` seconds                   |
+| Sentinel health tag                | `index.sentinel_tag`                        | Unavailable when omitted       |
+| Minimum free space                 | `index.minimum_free_space_bytes`            | `100 MiB`                      |
+| Storage headroom                   | `index.storage_headroom_bytes`              | `10 MiB`                       |
+| Maintenance windows                | `index.maintenance_windows`                 | Empty                          |
+| Concurrent builds                  | `index.concurrency`                         | `1`                            |
+| Query-cache capacity               | `index.query_cache_capacity`                | `256` entries                  |
+| Start paused                       | `index.paused`                              | `false`                        |
+| Maximum indexed results            | `index.max_results`                         | `50`                           |
 
 The item-rate limit and native minimum operation interval are independent controls. The
 `index.item_rate_limit` setting is forwarded to the native item-rate limiter and charges each
@@ -510,6 +513,13 @@ The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (
 24-hour ranges such as `22:00-06:00`; when configured, indexing is deferred outside those ranges.
 Adaptive indexing uses recent foreground OPC errors and bad-quality reads as health signals in
 addition to latency and host/storage guardrails.
+Foreground latency has separate soft and hard adaptive thresholds. Reaching the soft threshold
+throttles inventory pacing; reaching the hard threshold pauses inventory. When omitted, the
+thresholds default to twice and four times `health_latency_threshold_ms`, respectively, and the
+hard threshold is normalized upward if it is configured below the soft threshold. Commit latency
+is used as an adaptive database-pressure signal only during the recovery window after a commit;
+stale commit latency remains available in status diagnostics but no longer keeps a later build
+throttled indefinitely.
 The status reports whether a sentinel tag is configured separately from whether its latest probe
 is healthy or unavailable.
 

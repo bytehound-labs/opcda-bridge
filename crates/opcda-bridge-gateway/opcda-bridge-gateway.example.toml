@@ -100,6 +100,8 @@ canary_item_rate = 50
 canary_batch_size = 25
 canary_duty_cycle_percent = 5
 adaptive_healthy_window_seconds = 30
+# Commit latency contributes adaptive database pressure only for this recovery
+# window after a commit. Older values remain visible in status diagnostics.
 adaptive_recovery_delay_seconds = 30
 adaptive_max_recovery_delay_seconds = 300
 
@@ -122,6 +124,12 @@ quiet_period_seconds = 2
 # Health-probe cadence and latency threshold used to defer inventory work.
 health_probe_interval_seconds = 30
 health_latency_threshold_ms = 500
+# Separate adaptive foreground-latency thresholds. The soft threshold throttles
+# inventory pacing; the hard threshold pauses inventory. When omitted they
+# default to 2x and 4x health_latency_threshold_ms. The hard threshold is
+# clamped upward to the soft threshold when configured below it.
+# adaptive_foreground_soft_latency_ms = 1000
+# adaptive_foreground_hard_latency_ms = 2000
 # Bound each pre-build and health OPC operation so one unresponsive server
 # cannot hold the scheduler indefinitely.
 operation_timeout_seconds = 30
