@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.8](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.7...opcda-bridge-gateway-v0.5.8) - 2026-09-17
+
+### Added
+
+- *(gateway)* add adaptive inventory controller ([#156](https://github.com/bytehound-labs/opcda-bridge/pull/156))
+
 ## [0.5.7](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.6...opcda-bridge-gateway-v0.5.7) - 2026-09-17
 
 ### Added
