@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.7](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.6...opcda-bridge-gateway-v0.5.7) - 2026-09-17
+
+### Added
+
+- *(gateway)* batch index entry commits ([#151](https://github.com/bytehound-labs/opcda-bridge/pull/151))
+
 ### Changed
 
 - _(gateway)_ default namespace-index SQLite commits to batches of 1,024 entries,
