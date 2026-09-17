@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.5...opcda-bridge-gateway-v0.5.6) - 2026-09-17
+
+### Added
+
+- *(gateway)* separate inventory pacing controls ([#149](https://github.com/bytehound-labs/opcda-bridge/pull/149))
+
 ## [0.5.5](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.4...opcda-bridge-gateway-v0.5.5) - 2026-09-17
 
 ### Added
