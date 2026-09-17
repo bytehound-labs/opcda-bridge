@@ -65,7 +65,8 @@ pub struct ControllerConfig {
     pub healthy_window: Duration,
     pub recovery_delay: Duration,
     pub maximum_recovery_delay: Duration,
-    pub foreground_latency_absolute_ms: u64,
+    pub foreground_latency_soft_ms: u64,
+    pub foreground_latency_hard_ms: u64,
 }
 
 impl ControllerConfig {
@@ -126,7 +127,10 @@ impl ControllerConfig {
             maximum_recovery_delay: self
                 .maximum_recovery_delay
                 .max(self.recovery_delay.max(Duration::from_millis(1))),
-            foreground_latency_absolute_ms: self.foreground_latency_absolute_ms.max(1),
+            foreground_latency_soft_ms: self.foreground_latency_soft_ms.max(1),
+            foreground_latency_hard_ms: self
+                .foreground_latency_hard_ms
+                .max(self.foreground_latency_soft_ms.max(1)),
         }
     }
 }
@@ -153,7 +157,8 @@ impl Default for ControllerConfig {
             healthy_window: Duration::from_secs(30),
             recovery_delay: Duration::from_secs(30),
             maximum_recovery_delay: Duration::from_secs(300),
-            foreground_latency_absolute_ms: 2_000,
+            foreground_latency_soft_ms: 1_000,
+            foreground_latency_hard_ms: 2_000,
         }
     }
 }
@@ -193,6 +198,7 @@ pub struct HostMetrics {
 
 pub trait HostMetricsProvider: Send + Sync {
     fn snapshot(&self) -> HostMetrics;
+    fn latest(&self) -> HostMetrics;
 }
 
 #[derive(Debug, Default)]
@@ -200,6 +206,10 @@ pub struct UnavailableHostMetrics;
 
 impl HostMetricsProvider for UnavailableHostMetrics {
     fn snapshot(&self) -> HostMetrics {
+        HostMetrics::default()
+    }
+
+    fn latest(&self) -> HostMetrics {
         HostMetrics::default()
     }
 }
@@ -233,6 +243,7 @@ struct WindowsMetricsState {
     sampled_at: Option<Instant>,
     system: Option<SystemCounters>,
     process: Option<ProcessCounters>,
+    latest: HostMetrics,
 }
 
 #[cfg(target_os = "windows")]
@@ -411,7 +422,7 @@ impl HostMetricsProvider for WindowsHostMetrics {
         state.system = system;
         state.process = process;
 
-        HostMetrics {
+        let metrics = HostMetrics {
             cpu_percent,
             available_memory_percent,
             // Windows performance counters are intentionally not guessed here.
@@ -422,7 +433,16 @@ impl HostMetricsProvider for WindowsHostMetrics {
             process_read_bytes_per_second,
             process_write_bytes_per_second,
             disk_free_bytes,
-        }
+        };
+        state.latest = metrics;
+        metrics
+    }
+
+    fn latest(&self) -> HostMetrics {
+        self.state
+            .lock()
+            .map(|state| state.latest)
+            .unwrap_or_default()
     }
 }
 
@@ -539,17 +559,11 @@ impl AdaptiveIndexController {
         {
             return Some(PauseReason::OpcHealth);
         }
-        if let Some(latency) = observation.foreground_latency_ms {
-            let baseline = observation
-                .baseline_latency_ms
-                .unwrap_or(self.config.foreground_latency_absolute_ms);
-            let hard_limit = self
-                .config
-                .foreground_latency_absolute_ms
-                .max(baseline.saturating_mul(4));
-            if latency >= hard_limit {
-                return Some(PauseReason::OpcHealth);
-            }
+        if observation
+            .foreground_latency_ms
+            .is_some_and(|latency| latency >= self.config.foreground_latency_hard_ms)
+        {
+            return Some(PauseReason::OpcHealth);
         }
         if observation
             .host_cpu_percent
@@ -583,8 +597,7 @@ impl AdaptiveIndexController {
     fn soft_reason(&self, observation: ControllerObservation) -> Option<PauseReason> {
         if observation
             .foreground_latency_ms
-            .zip(observation.baseline_latency_ms)
-            .is_some_and(|(latency, baseline)| latency >= baseline.saturating_mul(2))
+            .is_some_and(|latency| latency >= self.config.foreground_latency_soft_ms)
         {
             return Some(PauseReason::OpcHealth);
         }
@@ -739,7 +752,8 @@ mod tests {
             healthy_window: Duration::ZERO,
             recovery_delay: Duration::ZERO,
             maximum_recovery_delay: Duration::ZERO,
-            foreground_latency_absolute_ms: 0,
+            foreground_latency_soft_ms: 0,
+            foreground_latency_hard_ms: 0,
         }
         .normalized();
         assert_eq!(config.floor.item_rate_per_second, 1);
@@ -748,6 +762,42 @@ mod tests {
         assert_eq!(config.canary, config.floor);
         assert_eq!(config.ceiling, config.floor);
         assert_eq!(config.healthy_window, Duration::from_millis(1));
+        assert_eq!(config.foreground_latency_soft_ms, 1);
+        assert_eq!(config.foreground_latency_hard_ms, 1);
+    }
+
+    #[test]
+    fn foreground_latency_uses_explicit_soft_and_hard_limits() {
+        let started = now();
+        let config = ControllerConfig {
+            foreground_latency_soft_ms: 300,
+            foreground_latency_hard_ms: 600,
+            ..ControllerConfig::default()
+        };
+
+        let mut soft_controller = AdaptiveIndexController::new(config, started);
+        let soft = soft_controller.observe(
+            started + Duration::from_secs(1),
+            ControllerObservation {
+                baseline_latency_ms: Some(100),
+                foreground_latency_ms: Some(300),
+                ..ControllerObservation::default()
+            },
+        );
+        assert_eq!(soft.reason, Some(PauseReason::OpcHealth));
+        assert_eq!(soft.state, ControllerState::Throttled);
+
+        let mut hard_controller = AdaptiveIndexController::new(config, started);
+        let hard = hard_controller.observe(
+            started + Duration::from_secs(1),
+            ControllerObservation {
+                baseline_latency_ms: Some(100),
+                foreground_latency_ms: Some(600),
+                ..ControllerObservation::default()
+            },
+        );
+        assert_eq!(hard.reason, Some(PauseReason::OpcHealth));
+        assert_eq!(hard.state, ControllerState::Paused(PauseReason::OpcHealth));
     }
 
     #[test]
@@ -886,6 +936,28 @@ mod tests {
     }
 
     #[test]
+    fn database_pause_recovers_when_commit_pressure_clears() {
+        let started = now();
+        let config = ControllerConfig {
+            recovery_delay: Duration::from_secs(5),
+            ..ControllerConfig::default()
+        };
+        let mut controller = AdaptiveIndexController::new(config, started);
+        let paused = controller.observe(
+            started + Duration::from_secs(1),
+            ControllerObservation {
+                database_commit_p95_ms: Some(1_000),
+                ..healthy()
+            },
+        );
+        assert_eq!(paused.state, ControllerState::Paused(PauseReason::Database));
+
+        let resumed = controller.observe(started + Duration::from_secs(6), healthy());
+        assert_eq!(resumed.state, ControllerState::Ramping);
+        assert!(!resumed.paused);
+    }
+
+    #[test]
     fn foreground_work_pauses_without_consuming_health_backoff() {
         let started = now();
         let mut controller = AdaptiveIndexController::new(ControllerConfig::default(), started);
@@ -935,6 +1007,7 @@ mod tests {
     #[test]
     fn unavailable_host_metrics_are_explicit() {
         assert_eq!(UnavailableHostMetrics.snapshot(), HostMetrics::default());
+        assert_eq!(UnavailableHostMetrics.latest(), HostMetrics::default());
     }
 
     #[test]
@@ -1039,7 +1112,7 @@ mod tests {
         let soft_cases = [
             (
                 ControllerObservation {
-                    foreground_latency_ms: Some(200),
+                    foreground_latency_ms: Some(1_000),
                     ..healthy()
                 },
                 PauseReason::OpcHealth,
