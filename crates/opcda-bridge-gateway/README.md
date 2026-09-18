@@ -136,8 +136,11 @@ default when its per-server auto-refresh setting and global `index.enabled` swit
 Disabling per-server auto-refresh preserves its searchable generation; deleting an index removes
 its enrollment, generations, entries, and retry state after coordinating any active build. Delete
 returns a temporary `deleting` status while cleanup runs, then reaches `not-indexed`. The gateway
-uses a service-writable SQLite database, conservative batch/rate/duty-cycle defaults, a
-two-second foreground quiet period, and one build at a time.
+uses a service-writable SQLite database, throughput-oriented 256-entry inventory and
+1,024-entry commit batches, no item-rate pacing, a 100% duty cycle, a two-second foreground
+quiet period, and one build at a time. Foreground coordination, health and storage guardrails,
+cancellation, build locking, lifecycle validation, and generation promotion remain active.
+Adaptive pacing is opt-in for deployments that need automatic rate/batch/duty throttling.
 Native inventory batches are bounded to 1,000 entries by the OPC DA client contract.
 Native inventory slicing and SQLite commit batching are independently bounded: the default
 SQLite commit batch is 1,024 entries, so a commit may span multiple native slices. Adaptive
@@ -172,9 +175,9 @@ The default database path is `%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Win
 `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (falling back to
 `$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS. See the example file for all
 available settings, including maintenance windows, health thresholds, and adaptive AIMD
-rate/batch/duty-cycle floors and ceilings. Adaptive indexing starts at the canary profile and
-backs off or pauses when recent foreground OPC errors or bad-quality reads, or host/storage
-guardrails, deteriorate.
+rate/batch/duty-cycle floors and ceilings. When adaptive indexing is enabled, it starts at the
+canary profile and backs off or pauses when recent foreground OPC errors or bad-quality reads,
+or host/storage guardrails, deteriorate.
 Pre-build and health OPC operations are bounded by `operation_timeout_seconds`, so an
 unresponsive target cannot hold the scheduler indefinitely.
 An optional `sentinel_tag` is read during health probes; omitted or unavailable sentinel

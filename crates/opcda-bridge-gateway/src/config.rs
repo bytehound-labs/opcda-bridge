@@ -122,7 +122,7 @@ pub struct IndexConfig {
     pub minimum_item_rate: Option<u32>,
     pub minimum_batch_size: Option<u32>,
     pub minimum_duty_cycle_percent: Option<u8>,
-    /// Conservative starting profile for each inventory build.
+    /// Starting profile used when adaptive pacing is enabled.
     pub canary_item_rate: Option<u32>,
     pub canary_batch_size: Option<u32>,
     pub canary_duty_cycle_percent: Option<u8>,
@@ -210,14 +210,14 @@ pub struct ResolvedIndexConfig {
 pub const DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS: u64 = 604_800;
 pub const DEFAULT_INDEX_STARTUP_GRACE_PERIOD_SECONDS: u64 = 30;
 pub const DEFAULT_INDEX_SCHEDULE_JITTER_SECONDS: u64 = 21_600;
-pub const DEFAULT_INDEX_INVENTORY_BATCH_SIZE: u32 = 100;
+pub const DEFAULT_INDEX_INVENTORY_BATCH_SIZE: u32 = 256;
 pub const DEFAULT_INDEX_COMMIT_BATCH_SIZE: u32 = 1_024;
 pub const DEFAULT_INDEX_COMMIT_INTERVAL_MS: u64 = 1_000;
-pub const DEFAULT_INDEX_BATCH_SIZE: u32 = 100;
-pub const DEFAULT_INDEX_ITEM_RATE: u32 = 250;
+pub const DEFAULT_INDEX_BATCH_SIZE: u32 = 256;
+pub const DEFAULT_INDEX_ITEM_RATE: u32 = 0;
 pub const DEFAULT_INDEX_BURST_SIZE: u32 = 100;
-pub const DEFAULT_INDEX_DUTY_CYCLE_PERCENT: u8 = 20;
-pub const DEFAULT_INDEX_ADAPTIVE: bool = true;
+pub const DEFAULT_INDEX_DUTY_CYCLE_PERCENT: u8 = 100;
+pub const DEFAULT_INDEX_ADAPTIVE: bool = false;
 pub const DEFAULT_INDEX_MINIMUM_ITEM_RATE: u32 = 10;
 pub const DEFAULT_INDEX_MINIMUM_BATCH_SIZE: u32 = 1;
 pub const DEFAULT_INDEX_MINIMUM_DUTY_CYCLE_PERCENT: u8 = 1;
@@ -728,11 +728,15 @@ mod tests {
         assert_eq!(resolved.refresh_interval_seconds, 604_800);
         assert_eq!(resolved.startup_grace_period_seconds, 30);
         assert_eq!(resolved.schedule_jitter_seconds, 21_600);
-        assert_eq!(resolved.inventory_batch_size, 100);
+        assert_eq!(resolved.inventory_batch_size, 256);
         assert_eq!(resolved.commit_batch_size, 1_024);
         assert_eq!(resolved.commit_interval_ms, 1_000);
         assert_eq!(resolved.sentinel_tag, None);
         assert_eq!(resolved.operation_timeout_seconds, 30);
+        assert_eq!(resolved.batch_size, 256);
+        assert_eq!(resolved.item_rate_limit, 0);
+        assert_eq!(resolved.duty_cycle_percent, 100);
+        assert!(!resolved.adaptive);
         assert_eq!(resolved.health_latency_threshold_ms, 500);
         assert_eq!(resolved.adaptive_foreground_soft_latency_ms, 1_000);
         assert_eq!(resolved.adaptive_foreground_hard_latency_ms, 2_000);
