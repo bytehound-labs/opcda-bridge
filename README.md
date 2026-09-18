@@ -452,16 +452,16 @@ schedules only enrolled servers with a successful active generation and
 | Refresh interval                   | `index.refresh_interval_seconds`            | `604800` (7 days)              |
 | Startup grace period               | `index.startup_grace_period_seconds`        | `30` seconds                   |
 | Schedule jitter                    | `index.schedule_jitter_seconds`             | `21600` seconds                |
-| Inventory slice batch              | `index.inventory_batch_size`                | `100` entries (max `1000`)     |
+| Inventory slice batch              | `index.inventory_batch_size`                | `256` entries (max `1000`)     |
 | Inventory root                     | `index.inventory_root`                      | None (full namespace)          |
 | Namespace workers                  | `index.worker_count`                        | `1` (maximum `4`)              |
-| SQLite commit batch                | `index.commit_batch_size`                   | `100` entries                  |
+| SQLite commit batch                | `index.commit_batch_size`                   | `1024` entries                 |
 | SQLite commit interval             | `index.commit_interval_ms`                  | `1000` ms                      |
-| Legacy batch size fallback         | `index.batch_size`                          | `100` (max `1000`)             |
-| Average item rate                  | `index.item_rate_limit`                     | `250` items/second             |
+| Legacy batch size fallback         | `index.batch_size`                          | `256` (max `1000`)             |
+| Average item rate                  | `index.item_rate_limit`                     | `0` (unlimited)                |
 | Burst allowance                    | `index.burst_size`                          | `100` items                    |
-| Active duty cycle                  | `index.duty_cycle_percent`                  | `20`%                          |
-| Adaptive pacing                    | `index.adaptive`                            | `true`                         |
+| Active duty cycle                  | `index.duty_cycle_percent`                  | `100`%                         |
+| Adaptive pacing                    | `index.adaptive`                            | `false` (opt-in)               |
 | Adaptive canary profile            | `index.canary_*`                            | `50` items/s, batch `25`, `5`% |
 | Adaptive floor profile             | `index.minimum_*`                           | `10` items/s, batch `1`, `1`%  |
 | Foreground quiet period            | `index.quiet_period_seconds`                | `2` seconds                    |
@@ -480,12 +480,16 @@ schedules only enrolled servers with a successful active generation and
 | Start paused                       | `index.paused`                              | `false`                        |
 | Maximum indexed results            | `index.max_results`                         | `50`                           |
 
-The item-rate limit and native minimum operation interval are independent controls. The
+The default index profile is throughput-oriented: 256-entry inventory slices, 1,024-entry
+SQLite commits, no item-rate pacing, and a 100% duty cycle. The item-rate limit and native
+minimum operation interval are independent controls. The
 `index.item_rate_limit` setting is forwarded to the native item-rate limiter and charges each
 inventory operation by its item cost; it does not derive a native sleep from
 `batch_size / item_rate_limit`. The gateway leaves the native minimum interval at zero and
-applies the native batch size independently. Set `index.item_rate_limit` to `0` for the raw
-profile with no item-rate pacing.
+applies the native batch size independently. A value of `0` disables item-rate pacing.
+`index.duty_cycle_percent = 100` removes intentional duty-cycle pauses. Adaptive pacing is
+opt-in; when enabled, the canary and floor settings below control its starting and minimum
+profiles.
 
 When `index.inventory_root` is set, indexing starts at that exact canonical OPC ItemID
 instead of the server root. This is useful for building an index for one controller or
@@ -511,8 +515,10 @@ The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (
 `$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS and
 `%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows. Maintenance-window entries are local
 24-hour ranges such as `22:00-06:00`; when configured, indexing is deferred outside those ranges.
-Adaptive indexing uses recent foreground OPC errors and bad-quality reads as health signals in
-addition to latency and host/storage guardrails.
+Foreground operations still coordinate with and pause inventory, and adaptive indexing, when
+enabled, uses recent foreground OPC errors and bad-quality reads as health signals in addition
+to latency and host/storage guardrails. These safety and lifecycle protections remain active
+with the throughput-oriented defaults.
 Foreground latency has separate soft and hard adaptive thresholds. Reaching the soft threshold
 throttles inventory pacing; reaching the hard threshold pauses inventory. When omitted, the
 thresholds default to twice and four times `health_latency_threshold_ms`, respectively, and the

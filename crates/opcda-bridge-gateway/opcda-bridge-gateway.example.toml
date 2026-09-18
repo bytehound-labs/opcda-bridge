@@ -67,7 +67,7 @@ schedule_jitter_seconds = 21600
 # Native inventory slices and SQLite commits are independently bounded. Native
 # slices must not exceed the OPC DA client's 1,000-entry limit, while commits
 # may span multiple native slices.
-inventory_batch_size = 100
+inventory_batch_size = 256
 # Optional exact canonical ItemID to inventory instead of the complete namespace.
 # When set, automatic root partitioning is not used.
 # inventory_root = "FCS0201"
@@ -76,23 +76,24 @@ commit_batch_size = 1024
 commit_interval_ms = 1000
 
 # Maximum native inventory entries requested per bounded operation.
-batch_size = 100
+batch_size = 256
 
 # Average inventory item rate and initial burst allowance. Set item_rate_limit
 # to 0 for the raw profile with no item-rate pacing. The native minimum
 # operation interval is independent and remains zero for gateway-generated
 # inventory pacing.
-item_rate_limit = 250
+# 0 disables item-rate pacing. Foreground coordination, health checks, storage
+# safeguards, cancellation, and lifecycle validation remain active.
+item_rate_limit = 0
 burst_size = 100
 
 # Maximum percentage of time spent actively indexing between foreground
-# operations. Lower values reduce OPC server load.
-duty_cycle_percent = 20
+# operations. 100 removes intentional duty-cycle pauses.
+duty_cycle_percent = 100
 
-# Adaptive AIMD control is enabled by default. It starts each build at a
-# conservative canary profile and ramps toward the limits above only while
-# foreground and host health remain good.
-adaptive = true
+# Adaptive AIMD control is opt-in. Enable it when a deployment needs automatic
+# rate/batch/duty throttling in response to foreground or host pressure.
+adaptive = false
 minimum_item_rate = 10
 minimum_batch_size = 1
 minimum_duty_cycle_percent = 1
