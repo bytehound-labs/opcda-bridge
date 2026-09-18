@@ -1,6 +1,6 @@
 [package]
 name = "opcda-bridge-gateway"
-version = "0.5.8"
+version = "0.5.9"
 edition.workspace = true
 rust-version.workspace = true
 description = "OPC DA gateway (Windows COM server)"
