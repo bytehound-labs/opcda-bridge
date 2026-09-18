@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.8...opcda-bridge-gateway-v0.5.9) - 2026-09-18
+
+### Other
+
+- *(gateway)* make fast index profile the default ([#161](https://github.com/bytehound-labs/opcda-bridge/pull/161))
+
 ## [0.5.8](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.7...opcda-bridge-gateway-v0.5.8) - 2026-09-17
 
 ### Added
