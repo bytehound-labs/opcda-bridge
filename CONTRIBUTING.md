@@ -174,6 +174,11 @@ client-specific tag and uses standard Arch `pkgver-pkgrel` versioning. Its gener
 filenames include the package version so cached files from an earlier release cannot cause
 checksum failures; packaging-only changes use a bumped `pkgrel`.
 
+## Reporting security issues
+
+Do not open public issues or pull requests for security vulnerabilities. Report them privately as
+described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 By contributing, you agree your contributions are licensed under the project's [MIT
