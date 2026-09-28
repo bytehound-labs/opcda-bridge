@@ -159,9 +159,10 @@ i686-pc-windows-msvc`. A plain host-target build is not release-equivalent; the 
 
 All GitHub Actions in `.github/workflows/` are pinned to immutable commit SHAs. Change-aware
 security workflows run CodeQL, Semgrep, full-history Gitleaks, actionlint, zizmor, Buf
-Protobuf compatibility checks, and bounded cargo-fuzz smoke tests. Tagged binary releases
-publish SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures, and GitHub artifact
-provenance attestations; `workflow_dispatch` builds package artifacts without publishing.
+Protobuf checks (lint, formatting, and compatibility), and bounded cargo-fuzz smoke tests.
+Tagged binary releases publish SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore
+signatures, and GitHub artifact provenance attestations; `workflow_dispatch` builds package
+artifacts without publishing.
 
 SonarQube Cloud analyzes the Rust workspace through `sonar-project.properties` and
 `.github/workflows/sonar.yml`. The configuration keeps crate and compatibility source roots
@@ -192,6 +193,14 @@ break compilation before the compatibility test can exercise the wire boundary.
 An intentional Protobuf break requires the `breaking-protobuf` label, a new or changed catalog
 boundary, updated evidence, and regenerated compatibility reports. Release-integrity validation
 rejects publishable package versions that do not fall within exactly one catalog release line.
+
+`buf.yaml` applies Buf's `STANDARD` lint rules, and the Protobuf workflow also requires
+`buf format --diff --exit-code` to pass. The commented `except` entries in `buf.yaml` cover names
+fixed by the published wire contract: the `bridge` package and file layout, the `Bridge` service,
+and the shared or domain-named RPC response messages. The exceptions apply to the whole module,
+so they also exempt new elements from those rules. Never rename packages, services, RPCs,
+messages, fields, or enum values, or change field numbers or types, merely to satisfy lint; add
+a documented exception instead.
 
 ### Coverage enforcement
 
