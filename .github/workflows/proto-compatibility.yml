@@ -42,6 +42,30 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/proto-compatibility.yml'
 
+  lint:
+    name: Lint Protobuf schema
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Buf
+        uses: bufbuild/buf-setup-action@fbb91772b52752bd36ca8552d2ff4b94e111f24f # main
+        with:
+          version: 1.50.0
+
+      - name: Lint Protobuf schema
+        run: buf lint
+
+      - name: Check Protobuf formatting
+        run: buf format --diff --exit-code
+
   compatibility:
     name: Check Protobuf compatibility
     needs: changes
@@ -91,7 +115,7 @@ jobs:
   security:
     name: Required Protobuf compatibility status
     if: always()
-    needs: [changes, compatibility, breaking-boundary]
+    needs: [changes, lint, compatibility, breaking-boundary]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -105,7 +129,15 @@ jobs:
 
       - name: Report skipped compatibility check
         if: needs.changes.outputs.run != 'true'
-        run: echo "No Protobuf-affecting files changed; compatibility check skipped."
+        run: echo "No Protobuf-affecting files changed; lint, formatting, and compatibility checks skipped."
+
+      - name: Verify lint and formatting result
+        if: needs.changes.outputs.run == 'true' && needs.lint.result != 'success'
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+        run: |
+          echo "Protobuf lint and formatting ended with: ${LINT_RESULT}"
+          exit 1
 
       - name: Report approved breaking change
         if: needs.changes.outputs.run == 'true' && contains(github.event.pull_request.labels.*.name, 'breaking-protobuf')

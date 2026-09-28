@@ -97,12 +97,12 @@ Linux and Windows jobs compile the current workspace sources. Documentation-only
 required `check` and `coverage` statuses green without rebuilding the workspace.
 
 Security workflows use immutable action pins and bounded aggregate statuses. They run CodeQL,
-Semgrep, full-history Gitleaks, actionlint, zizmor, Protobuf breaking-change checks, and bounded
-fuzz smoke tests when their inputs change. Tagged binary releases receive checksums, an SBOM,
-keyless signatures, and provenance; use the release workflow's manual dispatch for packaging
-validation without publishing. Intentional Protobuf wire-contract breaks must carry the
-`breaking-protobuf` label; without that explicit approval, the Buf compatibility check blocks the
-pull request.
+Semgrep, full-history Gitleaks, actionlint, zizmor, Buf Protobuf checks (lint, formatting, and
+breaking changes), and bounded fuzz smoke tests when their inputs change. Tagged binary releases
+receive checksums, an SBOM, keyless signatures, and provenance; use the release workflow's manual
+dispatch for packaging validation without publishing. Intentional Protobuf wire-contract breaks
+must carry the `breaking-protobuf` label; without that explicit approval, the Buf compatibility
+check blocks the pull request.
 
 The generated compatibility files must remain synchronized with
 `crates/opcda-bridge-proto/compatibility.toml`:
@@ -118,6 +118,20 @@ The catalog describes protocol release lines rather than equal package versions.
 breaking Protobuf change requires the `breaking-protobuf` label, a new or changed compatibility
 boundary, updated boundary evidence, and regenerated reports. The Buf compatibility workflow
 enforces those requirements.
+
+The same workflow lints the schema with Buf's `STANDARD` rules and requires the schema files to
+match `buf format` output. Run both checks from the repository root before submitting a Protobuf
+change:
+
+```sh
+buf lint
+buf format --diff --exit-code
+```
+
+The `except` entries in `buf.yaml` cover names that are already part of the published wire
+contract: the `bridge` package and its file layout, the `Bridge` service, and the shared or
+domain-named RPC response messages. Renaming those elements would change gRPC method paths or the
+generated Rust API, so they remain documented lint exceptions rather than lint fixes.
 
 ## Pull requests
 

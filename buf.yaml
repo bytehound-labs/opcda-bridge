@@ -3,6 +3,34 @@ version: v2
 modules:
   - path: crates/opcda-bridge-proto/proto
 
+lint:
+  use:
+    - STANDARD
+  # The published bridge protocol predates these rules. Each excepted rule
+  # would require renaming a package, service, or message, which changes the
+  # gRPC wire contract or the generated Rust API, so the rule is disabled
+  # instead of the schema being renamed.
+  except:
+    # `proto/bridge.proto` declares package `bridge`. Satisfying the rule
+    # requires either moving the file into `bridge/`, which the FILE breaking
+    # rules report as a deleted file and which changes the build.rs input
+    # path, or renaming the package, which changes every gRPC method path
+    # (`/bridge.Bridge/<Method>`).
+    - PACKAGE_DIRECTORY_MATCH
+    # Adding a version suffix (for example `bridge.v1`) renames the package
+    # and therefore every gRPC method path.
+    - PACKAGE_VERSION_SUFFIX
+    # Renaming service `Bridge` to `BridgeService` changes every gRPC method
+    # path and the generated client/server type names.
+    - SERVICE_SUFFIX
+    # `GetSearchIndexStatus`, `RefreshSearchIndex`, and `ControlSearchIndex`
+    # intentionally share the `SearchIndexStatus` response message.
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    # Responses use domain message names (`BrowsePage`, `SearchEvent`,
+    # `SearchIndexStatus`, and `google.protobuf.Empty`) rather than
+    # `<Rpc>Response`; renaming them breaks the generated Rust API.
+    - RPC_RESPONSE_STANDARD_NAME
+
 breaking:
   use:
     - FILE
