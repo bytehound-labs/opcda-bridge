@@ -1,0 +1,25 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{rs,py,ps1}]
+indent_size = 4
+
+[*.{yml,yaml,json,toml,md,proto}]
+indent_size = 2
+
+[*.{sh,bash}]
+indent_size = 2
+
+# Bash script without an extension. Its .SRCINFO heredoc body keeps the tab
+# indentation produced by `makepkg --printsrcinfo`; that is data, not indentation.
+[scripts/aurpkg]
+indent_size = 2

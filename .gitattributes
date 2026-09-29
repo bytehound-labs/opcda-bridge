@@ -1,0 +1,22 @@
+# Normalize text files to LF in the repository and in every working tree.
+* text=auto eol=lf
+
+# cmd.exe needs CRLF to parse batch labels reliably (none are tracked today).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets (none are tracked today).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.gz binary
+
+# Generated files.
+/COMPATIBILITY.md linguist-generated=true
+/compatibility.json linguist-generated=true
+Cargo.lock linguist-generated=true
