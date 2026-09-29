@@ -681,6 +681,13 @@ uploads packages as workflow artifacts without creating a GitHub release. The cl
 use their own package tags; protocol and library releases remain crates.io releases without binary
 archives.
 
+## Security
+
+The gateway is an unauthenticated, unencrypted network service that can read and write OPC DA
+tags. Run it only on trusted OT networks and restrict its port to specific client hosts. See
+[SECURITY.md](SECURITY.md) for the security model and for how to report vulnerabilities
+privately.
+
 ## License
 
 [MIT](LICENSE)
