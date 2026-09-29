@@ -2,7 +2,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use opcda_bridge_gateway::index::IndexedMatch;
-use opcda_bridge_gateway::index::fuzzing::{parse_breadcrumbs, search_all_modes};
+use opcda_bridge_gateway::index::fuzzing::{
+    SearchAllModesError, parse_breadcrumbs, search_all_modes,
+};
 use opcda_bridge_gateway::opc::{InventoryEntry, InventoryNodeKind};
 
 fn text(data: &[u8]) -> String {
@@ -46,6 +48,12 @@ fuzz_target!(|data: &[u8]| {
         breadcrumbs: entry.breadcrumbs.clone(),
     };
 
-    let results = search_all_modes(&entry.display_name, std::slice::from_ref(&entry), 10).unwrap();
+    let results = match search_all_modes(&entry.display_name, std::slice::from_ref(&entry), 10) {
+        Ok(results) => results,
+        Err(SearchAllModesError::QueryRejected(_)) => return,
+        Err(SearchAllModesError::Setup(error)) => {
+            panic!("unable to prepare index-record fuzz input: {error:#}")
+        }
+    };
     assert_eq!(results[1].as_slice(), std::slice::from_ref(&expected));
 });

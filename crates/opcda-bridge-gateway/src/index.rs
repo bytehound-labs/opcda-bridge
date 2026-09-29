@@ -2567,28 +2567,39 @@ pub mod fuzzing {
     use crate::opc::InventoryEntry;
     use std::path::Path;
 
+    #[derive(Debug)]
+    pub enum SearchAllModesError {
+        Setup(anyhow::Error),
+        QueryRejected(anyhow::Error),
+    }
+
     pub fn search_all_modes(
         query: &str,
         entries: &[InventoryEntry],
         limit: u32,
-    ) -> anyhow::Result<[Vec<IndexedMatch>; 4]> {
+    ) -> Result<[Vec<IndexedMatch>; 4], SearchAllModesError> {
         const SERVER: &str = "fuzz";
 
-        let mut database = IndexDb::open(Path::new(":memory:"))?;
-        let generation = database.start_generation(
-            SERVER,
-            NamespaceOrganization::Unspecified,
-            BrowseSource::Unspecified,
-            "0",
-        )?;
-        database.insert_entries(SERVER, generation, entries)?;
+        let mut database =
+            IndexDb::open(Path::new(":memory:")).map_err(SearchAllModesError::Setup)?;
+        let generation = database
+            .start_generation(
+                SERVER,
+                NamespaceOrganization::Unspecified,
+                BrowseSource::Unspecified,
+                "0",
+            )
+            .map_err(SearchAllModesError::Setup)?;
+        database
+            .insert_entries(SERVER, generation, entries)
+            .map_err(SearchAllModesError::Setup)?;
+        let search = |mode| {
+            database
+                .search(SERVER, generation, query, mode, limit)
+                .map_err(SearchAllModesError::QueryRejected)
+        };
 
-        Ok([
-            database.search(SERVER, generation, query, 0, limit)?,
-            database.search(SERVER, generation, query, 1, limit)?,
-            database.search(SERVER, generation, query, 2, limit)?,
-            database.search(SERVER, generation, query, 3, limit)?,
-        ])
+        Ok([search(0)?, search(1)?, search(2)?, search(3)?])
     }
 
     pub fn parse_breadcrumbs(value: String) -> rusqlite::Result<Vec<String>> {
@@ -9446,6 +9457,18 @@ mod tests {
             .unwrap();
         database.insert_entries("S", generation, entries).unwrap();
         (database, generation)
+    }
+
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn fuzzing_search_classifies_fts_syntax_rejections() {
+        let query = "fuzz!\0\u{3}";
+        let entries = [inventory_entry(query, "0")];
+
+        assert!(matches!(
+            super::fuzzing::search_all_modes(query, &entries, 10),
+            Err(super::fuzzing::SearchAllModesError::QueryRejected(_))
+        ));
     }
 
     proptest! {

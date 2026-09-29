@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use opcda_bridge_gateway::index::IndexedMatch;
-use opcda_bridge_gateway::index::fuzzing::search_all_modes;
+use opcda_bridge_gateway::index::fuzzing::{SearchAllModesError, search_all_modes};
 use opcda_bridge_gateway::opc::{InventoryEntry, InventoryNodeKind};
 
 fn text(data: &[u8]) -> String {
@@ -54,7 +54,13 @@ fuzz_target!(|data: &[u8]| {
         make_entry("6".into(), "zzzz".into(), InventoryNodeKind::Item),
     ];
 
-    let results = search_all_modes(&query, &entries, 10).unwrap();
+    let results = match search_all_modes(&query, &entries, 10) {
+        Ok(results) => results,
+        Err(SearchAllModesError::QueryRejected(_)) => return,
+        Err(SearchAllModesError::Setup(error)) => {
+            panic!("unable to prepare indexed-search fuzz input: {error:#}")
+        }
+    };
     assert_eq!(results[0], results[3]);
     if query.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
         assert_eq!(item_ids(&results[1]), vec!["0", query.as_str()]);
