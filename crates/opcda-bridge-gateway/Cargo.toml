@@ -16,6 +16,9 @@ categories = [
   "command-line-utilities",
 ]
 
+[features]
+fuzzing = []
+
 [dependencies]
 opcda-bridge-proto.workspace = true
 tonic.workspace = true
