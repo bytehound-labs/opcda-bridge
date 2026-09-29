@@ -721,7 +721,7 @@ mod tests {
         assert_eq!(
             [first.as_ref().err(), second.as_ref().err()]
                 .into_iter()
-                .filter(|error| error.is_some())
+                .filter(Option::is_some)
                 .count(),
             1
         );
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(
             [first.as_ref().err(), second.as_ref().err()]
                 .into_iter()
-                .filter(|error| error.is_some())
+                .filter(Option::is_some)
                 .count(),
             1
         );
@@ -1079,7 +1079,7 @@ mod tests {
         assert_eq!(
             [first.as_ref().err(), second.as_ref().err()]
                 .into_iter()
-                .filter(|error| error.is_some())
+                .filter(Option::is_some)
                 .count(),
             1
         );

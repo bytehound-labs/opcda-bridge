@@ -999,9 +999,8 @@ impl BackgroundTasks {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return false,
+        let Ok(mut state) = self.state.lock() else {
+            return false;
         };
         if state.shutting_down {
             return false;
@@ -2963,7 +2962,8 @@ async fn run_cleanup_worker(
 async fn wait_for_deferred_cleanup(
     path: &Path,
     server: &str,
-    _background_tasks: &Arc<BackgroundTasks>,
+    #[cfg(test)] background_tasks: &Arc<BackgroundTasks>,
+    #[cfg(not(test))] _background_tasks: &Arc<BackgroundTasks>,
     coordination: &Arc<DatabaseCoordination>,
     cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
@@ -2991,7 +2991,7 @@ async fn wait_for_deferred_cleanup(
         return true;
     }
     #[cfg(test)]
-    _background_tasks.wait_for_cleanup_notification_hook().await;
+    background_tasks.wait_for_cleanup_notification_hook().await;
     if *shutdown.borrow() {
         return false;
     }
@@ -3005,13 +3005,14 @@ async fn retry_cleanup_after_failure(
     path: &Path,
     server: &str,
     background_tasks: &Arc<BackgroundTasks>,
-    _cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    #[cfg(test)] cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    #[cfg(not(test))] _cleanup_tasks: &Arc<Mutex<HashMap<String, CleanupTaskState>>>,
     consecutive_failures: &mut u32,
     error: &anyhow::Error,
 ) -> bool {
     *consecutive_failures = consecutive_failures.saturating_add(1);
     #[cfg(test)]
-    if let Ok(mut tasks) = _cleanup_tasks.lock()
+    if let Ok(mut tasks) = cleanup_tasks.lock()
         && let Some(task) = tasks.get_mut(server)
     {
         task.failures = task.failures.saturating_add(1);
@@ -5923,21 +5924,18 @@ impl<C: OpcClient> IndexManager<C> {
                     break;
                 }
             }
-            let event = match tokio::time::timeout(
+            let Ok(event) = tokio::time::timeout(
                 Duration::from_secs(self.settings.operation_timeout_seconds.max(1)),
                 handle.stream.next(),
             )
             .await
-            {
-                Ok(event) => event,
-                Err(_) => {
-                    handle.control.cancel();
-                    state.failed = Some(format!(
-                        "inventory event timed out after {} seconds",
-                        self.settings.operation_timeout_seconds.max(1)
-                    ));
-                    break;
-                }
+            else {
+                handle.control.cancel();
+                state.failed = Some(format!(
+                    "inventory event timed out after {} seconds",
+                    self.settings.operation_timeout_seconds.max(1)
+                ));
+                break;
             };
             let Some(event) = event else {
                 break;
@@ -6414,7 +6412,7 @@ impl<C: OpcClient> IndexManager<C> {
                 state,
             ),
             Err(error) => {
-                self.finish_promotion_failure(server, generation, control, ownership, error)
+                self.finish_promotion_failure(server, generation, control, ownership, error);
             }
         }
     }

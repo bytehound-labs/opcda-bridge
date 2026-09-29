@@ -279,16 +279,20 @@ mod tests {
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    #[allow(unsafe_code)]
     fn test_load_config_default_discovery_absent_env() {
         // With none of XDG_CONFIG_HOME/HOME/APPDATA visible, discovery
         // should yield no path and fall back to defaults without error.
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = [
             std::env::var("XDG_CONFIG_HOME").ok(),
             std::env::var("HOME").ok(),
             std::env::var("APPDATA").ok(),
         ];
         // ENV_MUTEX serializes these Rust 2024 environment mutations.
+        // SAFETY: ENV_MUTEX remains held while this test changes and restores all three values.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
@@ -297,6 +301,8 @@ mod tests {
         }
         let result = load_config(None);
         // ENV_MUTEX serializes this Rust 2024 environment mutation block.
+        // SAFETY: The same guard is still held, and each value is restored from this test's
+        // snapshot.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             for (var, value) in ["XDG_CONFIG_HOME", "HOME", "APPDATA"]

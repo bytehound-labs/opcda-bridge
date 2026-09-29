@@ -470,8 +470,9 @@ pub fn evaluate_compatibility(
                 CompatibilityStatus::Partial
             }
         }
-        Some(FeatureCompatibilityStatus::Incompatible)
-        | Some(FeatureCompatibilityStatus::Unsupported) => CompatibilityStatus::Incompatible,
+        Some(
+            FeatureCompatibilityStatus::Incompatible | FeatureCompatibilityStatus::Unsupported,
+        ) => CompatibilityStatus::Incompatible,
         Some(FeatureCompatibilityStatus::Unknown) | None => CompatibilityStatus::Unknown,
     };
 

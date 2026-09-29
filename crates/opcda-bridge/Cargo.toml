@@ -12,6 +12,9 @@ documentation = "https://docs.rs/opcda-bridge"
 keywords = ["opc", "opc-da", "scada", "industrial", "grpc"]
 categories = ["network-programming", "api-bindings", "hardware-support"]
 
+[lints]
+workspace = true
+
 [dependencies]
 opcda-bridge-proto.workspace = true
 serde.workspace = true

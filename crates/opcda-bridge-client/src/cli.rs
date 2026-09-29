@@ -214,11 +214,11 @@ pub async fn run_command(
         Commands::Compatibility { server, require } => {
             let server = server.or_else(|| config.server.clone());
             let require = require.into_iter().map(Into::into).collect();
-            crate::commands::cmd_compatibility(host, server, require, format).await?
+            crate::commands::cmd_compatibility(host, server, require, format).await?;
         }
         Commands::Capabilities { server } => {
             let server = crate::config::resolve_server(server, config)?;
-            crate::commands::cmd_capabilities(host, server, format).await?
+            crate::commands::cmd_capabilities(host, server, format).await?;
         }
         Commands::Browse {
             server,
@@ -245,10 +245,10 @@ pub async fn run_command(
                 refresh,
                 format,
             )
-            .await?
+            .await?;
         }
         Commands::CloseBrowseSession { session_id } => {
-            crate::commands::cmd_close_browse_session(host, session_id, format).await?
+            crate::commands::cmd_close_browse_session(host, session_id, format).await?;
         }
         Commands::Search {
             query,
@@ -274,11 +274,11 @@ pub async fn run_command(
                 refresh,
                 format,
             )
-            .await?
+            .await?;
         }
         Commands::IndexStatus { server, watch } => {
             let server = crate::config::resolve_server(server, config)?;
-            crate::commands::cmd_index_status(host, server, format, watch).await?
+            crate::commands::cmd_index_status(host, server, format, watch).await?;
         }
         Commands::IndexSearch {
             query,
@@ -296,11 +296,11 @@ pub async fn run_command(
                 max_results,
                 format,
             )
-            .await?
+            .await?;
         }
         Commands::IndexRefresh { server, force } => {
             let server = crate::config::resolve_server(server, config)?;
-            crate::commands::cmd_index_refresh(host, server, force, format).await?
+            crate::commands::cmd_index_refresh(host, server, force, format).await?;
         }
         Commands::IndexPause { server } => {
             let server = crate::config::resolve_server(server, config)?;
@@ -310,7 +310,7 @@ pub async fn run_command(
                 opcda_bridge::SearchIndexControlAction::Pause,
                 format,
             )
-            .await?
+            .await?;
         }
         Commands::IndexResume { server } => {
             let server = crate::config::resolve_server(server, config)?;
@@ -320,7 +320,7 @@ pub async fn run_command(
                 opcda_bridge::SearchIndexControlAction::Resume,
                 format,
             )
-            .await?
+            .await?;
         }
         Commands::IndexCancel { server } => {
             let server = crate::config::resolve_server(server, config)?;
@@ -330,15 +330,15 @@ pub async fn run_command(
                 opcda_bridge::SearchIndexControlAction::Cancel,
                 format,
             )
-            .await?
+            .await?;
         }
         Commands::Read { server, tags } => {
             let server = crate::config::resolve_server(server, config)?;
-            crate::commands::cmd_read(host, server, tags, format).await?
+            crate::commands::cmd_read(host, server, tags, format).await?;
         }
         Commands::Write { server, tag, value } => {
             let server = crate::config::resolve_server(server, config)?;
-            crate::commands::cmd_write(host, server, tag, value, format).await?
+            crate::commands::cmd_write(host, server, tag, value, format).await?;
         }
     }
     Ok(())
@@ -664,8 +664,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn global_flags_and_environment_parse() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: ENV_MUTEX is held across setup, parsing, and cleanup, preventing another
+        // test that uses this lock from interleaving environment mutations.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888");
@@ -675,6 +680,8 @@ mod tests {
         assert_eq!(args.host.as_deref(), Some("envhost:8888"));
         assert_eq!(args.output, Some(OutputFormat::Json));
         assert!(args.json);
+        // SAFETY: The same guard is still held, and cleanup restores the variables modified
+        // during setup.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             std::env::remove_var("OPC_BRIDGE_HOST");
