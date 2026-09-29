@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.10](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.9...opcda-bridge-gateway-v0.5.10) - 2026-09-29
+
+### Other
+
+- *(fuzz)* cover indexed search and records ([#173](https://github.com/bytehound-labs/opcda-bridge/pull/173))
+- restructure repository documentation ([#171](https://github.com/bytehound-labs/opcda-bridge/pull/171))
+
 ## [0.5.9](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.8...opcda-bridge-gateway-v0.5.9) - 2026-09-18
 
 ### Other
