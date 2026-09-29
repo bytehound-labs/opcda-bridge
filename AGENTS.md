@@ -141,6 +141,8 @@ target for early gateway development.
 - Use Rust's `stable` toolchain for local development, validation, coverage, SonarQube, and
   release-plz jobs. The separate MSRV (Minimum Supported Rust Version) check uses Rust 1.88.0.
   Keep the cargo-fuzz smoke workflow on nightly unless stable support is verified independently.
+  The `Semver checks` job pins Rust 1.98.1 together with cargo-semver-checks 0.50.0 because the
+  tool reads the toolchain's rustdoc JSON output; update both pins together.
 - **Build**: `cargo build`
 - **Windows gateway target**: the gateway is intentionally 32-bit x86, even on 64-bit Windows.
   Install `i686-pc-windows-msvc` and pass it explicitly:
@@ -163,6 +165,12 @@ Protobuf checks (lint, formatting, and compatibility), and bounded cargo-fuzz sm
 Tagged binary releases publish SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore
 signatures, and GitHub artifact provenance attestations; `workflow_dispatch` builds package
 artifacts without publishing.
+
+Whenever the compiled Rust validation in `.github/workflows/checks.yml` runs, its `Semver checks`
+job also runs cargo-semver-checks for the published library crates `opcda-bridge`,
+`opcda-bridge-proto`, and `opcda-bridge-client` against each crate's latest crates.io release.
+The job's result is part of the required `check` status; the Windows gateway is a binary and is
+not checked.
 
 SonarQube Cloud analyzes the Rust workspace through `sonar-project.properties` and
 `.github/workflows/sonar.yml`. The configuration keeps crate and compatibility source roots
@@ -387,7 +395,12 @@ page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.sea
   and a crates.io rate limit bounds publishing if another guard regresses. Client/gateway runtime
   compatibility is defined by protocol and capability versions, not equal crate versions.
 - **Pre-1.0 API versioning**: adding fields to a public Rust struct is a source-breaking change
-  for downstream struct literals even when the protobuf wire change is additive. Release such
-  changes on the next minor API line (for example, `0.4.x` to `0.5.0`), not as a patch; leave
-  manifest version bumps to release-plz and use a feature-level conventional commit so its
-  release PR selects the minor increment.
+  for downstream struct literals even when the protobuf wire change is additive. A breaking change
+  to a published library crate (`opcda-bridge`, `opcda-bridge-proto`, or `opcda-bridge-client`)
+  bumps that crate's minor version in the same pull request (for example, `0.5.x` to `0.6.0`) and
+  updates any matching `[workspace.dependencies]` requirement in the root `Cargo.toml`. The
+  `Semver checks` job compares each crate with its latest crates.io release and accepts a breaking
+  change only when the manifest carries such a bump. The compatibility catalog's current release
+  line already spans later `0.x` versions, so a Rust-only API break needs no catalog change;
+  Protobuf wire breaks still follow the `breaking-protobuf` process. Leave non-breaking version
+  bumps to release-plz.

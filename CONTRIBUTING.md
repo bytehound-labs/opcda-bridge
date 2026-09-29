@@ -43,7 +43,8 @@ Example: `feat(gateway): add tag subscription support`.
 - Use Rust's `stable` toolchain for local development to match the regular validation, coverage,
   SonarQube, and release-plz jobs. The MSRV (Minimum Supported Rust Version) job separately checks
   Rust 1.88.0; on rustup-managed hosts, run `rustup update stable` if the selected toolchain is
-  older. The cargo-fuzz smoke tests intentionally use nightly.
+  older. The cargo-fuzz smoke tests intentionally use nightly, and the `Semver checks` job pins
+  Rust 1.98.1 to match its pinned cargo-semver-checks 0.50.0.
 - **Build the Windows gateway for the release target, not the host target.** The gateway is
   intentionally 32-bit x86 (`i686-pc-windows-msvc`) so it can load legacy OPC DA/COM
   installations that use the 32-bit registry view, even when Windows itself is 64-bit:
@@ -95,6 +96,22 @@ documentation changes. The archive job uses `cargo package --workspace --locked 
 because same-version internal dependencies may not be published until the release PR merges; the
 Linux and Windows jobs compile the current workspace sources. Documentation-only changes keep the
 required `check` and `coverage` statuses green without rebuilding the workspace.
+
+Whenever the compiled Rust validation runs, the `Semver checks` job also runs
+[cargo-semver-checks](https://github.com/obi1kenobi/cargo-semver-checks) for the published library
+crates `opcda-bridge`, `opcda-bridge-proto`, and `opcda-bridge-client`, comparing each crate's
+public API with its latest crates.io release. Its result is part of the required `check` status;
+the Windows gateway is a binary and is not checked. Reproduce the job locally with `protoc` on
+`PATH`:
+
+```sh
+cargo install cargo-semver-checks --locked
+cargo semver-checks -p opcda-bridge -p opcda-bridge-proto -p opcda-bridge-client
+```
+
+The job pins both Rust and cargo-semver-checks because the tool reads the toolchain's rustdoc JSON
+output; update the two pins together. An intentional breaking change passes only when the same
+pull request bumps the affected crate's minor version, as described under [Releases](#releases).
 
 Security workflows use immutable action pins and bounded aggregate statuses. They run CodeQL,
 Semgrep, full-history Gitleaks, actionlint, zizmor, Buf Protobuf checks (lint, formatting, and
@@ -160,6 +177,17 @@ release commit filter and crates.io rate limit provide additional safeguards.
 The release workflow proposes a separate `release-plz-*` pull request for any generated
 compatibility-test lockfile update; that change follows the normal checks and auto-merge path
 instead of being pushed directly to `main`.
+
+Versioning follows Cargo's rules for `0.x` crates, where a minor version bump marks a breaking
+release. A pull request that breaks the public API of `opcda-bridge`, `opcda-bridge-proto`, or
+`opcda-bridge-client`, including adding a field to a public struct that callers can construct with
+a struct literal, bumps that crate's minor version in the same pull request (for example, `0.5.x`
+to `0.6.0`). A bump of `opcda-bridge` or `opcda-bridge-proto` also updates its `version`
+requirement under `[workspace.dependencies]` in the root `Cargo.toml`. The `Semver checks` job
+enforces this against the latest crates.io releases. Non-breaking changes leave version bumps to
+release-plz. The catalog's current release line already spans later `0.x` versions, so a Rust-only
+API break needs no catalog change; Protobuf wire breaks still follow the `breaking-protobuf`
+process described under [CI](#ci).
 
 Every publishable package version must fall within exactly one catalog release line. Client and
 gateway binary Releases include `COMPATIBILITY.md` and `compatibility.json` so operators can inspect

@@ -183,9 +183,33 @@ jobs:
       - name: Check the declared MSRV
         run: cargo check --workspace --all-targets --locked
 
+  semver:
+    name: Semver checks
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      # cargo-semver-checks reads rustdoc JSON, whose format changes between Rust releases.
+      # Keep this toolchain pinned to a release supported by the pinned tool; update both together.
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        with:
+          tool: cargo-semver-checks@0.50.0,protoc
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Check library semver compatibility
+        run: cargo semver-checks -p opcda-bridge -p opcda-bridge-proto -p opcda-bridge-client
+
   check:
     if: always()
-    needs: [changes, windows, linux, package, msrv]
+    needs: [changes, windows, linux, package, msrv, semver]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -208,11 +232,12 @@ jobs:
           LINUX_RESULT: ${{ needs.linux.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
+          SEMVER_RESULT: ${{ needs.semver.result }}
         run: |
           failed=0
 
           if [[ "$RUST_CHANGED" == "true" ]]; then
-            for result in "$WINDOWS_RESULT" "$LINUX_RESULT" "$MSRV_RESULT"; do
+            for result in "$WINDOWS_RESULT" "$LINUX_RESULT" "$MSRV_RESULT" "$SEMVER_RESULT"; do
               if [[ "$result" != "success" ]]; then
                 echo "A required Rust validation job ended with: $result"
                 failed=1
