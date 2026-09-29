@@ -152,6 +152,8 @@ pub async fn cmd_browse(
         );
     }
 
+    // Stdout is the command result required to continue or close the session.
+    // codeql[rust/cleartext-logging]: browse session id is the operator continuation handle, not a secret
     println!("{}", render_browse(combined, pages, format)?);
     Ok(())
 }
