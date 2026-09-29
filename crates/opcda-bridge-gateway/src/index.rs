@@ -9527,6 +9527,7 @@ mod tests {
             } else {
                 item_id
             };
+            let display_name = format!("fuzz{display_name}");
             let kind = if branch_and_item {
                 InventoryNodeKind::BranchAndItem
             } else {
@@ -9545,7 +9546,9 @@ mod tests {
                 breadcrumbs,
             };
             let (database, generation) = in_memory_index_with(std::slice::from_ref(&entry));
-            let matches = database.search("S", generation, &entry.item_id, 1, 10).unwrap();
+            let matches = database
+                .search("S", generation, &entry.display_name, 1, 10)
+                .unwrap();
 
             prop_assert_eq!(matches, vec![expected]);
         }

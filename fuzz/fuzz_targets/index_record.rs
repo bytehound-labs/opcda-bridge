@@ -22,7 +22,7 @@ fuzz_target!(|data: &[u8]| {
     if item_id.is_empty() {
         item_id = "fuzz-item".into();
     }
-    let display_name = field(data, 1);
+    let display_name = format!("fuzz{}", field(data, 1));
     let kind = if data.first().is_some_and(|byte| *byte & 1 == 1) {
         InventoryNodeKind::BranchAndItem
     } else {
@@ -46,6 +46,6 @@ fuzz_target!(|data: &[u8]| {
         breadcrumbs: entry.breadcrumbs.clone(),
     };
 
-    let results = search_all_modes(&entry.item_id, std::slice::from_ref(&entry), 10).unwrap();
+    let results = search_all_modes(&entry.display_name, std::slice::from_ref(&entry), 10).unwrap();
     assert_eq!(results[1].as_slice(), std::slice::from_ref(&expected));
 });
