@@ -8,686 +8,77 @@
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A lightweight Rust gateway bridging classic OPC DA (Windows/COM) servers to remote Linux/macOS/Windows clients.
+A lightweight Rust gateway that connects classic Windows OPC DA servers to cross-platform
+clients. The Windows gateway uses COM/DCOM locally and exposes a gRPC service; the reusable Rust
+client and command-line client run on Windows, Linux, and macOS.
 
-## Status
+## Network safety
 
-Active development. Gateway and client are functional end-to-end — OPC DA read/write/browse passing
-against a live Kepware server. The workspace publishes the reusable client library, protocol
-definitions, cross-platform CLI, and Windows gateway as separate crates. Each crate is versioned
-independently, and release-plz publishes only packages with releasable changes after the generated
-metadata passes the required release integrity check.
+The gateway is unauthenticated, unencrypted, and listens on `0.0.0.0:7600`. When installed as a
+Windows service it runs as `LocalSystem`. Any client that can reach it can read and write tags
+allowed by the OPC DA server account and control index operations. Deploy it only on a trusted,
+segmented network and restrict the Windows Firewall rule to approved client addresses. The
+gateway archive and service registration do not create firewall rules.
 
-The indexed API line introduces indexed namespace search and extends the gRPC capabilities contract.
-The protobuf additions are wire-compatible with older gateways and clients, while the 0.5
-indexed-on-demand lifecycle is advertised as a new negotiated feature boundary. Older pairs can
-continue to use overlapping core and namespace operations, but they must not assume that the
-indexed-search lifecycle or its enrollment semantics are available. Indexed-search availability
-is determined by the advertised protocol and capability versions, not by matching crate or binary
-version numbers.
-Public Rust struct additions in the pre-1.0 API are source-breaking for downstream struct
-literals, so releases containing those additions use the next minor API version rather than a
-patch version. The protobuf wire additions remain backward-compatible.
-
-### Versions and compatibility
-
-The published packages have independent SemVer versions and package-specific tags:
-
-- `opcda-bridge-proto` — generated protocol types.
-- `opcda-bridge` — reusable Rust client library.
-- `opcda-bridge-client` — cross-platform CLI.
-- `opcda-bridge-gateway` — Windows OPC DA gateway.
-
-All four packages publish to crates.io. GitHub Releases and prebuilt archives are created only for
-the client and gateway tags. A client release and a gateway release therefore do not need to carry
-the same version number; choose and pin each binary independently. Client/gateway interoperability
-is defined by the wire protocol, `protocol_version`, indexed-search protocol and capability flags,
-and the compatibility checks in CI. Changes to a reusable dependency can also produce a dependent
-package release when the dependent binary or API needs to be rebuilt.
-
-The cross-version compatibility workspace pins each historical client to its original protocol
-crate version. This keeps older Rust clients compiling against the schema they were released
-with while the tests exercise their wire compatibility with current gateways.
-
-## Why
-
-OPC DA (OLE for Process Control, Data Access) is a Windows-only, COM/DCOM-based industrial protocol still running on countless PLCs, DCSs, and SCADA systems that predate its successor, OPC UA.
-
-`opcda-bridge` aims to be the same idea distilled to a single static Rust binary per side:
-
-- **Gateway** — runs on the Windows host alongside the OPC DA server, speaks native COM.
-- **Client** — runs anywhere (Linux, macOS, Windows), talks to the gateway over the network.
-
-### Lightning-fast indexed tag search
-
-Large OPC DA namespaces can make live browse-tree searches slow because every query has to
-traverse the server. `opcda-bridge` can build a durable, gateway-owned SQLite/FTS index of a
-server's namespace; after the first build, repeated `index-search` queries run against that local
-snapshot and return the server's exact ItemIDs without walking the live namespace again. This makes
-interactive tag discovery lightning-fast compared with live traversal, while ordinary browse,
-read, and write operations remain available independently.
-
-Indexing is opt-in per server rather than controlled by a TOML allow-list. A fresh gateway has no
-enrolled servers; the first `index-refresh` validates the exact ProgID returned by server discovery,
-enrolls it, and starts the build. Successful generations are refreshed weekly by default, with the
-interval and gateway-wide safety limits configurable in TOML. The index is also exposed through the
-client CLI, reusable Rust library, gRPC protocol, and HTTP integrations.
-
-Among open-source OPC DA gateways reviewed for this feature, we have not found another project
-that combines gateway access with a durable on-disk namespace index and built-in indexed tag
-search. That makes `opcda-bridge`, to our knowledge, the only open-source OPC DA gateway with
-this capability; the distinction is intentionally qualified because no catalog of every private or
-unmaintained gateway can be exhaustive.
-
-## Client/gateway compatibility
-
-Check a deployed pair before using optional protocol features:
-
-```sh
-opcda-bridge-client --host 192.168.1.50:7600 compatibility
-opcda-bridge-client --host 192.168.1.50:7600 compatibility \
-  --require namespace --require indexed-search
-```
-
-The check uses the gateway-wide protocol handshake and does not contact an OPC DA server. For an
-older gateway that predates that handshake, provide `--server` (or configure a default server) to
-infer compatibility from its legacy capabilities response. A `full` result means all advertised
-features overlap; `partial` means core read/write operations overlap while an optional feature does
-not; `incompatible` means core or a required feature cannot be negotiated; and `unknown` means the
-gateway cannot describe itself. Overlapping but untested package pairs are reported as
-`unverified` and remain usable. The report includes both the client binary version and the reusable
-library version implementing its protocol contract.
-
-The [compatibility catalog](COMPATIBILITY.md) documents protocol release lines and boundary-test
-evidence. The machine-readable [`compatibility.json`](compatibility.json) file is suitable for
-deployment tooling. Client and gateway package versions are independent and do not need to match.
-
-## Installation
-
-Prebuilt client and gateway binaries are attached to their package-specific tags on the
-[Releases](https://github.com/bytehound-labs/opcda-bridge/releases) page.
-
-Source builds use Rust's `stable` toolchain to match the regular validation, coverage,
-SonarQube, and release-plz jobs. CI separately checks the MSRV (Minimum Supported Rust Version),
-which is Rust 1.88.0; on rustup-managed hosts, `rustup update stable` refreshes an older selected
-toolchain. The cargo-fuzz smoke tests intentionally use nightly.
-
-### Gateway (Windows)
-
-The gateway runs on the Windows host alongside the OPC DA server(s) you want to expose.
-
-- **Supported architecture** — the gateway is intentionally built and distributed as
-  32-bit x86 (`i686-pc-windows-msvc`), including when it runs on 64-bit Windows. The gateway
-  loads the native OPC DA/COM stack on the server host, and legacy installations may expose
-  their OPC components only through the 32-bit COM and registry view. Windows runs the x86
-  gateway on a 64-bit host through WOW64. The x86 gateway is the supported Windows gateway;
-  a host-default x64 build is not a substitute.
-- **Prebuilt binary** — download `opcda-bridge-gateway-windows-x86.zip` from the latest
-  `opcda-bridge-gateway-v*` release, extract it, and run `opcda-bridge-gateway.exe`. No installer
-  needed. The archive is the 32-bit `i686` gateway described above.
-- **From source** (requires Rust 1.88+ and the
-  Protocol Buffers compiler `protoc` on `PATH`):
-  ```powershell
-  git clone https://github.com/bytehound-labs/opcda-bridge.git
-  cd opcda-bridge
-  rustup target add i686-pc-windows-msvc
-  cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-msvc
-  .\target\i686-pc-windows-msvc\release\opcda-bridge-gateway.exe
-  ```
-  The explicit target is required: a plain `cargo build --release` on a 64-bit Windows
-  development machine produces a host-target x64 binary instead of the supported gateway
-  build.
-- **Install from crates.io** (requires Rust 1.88+ and `protoc`):
-  ```powershell
-  rustup target add i686-pc-windows-msvc
-  cargo install --locked --target i686-pc-windows-msvc opcda-bridge-gateway
-  ```
-
-### Client (Linux, macOS, Windows)
-
-The client is a separate network process, so its architecture does not need to match the
-gateway. A 64-bit Windows client can connect to the supported 32-bit gateway over the network.
-
-- **Prebuilt binary** — download the archive for your OS from the latest `opcda-bridge-client-v*`
-  release, extract it, and run `opcda-bridge-client`:
-  - Linux (x86_64): `opcda-bridge-client-linux-x86_64.tar.gz`
-  - macOS (arm64): `opcda-bridge-client-macos-arm64.tar.gz`
-  - Windows (x86_64): `opcda-bridge-client-windows-x86_64.zip`
-- **Arch Linux (AUR)**:
-  ```sh
-  yay -S opcda-bridge-client-bin
-  ```
-  The package uses standard Arch `pkgver-pkgrel` versioning and versioned source filenames to
-  avoid reusing stale local `makepkg` or `yay` cache files between releases.
-- **From source** (same prerequisites as the gateway):
-  ```sh
-  git clone https://github.com/bytehound-labs/opcda-bridge.git
-  cd opcda-bridge
-  cargo build --release -p opcda-bridge-client
-  ./target/release/opcda-bridge-client --help
-  ```
-- **Install from crates.io** (same prerequisites as the gateway):
-  ```sh
-  cargo install opcda-bridge-client
-  ```
-  This places `opcda-bridge-client` on `PATH` at `~/.cargo/bin/opcda-bridge-client`; re-run the same
-  command (add `--force` to overwrite an existing install) to upgrade. Use
-  `cargo install opcda-bridge-client --version 0.4.3` to pin a specific published version. The
-  client and gateway versions are independent, so pinning one does not select the other.
-
-## Usage
-
-### 1. Start the gateway
-
-On the Windows machine running the OPC DA server:
-
-```sh
-opcda-bridge-gateway.exe
-```
-
-It listens on all interfaces on port `7600` by default — override with `--port`, the
-`OPC_BRIDGE_PORT` environment variable, or a config file (see [Configuration](#configuration)
-below). If the client will connect from another machine, open that port in the Windows Firewall.
-
-Press `Ctrl+C` (or close the console window) to stop it — the gateway finishes any in-flight
-requests before exiting rather than dropping them mid-response.
-
-### 2. Run client commands
-
-Point the client at the gateway with `--host <address:port>` (or set `OPC_BRIDGE_HOST`; both
-default to `localhost:7600`). A default OPC DA server and other settings can also come from a
-config file — see [Configuration](#configuration) below.
-
-- List the OPC DA servers registered on the gateway's host:
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 servers
-  ```
-- Inspect the gateway's browse/search capabilities for a server:
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 capabilities --server Kepware.KepServerEX.V5
-  ```
-- Check client/gateway protocol compatibility without opening an OPC DA server:
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 compatibility
-  ```
-  Add `--require namespace` or `--require indexed-search` when deployment requires those optional
-  features. Older gateways can be checked with `--server Kepware.KepServerEX.V5`, which enables
-  legacy capability inference.
-- Browse one bounded page of immediate children. The root request opens a session; use the returned
-  opaque session, node, and continuation values unchanged to expand a branch or load another page:
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 --page-size 200
-  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 \
-    --session-id SESSION --parent-node-key NODE_KEY
-  opcda-bridge-client --host 192.168.1.50:7600 browse --server Kepware.KepServerEX.V5 \
-    --session-id SESSION --page-token PAGE_TOKEN
-  ```
-  `--all` follows continuation tokens explicitly and stops at the `--max-results` safety cap
-  (10,000 by default). It can be expensive and is not used for normal tree navigation.
-- Search the live namespace independently of tree browsing. This compatibility/diagnostic path
-  traverses the OPC server; results arrive progressively, progress is written to stderr, and
-  Ctrl+C drops the active stream. Exact ItemIDs in results remain the identities used for
-  read/write:
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 search Device1 \
-    --server Kepware.KepServerEX.V5 --match-mode contains
-  ```
-  A normal search stream starts with an initial progress event, emits matches in browse order
-  with progress updates after each page, and ends with a completion event. Result or visit caps
-  can terminate the stream early with a truncation warning.
-- Use the persistent gateway-owned index for fast interactive discovery. A fresh gateway has no
-  enrolled servers. The first manual refresh validates the exact ProgID against server discovery,
-  persists enrollment, and starts the build. Indexed search never falls back to live traversal:
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 index-status \
-    --server Kepware.KepServerEX.V5
-  opcda-bridge-client --host 192.168.1.50:7600 index-search Device1 \
-    --server Kepware.KepServerEX.V5 --match-mode contains
-  opcda-bridge-client --host 192.168.1.50:7600 index-refresh \
-    --server Kepware.KepServerEX.V5
-  ```
-  Operators can use `index-pause`, `index-resume`, and `index-cancel` for an active build.
-  Refreshes run asynchronously, and responses distinguish `not-indexed`, `partial`, `ready`,
-  `stale`, `refreshing`, and `failed` states. A completed inventory may also carry a non-fatal
-  warning while remaining `ready`; clients display that diagnostic as a warning rather than
-  treating the active generation as failed. A no-match response is authoritative only for a
-  complete index.
-  Active generations remain durable across restarts. Activation is an atomic metadata transition;
-  promotion status uses a read-only SQLite connection and filesystem diagnostics, so status remains
-  responsive even while the writer is in the promotion critical section. Superseded and abandoned
-  data is reclaimed in bounded background batches through a database-wide writer gate shared with
-  every build mutation, including builds for other servers using the same database file. Cleanup
-  defers while a build is active, yields between batches so a build can proceed, and resumes pending
-  requests after the last active build finishes, even when the cleanup request was scheduled by a
-  different manager instance sharing the same database file, so indexing maintenance does not
-  interrupt indexed search requests or compete with progress/failure writes. Deferred cleanup also
-  exits cleanly if gateway shutdown begins before it starts waiting for build completion. Transient
-  cleanup stops before starting another write batch once shutdown is requested, and a batch that
-  finds no remaining obsolete rows makes no write. Transient cleanup failures are retried with
-  bounded backoff, and pending cleanup requests remain tracked until a completed pass confirms
-  that no rerun is needed. Persisted retry deadlines take precedence
-  after a restart, so a failed server is not retried immediately just because the gateway was
-  restarted. A refresh interrupted by restart is superseded when a complete
-  active generation remains available, so the durable snapshot stays ready while cleanup runs;
-  foreground operations are reference-counted per server; indexing stays paused while any
-  foreground user is active and remains paused through the configured quiet period after the last
-  foreground operation ends.
-  interrupted initial builds and genuine refresh failures remain visible as failed. Older failed
-  generations do not make a newer active generation appear failed. If relational index rows and
-  the full-text index disagree after an interrupted legacy startup repair, the rebuildable cache
-  is quarantined rather than serving silently incomplete substring results. SQLite recovery
-  quarantines the database together with its `-wal` and `-shm` sidecars so committed index data
-  remains available for diagnosis.
-  Status combines the persisted generation snapshot with runtime build, health, storage,
-  foreground, and scheduler diagnostics. During promotion, persisted status is read through a
-  read-only connection; a runtime error overrides the reported state only when no build is active.
-  Database coordination and persistent build-lock paths use the canonical identity of the database
-  file, so existing-file aliases such as relative paths and symlinks cannot bypass coordination.
-  If the file and its parent cannot be canonicalized, the original path spelling is retained.
-  Independent in-memory databases are not shared through the registry and do not create filesystem
-  build-lock sidecars.
-  Indexed queries use a dedicated read-only SQLite connection and bounded candidate sets, keeping
-  broad searches out of the foreground database mutex. Exact searches use separate equality
-  lookups on covering normalized display-name and ItemID indexes, each bounded to `limit + 1`
-  rows, exclude lower-priority ItemID duplicates already found by the display-name probe, and then
-  merge and deduplicate those candidates before ranking. Prefix searches use indexed
-  lexicographic ranges rather than generation-wide `LIKE` scans; contains searches retain their FTS
-  path.
-  During promotion, searches reuse the active generation reported by promotion-safe status rather
-  than reacquiring the writable database mutex. Cancellation requests received while inventory
-  startup is still acquiring its control handle are retained and applied as soon as that handle
-  becomes available.
-  If refresh setup fails or shutdown wins before the background build task starts, the provisional
-  generation is abandoned and the build reservation is released without disturbing the last
-  complete active generation.
-  Before each inventory event, a build passes its maintenance-window, health, and adaptive
-  recovery gates. Health probes check server capabilities, latency, and the optional sentinel
-  tag; an unhealthy server pauses the build with bounded exponential backoff, while a healthy
-  recovery resumes it with the configured pacing. Without a sentinel tag, the health status is
-  reported as `Unavailable` while capability and latency checks can still permit the build.
-  Cancellation, probe failure, or a rejected pacing update stops the build and preserves the last
-  complete generation. Pending entries are
-  flushed before terminal state is recorded, and successful completion or a non-fatal inventory
-  warning remains distinct from a failed or cancelled build.
-  Matching is case-insensitive with exact/prefix/contains ranking, and responses report
-  `has_more` when the requested result window is exceeded. This preserves status, discovery,
-  reads, writes, and lazy browse responsiveness during search.
-  If the native client rejects an initial or adaptive pacing update, the active build fails
-  visibly and the prior complete generation is preserved; pacing errors are not ignored.
-  DA3 root ItemIDs and unused filters are marshalled as required non-null empty strings. If the
-  first DA3 root browse still returns `RPC_X_NULL_REF_POINTER` or `E_NOTIMPL`, a server that also
-  supports DA2 continues through DA2 with an explicit compatibility warning. The persisted
-  generation records that negotiated fallback explicitly, so a genuine DA2-only server that later
-  gains DA3 support still triggers normal profile-change invalidation.
-  DA2 hierarchical inventory validates every server-reported branch before queueing it.
-  Branch-only names rejected by native navigation with `E_INVALIDARG` are skipped and included in
-  the completion warning, while names that resolve to exact items remain selectable.
-- Release a browse session before its gateway-side expiry:
-
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 close-browse-session SESSION
-  ```
-
-- Read one or more tag values:
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 read --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D
-  ```
-- Write a value to a tag (parsed automatically as bool, int, float, or string):
-  ```sh
-  opcda-bridge-client --host 192.168.1.50:7600 write --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D 42
-  ```
-
-Every command prints human-readable output by default. Browse output includes the session ID,
-namespace organization/source, completeness, warning, and next-page token so partial results are
-never presented as complete. Pass `--output json` (or its shorthand, `--json`) for machine-readable
-output instead — see
-[JSON output](#json-output) below. `--host`, `--config`, `--output`, and `--json` may be placed
-either before or after the subcommand (e.g. both `--json read ...` and `read ... --json` work).
-Run `opcda-bridge-client --help` or `opcda-bridge-client <command> --help` for the full flag
-reference.
-
-### JSON output
-
-Every command accepts `--output json` (or the shorthand `--json`) for scripting, CI, or piping
-into `jq`. Most commands print a pretty-printed JSON array:
-
-```sh
-opcda-bridge-client --host 192.168.1.50:7600 --json read --server Kepware.KepServerEX.V5 Simulink.Device1.Python.D
-```
-
-```json
-[
-  {
-    "tag_id": "Simulink.Device1.Python.D",
-    "value": "42",
-    "quality": "Good",
-    "timestamp": "2024-01-01T00:00:00Z"
-  }
-]
-```
-
-Read values are semantic strings. For an OPC DA `VT_BSTR`, the `value` field contains the exact
-BSTR contents: `AUT` is returned as `AUT`, an empty BSTR is empty, and quote characters are
-preserved only when they are part of the BSTR itself.
-
-`browse` emits a metadata object containing `session_id`, `nodes`, `next_page_token`, `complete`,
-`organization`, `source`, `warning`, and `pages`. Each node keeps its opaque `node_key`, local
-`display_name`, typed `kind`, and optional exact `item_id` separate. Only selectable `item` and
-`branch_and_item` nodes expose an ItemID; branch-only nodes use their opaque key for navigation
-without presenting private DA3 navigation identifiers as selectable tags. `search` emits
-newline-delimited JSON events so matches and progress remain streaming rather than waiting for the
-full search.
-`index-search` emits one object containing ranked `matches`, `has_more`, and full index `status`;
-its matches contain exact ItemIDs and breadcrumb labels but no session-bound node keys.
-Commands that fail print a structured `{"error": "..."}` object to stderr instead of the usual
-`Error: ...` text, and the process still exits non-zero.
-
-`--output`/`--json` follow the same `CLI flag > environment variable > config file > default`
-precedence as every other setting (env var `OPC_BRIDGE_OUTPUT`, config key `output`), so a script
-can set the environment variable once instead of passing `--json` on every invocation.
-
-### Using the client from other languages
-
-The lightest-weight integration path for calling the client from a script (Python, shell, etc.)
-is shelling out to the binary with `--json` and parsing stdout, as shown above. For heavier
-integration — a long-running .NET or Python service that talks to the gateway directly — it's
-usually better to generate native gRPC stubs straight from
-[`opcda-bridge-proto/proto/bridge.proto`](crates/opcda-bridge-proto/proto/bridge.proto) (e.g. `grpcio-tools` for
-Python, `Grpc.Tools` for .NET) and skip the client binary entirely; it's the same wire protocol
-the CLI itself speaks. One caveat: the gateway serves plaintext HTTP/2 (no TLS), so a .NET
-client needs to opt in explicitly with
-`AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true)` before
-connecting.
-
-For a Rust program, skip both of the above and depend on
-[`opcda-bridge`](https://crates.io/crates/opcda-bridge) directly instead. It exposes typed
-capabilities, one-page browse requests/responses, explicit session close, cancellable live-search
-streams, persistent indexed-search status/refresh/control/query methods, and read/write operations
-without `clap`, `tabled`, `serde_json`, or `toml` pulled in transitively — just
-`opcda-bridge-proto`, `tonic`, `tonic-prost`, `uuid`, and `thiserror`. Add it to a project with:
-
-```sh
-cargo add opcda-bridge
-```
-
-See the crate's [API documentation](https://docs.rs/opcda-bridge) for a usage example.
-
-## Configuration
-
-Both binaries accept a `--config <path>` flag pointing at a TOML file. Every setting resolves
-with the same precedence, highest first:
-
-**CLI flag > environment variable > config file > built-in default**
-
-A config file (or an individual key within it) is entirely optional — anything not set falls
-back through the rest of the chain. If `--config` is omitted, each binary looks for a config
-file in a default location; a missing file there is not an error, since it may simply not have
-been created yet. A file that _does_ exist but fails to parse as TOML is always a hard error,
-pointing at the file and the parse problem.
+## Quick start
 
 ### Gateway
 
-Looks for `opcda-bridge-gateway.toml` next to the executable unless `--config` gives another
-path. See
-[`crates/opcda-bridge-gateway/opcda-bridge-gateway.example.toml`](crates/opcda-bridge-gateway/opcda-bridge-gateway.example.toml)
-for every available key.
+On the Windows host with the OPC DA server, download the official
+[`opcda-bridge-gateway-windows-x86.zip`](https://github.com/bytehound-labs/opcda-bridge/releases)
+archive, verify its checksum and provenance, and run `opcda-bridge-gateway.exe`. The supported
+gateway artifact is 32-bit x86 (`i686-pc-windows-msvc`), including on 64-bit Windows.
 
-| Setting     | CLI flag | Env var           | Config key | Default |
-| ----------- | -------- | ----------------- | ---------- | ------- |
-| Listen port | `--port` | `OPC_BRIDGE_PORT` | `port`     | `7600`  |
-
-Logging settings (`log.*`) are also read from this file — see [Logging](#logging) below.
-
-The persistent namespace index is opt-in by manual enrollment. Its first `index-refresh` validates
-the exact ProgID returned by server discovery, persists the server in SQLite, and starts work
-immediately. Unknown ProgIDs leave no enrollment behind. A valid complete generation remains
-available while a refresh runs, and failed or cancelled refreshes never replace it. The gateway
-schedules only enrolled servers with a successful active generation and
-`auto_refresh_enabled = true`; a failed first build remains visible until manually retried.
-
-| Index setting                      | Config key                                  | Default                        |
-| ---------------------------------- | ------------------------------------------- | ------------------------------ |
-| Database path                      | `index.database_path`                       | Platform data directory        |
-| Automatic indexing                 | `index.enabled`                             | `true`                         |
-| Refresh interval                   | `index.refresh_interval_seconds`            | `604800` (7 days)              |
-| Startup grace period               | `index.startup_grace_period_seconds`        | `30` seconds                   |
-| Schedule jitter                    | `index.schedule_jitter_seconds`             | `21600` seconds                |
-| Inventory slice batch              | `index.inventory_batch_size`                | `256` entries (max `1000`)     |
-| Inventory root                     | `index.inventory_root`                      | None (full namespace)          |
-| Namespace workers                  | `index.worker_count`                        | `1` (maximum `4`)              |
-| SQLite commit batch                | `index.commit_batch_size`                   | `1024` entries                 |
-| SQLite commit interval             | `index.commit_interval_ms`                  | `1000` ms                      |
-| Legacy batch size fallback         | `index.batch_size`                          | `256` (max `1000`)             |
-| Average item rate                  | `index.item_rate_limit`                     | `0` (unlimited)                |
-| Burst allowance                    | `index.burst_size`                          | `100` items                    |
-| Active duty cycle                  | `index.duty_cycle_percent`                  | `100`%                         |
-| Adaptive pacing                    | `index.adaptive`                            | `false` (opt-in)               |
-| Adaptive canary profile            | `index.canary_*`                            | `50` items/s, batch `25`, `5`% |
-| Adaptive floor profile             | `index.minimum_*`                           | `10` items/s, batch `1`, `1`%  |
-| Foreground quiet period            | `index.quiet_period_seconds`                | `2` seconds                    |
-| Health probe interval              | `index.health_probe_interval_seconds`       | `30` seconds                   |
-| Health latency threshold           | `index.health_latency_threshold_ms`         | `500` ms                       |
-| Adaptive foreground soft threshold | `index.adaptive_foreground_soft_latency_ms` | `2 × health threshold`         |
-| Adaptive foreground hard threshold | `index.adaptive_foreground_hard_latency_ms` | `4 × health threshold`         |
-| Adaptive recovery window           | `index.adaptive_recovery_delay_seconds`     | `30` seconds                   |
-| OPC operation timeout              | `index.operation_timeout_seconds`           | `30` seconds                   |
-| Sentinel health tag                | `index.sentinel_tag`                        | Unavailable when omitted       |
-| Minimum free space                 | `index.minimum_free_space_bytes`            | `100 MiB`                      |
-| Storage headroom                   | `index.storage_headroom_bytes`              | `10 MiB`                       |
-| Maintenance windows                | `index.maintenance_windows`                 | Empty                          |
-| Concurrent builds                  | `index.concurrency`                         | `1`                            |
-| Query-cache capacity               | `index.query_cache_capacity`                | `256` entries                  |
-| Start paused                       | `index.paused`                              | `false`                        |
-| Maximum indexed results            | `index.max_results`                         | `50`                           |
-
-The default index profile is throughput-oriented: 256-entry inventory slices, 1,024-entry
-SQLite commits, no item-rate pacing, and a 100% duty cycle. The item-rate limit and native
-minimum operation interval are independent controls. The
-`index.item_rate_limit` setting is forwarded to the native item-rate limiter and charges each
-inventory operation by its item cost; it does not derive a native sleep from
-`batch_size / item_rate_limit`. The gateway leaves the native minimum interval at zero and
-applies the native batch size independently. A value of `0` disables item-rate pacing.
-`index.duty_cycle_percent = 100` removes intentional duty-cycle pauses. Adaptive pacing is
-opt-in; when enabled, the canary and floor settings below control its starting and minimum
-profiles.
-
-When `index.inventory_root` is set, indexing starts at that exact canonical OPC ItemID
-instead of the server root. This is useful for building an index for one controller or
-subtree without traversing the rest of a large namespace. The configured root takes
-precedence over automatic root partitioning.
-
-When `index.worker_count` is greater than one, a hierarchical server is partitioned into
-independent root-scoped workers only when the gateway can obtain a complete, single-page
-root browse through a supported browse session and finds at least two expandable roots.
-Root-level items are emitted directly, and duplicate ItemIDs are suppressed across workers.
-If those conditions are not met, the gateway falls back to one full-root inventory. Workers
-share pause, resume, pacing, and cancellation controls, and all worker streams are joined
-before the build releases its ownership.
-
-`index.enabled` is an emergency switch for startup and scheduled work only. Manual status,
-browse, search, refresh, and read operations remain available when it is false. Per-server
-scheduled refresh can be disabled without deleting its searchable data through the indexed-search
-control API. Deleting an index cancels and coordinates any active build, then removes enrollment,
-generations, entries, and retry metadata asynchronously. The delete request returns a temporary
-`deleting` status while cleanup runs; its final status is `not-indexed`.
-
-The default database locations are `$XDG_DATA_HOME/opcda-bridge/index.sqlite3` (falling back to
-`$HOME/.local/share/opcda-bridge/index.sqlite3`) on Linux/macOS and
-`%PROGRAMDATA%\\opcda-bridge\\index.sqlite3` on Windows. Maintenance-window entries are local
-24-hour ranges such as `22:00-06:00`; when configured, indexing is deferred outside those ranges.
-Foreground operations still coordinate with and pause inventory, and adaptive indexing, when
-enabled, uses recent foreground OPC errors and bad-quality reads as health signals in addition
-to latency and host/storage guardrails. These safety and lifecycle protections remain active
-with the throughput-oriented defaults.
-Foreground latency has separate soft and hard adaptive thresholds. Reaching the soft threshold
-throttles inventory pacing; reaching the hard threshold pauses inventory. When omitted, the
-thresholds default to twice and four times `health_latency_threshold_ms`, respectively, and the
-hard threshold is normalized upward if it is configured below the soft threshold. Commit latency
-is used as an adaptive database-pressure signal only during the recovery window after a commit;
-stale commit latency remains available in status diagnostics but no longer keeps a later build
-throttled indefinitely.
-The status reports whether a sentinel tag is configured separately from whether its latest probe
-is healthy or unavailable.
-
-When upgrading from the previous indexed-search schema, the gateway migrates the existing
-generations and full-text data in place through the schema 2 -> 3 -> 4 chain. Servers with a
-usable active generation are enrolled for weekly automatic refresh; servers with only failed or
-incomplete history remain visible but require an explicit manual retry before automatic refresh is
-enabled. Each migration step is transactional, so a failed upgrade is reported without leaving a
-partially upgraded index database.
-
-Run only one gateway process with a given index database path. A gateway automatically loads
-`opcda-bridge-gateway.toml` next to its executable, so launching a second copy from the same
-directory can otherwise start a second inventory against the same SQLite file. When multiple
-gateway instances are intentional, give each instance an explicit, different
-`index.database_path` and configure indexing on only the instance that should build that
-server's index. Each server's build uses a persistent sibling `.build.lock` file. On Windows,
-`.build.owner` carries the same owner metadata because the locked file may be unreadable; it is
-removed on a clean lock release and may remain after forced termination until the next acquisition
-overwrites it. The operating-system advisory lock, not either file's existence, determines whether
-a build is active. Do not delete either path while a gateway may still be running.
+See [Gateway deployment, service, and firewall](docs/gateway-deployment.md) before exposing the
+listener or installing the Windows service.
 
 ### Client
 
-Looks for a config file in a platform-specific location unless `--config` gives another path:
-
-- Linux/macOS: `$XDG_CONFIG_HOME/opcda-bridge/client.toml`, falling back to
-  `$HOME/.config/opcda-bridge/client.toml`.
-- Windows: `%APPDATA%\opcda-bridge\client.toml`.
-
-See
-[`crates/opcda-bridge-client/client.example.toml`](crates/opcda-bridge-client/client.example.toml)
-for every available key.
-
-| Setting               | CLI flag                     | Env var             | Config key                 | Default                               |
-| --------------------- | ---------------------------- | ------------------- | -------------------------- | ------------------------------------- |
-| Gateway address       | `--host`                     | `OPC_BRIDGE_HOST`   | `host`                     | `localhost:7600`                      |
-| Default OPC DA server | `--server`                   | —                   | `server`                   | none — must be set one way or another |
-| Browse page size      | `browse --page-size`         | —                   | `page_size`                | `200`                                 |
-| Browse `--all` cap    | `browse --all --max-results` | —                   | `browse_all_limit`         | `10000`                               |
-| Search result cap     | `search --max-results`       | —                   | `search_max_results`       | `200`                                 |
-| Index search cap      | `index-search --max-results` | —                   | `index_search_max_results` | `50`                                  |
-| Output format         | `--output` / `--json`        | `OPC_BRIDGE_OUTPUT` | `output`                   | `table`                               |
-
-`server` has no built-in default: if it is left unset by every source,
-`capabilities`/`browse`/`search`/`read`/`write` fail rather than guessing a server.
-
-## Logging
-
-The gateway writes structured logs to a rolling file next to its executable — by default
-`logs/opcda-bridge-gateway.<date>.log` — through a non-blocking writer, so logging never adds
-latency to request handling. Daily rotation uses `YYYY-MM-DD`, hourly rotation uses
-`YYYY-MM-DD-HH`, and `never` uses `logs/opcda-bridge-gateway.log`. When a console is attached
-(running interactively, as opposed to under a background/service process), the same log lines
-are also printed to stdout.
-
-| Setting      | CLI flag         | Env var    | Config key     | Default                       |
-| ------------ | ---------------- | ---------- | -------------- | ----------------------------- |
-| Level/filter | `--log-level`    | `RUST_LOG` | `log.level`    | `info`                        |
-| Directory    | `--log-dir`      | —          | `log.dir`      | `logs` next to the executable |
-| Format       | `--log-format`   | —          | `log.format`   | `pretty`                      |
-| Rotation     | `--log-rotation` | —          | `log.rotation` | `daily`                       |
-
-- **Level/filter** accepts a single level (`error`, `warn`, `info`, `debug`, `trace`) or a full
-  [`tracing_subscriber::EnvFilter`](https://docs.rs/tracing-subscriber) directive spec, e.g.
-  `opcda_bridge_gateway=debug,tower=warn`. An invalid value falls back to `info` rather than
-  preventing the gateway from starting.
-- **Format** is `pretty` (human-readable text) or `json` (one JSON object per line, for log
-  shippers such as Fluent Bit or Vector).
-- **Rotation** is `hourly`, `daily`, or `never` (a single file that grows indefinitely).
-
-## Running as a Windows service
-
-The gateway can run under the Windows Service Control Manager (SCM) instead of an interactive
-console, so it starts automatically at boot without a logged-in user. Manage it with built-in
-subcommands — no need to hand-roll `sc.exe` invocations:
-
-| Command                              | Effect                                            |
-| ------------------------------------ | ------------------------------------------------- |
-| `opcda-bridge-gateway.exe install`   | Registers the service (auto-start, `LocalSystem`) |
-| `opcda-bridge-gateway.exe start`     | Starts the registered service                     |
-| `opcda-bridge-gateway.exe status`    | Prints the service's current SCM state            |
-| `opcda-bridge-gateway.exe stop`      | Requests a graceful stop                          |
-| `opcda-bridge-gateway.exe uninstall` | Stops (if running) and removes the service        |
-
-Run `install`, `uninstall`, `start`, and `stop` from an elevated (Administrator) prompt — the SCM
-rejects these operations otherwise.
-
-Any flags that should apply every time the service starts — `--port`, `--config`, `--log-*` —
-must be given to `install` **before** the subcommand, since they become the service's permanent
-launch arguments:
+Install `opcda-bridge-client` from a platform archive, crates.io, or the Arch User Repository.
+For example, list OPC DA servers registered on the gateway:
 
 ```sh
-opcda-bridge-gateway.exe --port 7700 --log-dir C:\logs install
+opcda-bridge-client --host 192.168.1.50:7600 servers
 ```
 
-not `opcda-bridge-gateway.exe install --port 7700`. If the client will connect from another
-machine, remember to open the listen port in the Windows Firewall, same as console mode.
+The client and gateway versions do not need to match. Check their negotiated features before
+depending on optional operations:
 
-Once running as a service there is no console, so [logging](#logging) always goes to the file
-sink — the same location and settings as console mode (next to the executable by default, or
-wherever `--log-dir`/`log.dir` points). The service also shuts down the same way `Ctrl+C` does in
-console mode: the SCM reports `Running` only after the listener is ready, and `stop` drains
-in-flight requests before it reports `Stopped`.
+```sh
+opcda-bridge-client --host 192.168.1.50:7600 compatibility
+```
 
-## Architecture
+## Documentation
 
-- Gateway (Windows-only) built on the ByteHound-maintained [`bytehound-opc-da-client`](https://github.com/bytehound-labs/opc-cli/tree/main/opc-da-client) package for the COM/OPC DA layer — no dependency on proprietary SDKs (OPC Labs QuickOPC, Graybox, Matrikon, etc.).
-- Client (cross-platform) is a plain network client with no COM/Windows dependency.
-- Scope is intentionally OPC DA only for now — see [`AGENTS.md`](AGENTS.md) for the reasoning.
+| Topic | Guide |
+| --- | --- |
+| Components and request flow | [Architecture](docs/architecture.md) |
+| Windows setup, service, and firewall | [Gateway deployment](docs/gateway-deployment.md) |
+| Persistent index operations and large-namespace acceptance | [Indexing and search](docs/indexing-and-search.md) |
+| Protocol negotiation and package compatibility | [Protocol and compatibility](docs/protocol-and-compatibility.md) |
+| Common connection, browse, and index issues | [Troubleshooting](docs/troubleshooting.md) |
+| Package releases and artifact verification | [Release and package verification](docs/release.md) |
+
+The generated [compatibility report](COMPATIBILITY.md) and
+[machine-readable catalog](compatibility.json) describe protocol release lines and test evidence.
+The [security policy](SECURITY.md) explains the threat model and vulnerability reporting process.
+
+## Packages
+
+The workspace publishes four independently versioned crates:
+
+- `opcda-bridge-proto` — Protobuf schema and generated types.
+- `opcda-bridge` — reusable, typed Rust client library.
+- `opcda-bridge-client` — cross-platform CLI.
+- `opcda-bridge-gateway` — Windows OPC DA gateway and namespace index.
+
+GitHub release archives are provided for the client and gateway. Package compatibility is
+negotiated through protocol and capability versions; equal package versions are not required.
 
 ## Contributing
 
-All changes, including documentation-only fixes, use a short-lived feature branch and focused
-pull request. Start from synchronized `main`, keep one logical change group per PR, run the
-applicable checks, and repair the same branch until every required status is green. Pull requests
-are squash-merged only after the applicable SonarQube analysis reports zero `OPEN`/`CONFIRMED`
-issues; intentional Accepted or False Positive findings need a durable rationale and related
-link. After merging, wait for the `main` workflows and SonarQube analysis before starting
-dependent work. See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete workflow and coding
-standards.
-
-CI is change-aware: documentation-only changes do not rebuild the workspace, while required status
-checks still complete for branch protection. Release-plz compatibility lockfile updates are
-proposed as checked `release-plz-*` pull requests rather than pushed directly to `main`.
-
-CI validates Rust code and package metadata, checks the public API of the published library crates
-for semver compatibility against their latest crates.io releases, lints and format-checks the
-Protobuf schema with Buf and checks its compatibility against `main`, runs CodeQL and Semgrep
-analysis, scans complete Git history with the open-source Gitleaks CLI, and audits workflow files
-with actionlint and zizmor. Configuration, output, and protocol boundaries have property tests plus
-standalone cargo-fuzz smoke targets.
-
-SonarQube Cloud analyzes the Rust workspace for maintainability, reliability, security, complexity,
-and duplication issues. Rust coverage is imported from the same `cargo llvm-cov` LCOV report used
-by the coverage workflow; integration tests, fuzz targets, the compatibility workspace, and build
-output are classified or excluded so they do not distort source coverage. Relevant pull requests
-and pushes to `main` run the analysis, with a full scan every Wednesday at 04:47 UTC and an
-available manual dispatch. Fork pull requests report an intentional skip because repository
-secrets are unavailable. If a scan fails after its report is uploaded, the workflow log includes
-the Compute Engine response and the projects visible to the configured analysis token, allowing
-project-identity and server-side processing failures to be distinguished without exposing the
-token.
-
-With the SonarScanner CLI installed and `SONAR_TOKEN` exported, reproduce the analysis locally:
-
-```sh
-cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
-sonar-scanner
-```
-
-Tagged binary releases include SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore signatures,
-and GitHub artifact provenance attestations. Running the release workflow manually builds and
-uploads packages as workflow artifacts without creating a GitHub release. The client and gateway
-use their own package tags; protocol and library releases remain crates.io releases without binary
-archives.
-
-## Security
-
-The gateway is an unauthenticated, unencrypted network service that can read and write OPC DA
-tags. Run it only on trusted OT networks and restrict its port to specific client hosts. See
-[SECURITY.md](SECURITY.md) for the security model and for how to report vulnerabilities
-privately.
+Contributions use focused pull requests and the repository's required validation checks. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow.
 
 ## License
 

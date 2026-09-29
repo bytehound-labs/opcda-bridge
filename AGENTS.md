@@ -1,406 +1,81 @@
-# opcda-bridge
+# Agent instructions
 
-A Windows-side gateway that speaks native OPC DA (COM/DCOM) to industrial control
-systems, plus a cross-platform (Linux/macOS/Windows) client that talks to the gateway over
-the network — a single static binary per side, no legacy dependency stack.
+`opcda-bridge` contains a Windows-only OPC DA gateway, a cross-platform gRPC client, a reusable
+Rust library, and shared protocol types. The repository is intentionally scoped to OPC DA; do not
+expand it into a generic industrial-protocol gateway.
 
-## Status
+## Safety and operations
 
-Active development. Workspace contains gateway (`opcda-bridge-gateway`), client
-(`opcda-bridge-client`), a reusable client library (`opcda-bridge`), and shared proto
-definitions (`opcda-bridge-proto`). Gateway and client are functional end-to-end against a live
-Kepware server.
+- The gateway is unauthenticated, serves plaintext gRPC, and binds `0.0.0.0:7600`. Its Windows
+  service runs as `LocalSystem`. Do not deploy it on an untrusted network; do not imply that
+  installation creates a firewall rule.
+- Port `7600` is protected. Diagnostic sidecars use port `7602`, with a separate executable,
+  configuration, log directory, and index database. Never let gateway processes share an index
+  database path.
+- Do not stop, replace, or deploy a gateway, run a full production index refresh, or issue an OPC
+  DA write without explicit authorization. Identify the exact process, command line, listener, and
+  database before operational changes. Never terminate a process by name alone.
+- The official gateway artifact is 32-bit `i686-pc-windows-msvc`, including on 64-bit Windows.
+  Do not substitute a host-target x64 build.
+- Do not create intermediate releases, tags, or publications. Release changes go through the
+  approved release workflow.
+- Keep the deployment threat model accurate; see
+  [gateway deployment](docs/gateway-deployment.md), [indexing operations](docs/indexing-and-search.md),
+  and [the security policy](SECURITY.md).
 
-## Origin and scope discipline
+## Change contract
 
-This project started as an exploration of building an OPC DA bridge in Rust, then briefly considered a
-much broader scope (a generic industrial protocol multiplexer supporting OPC UA/DA/Modbus/etc.,
-similar to [`ng-gateway`](https://github.com/shiyuecamus/ng-gateway) or Telegraf). **Deliberately
-scoped back down to OPC DA only** to avoid never shipping a v1. Resist re-expanding scope to other
-protocols until an OPC DA MVP (gateway + client, read/write working end-to-end) actually ships. If
-a generic multiplexer is revisited later, it should be a separate project/crate built _on top of_
-a working opcda-bridge, not a redesign of it.
+- Work only in the requested worktree and branch. Preserve unrelated changes and other agents'
+  worktrees. Never push directly to `main` or bypass branch protection.
+- Keep each pull request focused, use Conventional Commits, and squash-merge through GitHub after
+  the required checks pass. Do not change the local Git identity.
+- Add or update user-facing documentation with behavior, configuration, protocol, safety, or
+  operational changes. Generated compatibility reports are not hand-edited.
+- Never commit secrets, credentials, machine-local state, caches, build output, or temporary
+  artifacts.
+- Protocol changes must preserve published Protobuf names, field numbers, and wire types. An
+  intentional wire break requires the `breaking-protobuf` label, a compatibility-catalog boundary,
+  evidence, and regenerated reports.
 
-## Key architectural decisions
+## Build and validation commands
 
-- **Build on the ByteHound-maintained [`bytehound-opc-da-client`](https://github.com/bytehound-labs/opc-cli/tree/main/opc-da-client)
-  package** (MIT, async/trait-based, `windows-rs`-backed) for the COM/OPC DA layer, rather than reimplementing raw
-  OPC DA COM interfaces from scratch. Its lower-level sibling
-  [`opc_da`](https://github.com/Ronbb/rust_opc) (also MIT) is a fallback/reference if
-  `opc-da-client` proves insufficient. `opc_da`'s repo bundles OPC Foundation IDL files under the
-  OPC Foundation's own license terms (separate from its overall MIT license) — worth a re-read if
-  this ever becomes a legal question.
-- **No proprietary OPC SDKs.** Deliberately do not depend on OPC Labs QuickOPC or Graybox's
-  `gbda_aut.dll` — both carry licensing terms incompatible with redistribution in an open-source
-  project (the author's FalconTune/AccuTune `Main` repo hit this exact wall — see that repo's
-  history if the reasoning needs re-deriving).
-- **Use native lazy OPC DA browsing for hierarchical servers.** The gateway requests one bounded
-  level at a time through the scalable browse API in the `opc-da-client` fork. DA 3.0 continuation
-  points and DA 2.x browse positions remain on their native session; the gRPC layer exposes only
-  gateway-owned opaque session, page, and node tokens. Flat namespaces are reported as flat rather
-  than reconstructed into a potentially incomplete hierarchy, and exact ItemIDs remain separate
-  from display names.
-- **Index databases are process-scoped resources.** Every gateway process that can index a server
-  must use a unique, explicit `index.database_path`; an executable launched next to the shared
-  TOML automatically loads that file, so two direct launches can otherwise build into the same
-  SQLite database. Gateway logs include the process ID, resolved database path, server,
-  generation, operation, and terminal build outcome to make this class of deployment error
-  diagnosable. Build locks use OS advisory ownership, and startup recovery preserves staging
-  generations whose server-specific lock is still held by another live process.
-- **Index scheduler operations are bounded.** The configured `index.operation_timeout_seconds`
-  limit applies to pre-build capability/inventory calls and health probes, so one unresponsive
-  OPC target cannot hold the scheduler indefinitely; timeout failures remain visible and do not
-  start a replacement build. Persisted retry deadlines take precedence over the normal refresh
-  cadence after a restart, so a failed server is not retried immediately just because the
-  gateway restarted.
-- **Inventory failures are terminal, typed failures.** The native inventory worker catches
-  unexpected panics, logs the payload type without exposing panic contents through the public
-  protocol, and delivers an `OpcError` to the stream. Fixed-size COM iterator buffers validate
-  every reported count before indexing so malformed native counts cannot panic the worker.
-- **Indexed search is isolated from foreground database coordination.** Uncached full-text
-  queries open a read-only SQLite connection outside the process-wide writable database mutex,
-  retain only a bounded ranked candidate set, and fetch metadata for the final result page.
-  Exact searches must use separate equality lookups on the normalized display-name and ItemID
-  indexes, each bounded to `limit + 1` rows, then merge and deduplicate those candidate sets before
-  ranking; they must not reintroduce a broad `OR`/`LIKE` ordering scan over the generation. Search
-  must never make status,
-  discovery, reads, writes, or lazy browse wait on a broad query; during promotion it must use the
-  active generation from the promotion-safe status read rather than call back through the writable
-  database mutex. Live search streams begin with an initial progress event, emit matches in browse
-  order with progress after each page, and end with completion or an explicit truncation warning.
-  Cancellation issued while inventory startup is awaiting its control handle must be queued and
-  applied when the handle becomes available.
-- **SQLite writer coordination is database-wide and cleanup is build-aware.** Every mutation on
-  an index database file, including primary build progress/failure writes and cleanup batches on
-  the separate WAL connection, must pass through the same internal writer gate; per-server build
-  locks are not sufficient because SQLite permits only one writer per file. Cleanup checks for
-  active builds before and after acquiring the gate, yields it between bounded batches, and keeps
-  deferred requests pending until the final active build has completed, including when the request
-  and build belong to different manager instances sharing that file. Deferred workers must observe
-  shutdown even if it races with notification subscription; cleanup must stop before opening a
-  new write batch after shutdown and treat a batch with no remaining obsolete rows as no progress.
-  Scheduler attempts keep retry/deferred decisions separate from completion bookkeeping so a
-  pending request is not discarded before its worker outcome is known.
-  Build finalization must release
-  ownership before publishing build capacity and resume pending cleanup on every terminal path,
-  including startup failure, cancellation, spawn rejection, shutdown, and unexpected unwinding.
-  Coordination keys and persistent build-lock paths must use the canonical identity of an existing
-  database file so relative/symlink aliases cannot bypass the gate. For missing files, canonicalize
-  the parent and reattach the filename; if that cannot be done, retain the original path spelling.
-  Each `:memory:` database gets an independent coordination object and must not create or rely on a
-  filesystem build lock. On Windows, cleanly released build locks remove their `.build.owner`
-  metadata sidecar; forced termination may leave it for the next acquisition to overwrite.
-- **Index status is an aggregation of durable and runtime state.** Status combines the persisted
-  generation snapshot with runtime build, health, storage, foreground, and scheduler diagnostics.
-  Promotion reads persisted rows through a read-only connection and filesystem diagnostics; a
-  runtime error changes the reported state only when no build is active, so an in-flight build
-  remains represented by its current lifecycle state.
-- **Architecture split**: Gateway (Windows-only, COM) + cross-platform client talking to it over
-  the network.
-- **Compatibility contract**: Client and gateway package versions are independent. Runtime
-  compatibility is negotiated by the gateway-wide `GetGatewayInfo` protocol-feature ranges, with
-  legacy `GetCapabilities` fallback only when an explicit OPC server is supplied. The canonical
-  release-line catalog is `crates/opcda-bridge-proto/compatibility.toml`; generated
-  `COMPATIBILITY.md` and `compatibility.json` must stay synchronized.
+Use stable Rust and install `protoc` for workspace builds. The declared MSRV is Rust 1.88. The
+cargo-fuzz smoke workflow uses nightly.
 
-## Reference test environment
+```sh
+cargo build --workspace --locked
+cargo fmt --check --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --locked
+cargo llvm-cov --workspace --lcov --output-path lcov.info
+cargo deny check
+cargo machete
+cargo test --manifest-path compatibility-tests/Cargo.toml --locked
+python3 scripts/generate-compatibility-report.py --check
+cargo package --workspace --locked --no-verify
+```
 
-Manually validated (not automated/CI) against: a Windows host running Kepware KEPServerEX, OPC
-server `Kepware.KepServerEX.V5`, tag `Simulink.Device1.Python.D`. This is a good smoke-test
-target for early gateway development.
+Build the supported Windows gateway target explicitly:
 
-## Conventions
+```powershell
+rustup target add i686-pc-windows-msvc
+cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-msvc
+```
 
-- **Trunk-based git flow**: single long-lived `main` branch, short-lived PR branches, squash
-  merges, no `develop`/release branches, releases tagged directly off `main`. Contrast with the
-  author's FalconTune/AccuTune repos, which use a `dev`-branch + `--no-ff` merge model — do not
-  carry that convention over here.
-- **Standard change protocol**: Start from a clean checkout with local `main` synchronized to
-  `origin/main`, then create a short-lived `<type>/<short-description>` branch. Keep each pull
-  request to one logical change group, run the smallest targeted checks followed by every
-  applicable repository gate, and update the relevant user-facing documentation in the same
-  change. Commit with Conventional Commits, push the branch, and open a focused pull request.
-  Monitor every required CI/CD and SonarQube status; repair failures on the same branch and
-  repeat until all checks pass. If branch protection reports the branch behind `main`, update it
-  before merging. A merge is allowed only when the applicable PR Sonar analysis reports zero
-  `OPEN`/`CONFIRMED` issues; intentional Accepted or False Positive findings must have a durable
-  rationale and related PR or documentation link. Squash-merge only after the complete green
-  result, wait for the resulting `main` workflows and Sonar analysis, and verify the intended
-  findings disappeared without introducing new ones before starting dependent work. Never commit
-  or push directly to `main`, bypass branch protection, use `NOSONAR`, or silence a real finding
-  merely to clean a dashboard.
-- **Commits**: [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`,
-  `chore:`, etc.).
-- **Formatting/linting**: `cargo fmt` (default settings) and
-  `cargo clippy --all-targets --all-features -- -D warnings`, once code exists.
-- Full contributor workflow is documented in [`CONTRIBUTING.md`](CONTRIBUTING.md); this file is
-  for future coding-agent sessions, not human contributors.
+## Code and test constraints
 
-## Build / Test / Lint / Coverage
+- Keep gateway OPC operations behind the `OpcClient` abstraction so RPC and lifecycle behavior can
+  be tested cross-platform. The concrete COM adapter is Windows-only; use the shared mock client
+  in tests.
+- Add focused tests with new behavior and preserve the repository's complete source-line coverage
+  gate. Operational SQLite lock errors are not corrupt-cache evidence and must not trigger
+  quarantine.
+- Keep config precedence as CLI > environment > TOML > built-in default. Missing auto-discovered
+  config files are allowed; malformed existing files and missing explicit paths are errors.
+- Preserve the CLI's JSON contract: product output goes to stdout, command errors to stderr, and
+  browse/search progress remains streamable. Exact ItemIDs and opaque browse tokens are protocol
+  values; do not infer hierarchy by splitting tag punctuation.
+- Treat protocol-feature versions and exact-pair test evidence as separate from crate versions.
+  Update the compatibility catalog and generated report whenever a protocol boundary changes.
 
-- Use Rust's `stable` toolchain for local development, validation, coverage, SonarQube, and
-  release-plz jobs. The separate MSRV (Minimum Supported Rust Version) check uses Rust 1.88.0.
-  Keep the cargo-fuzz smoke workflow on nightly unless stable support is verified independently.
-  The `Semver checks` job pins Rust 1.98.1 together with cargo-semver-checks 0.50.0 because the
-  tool reads the toolchain's rustdoc JSON output; update both pins together.
-- **Build**: `cargo build`
-- **Windows gateway target**: the gateway is intentionally 32-bit x86, even on 64-bit Windows.
-  Install `i686-pc-windows-msvc` and pass it explicitly:
-  `rustup target add i686-pc-windows-msvc`
-  followed by `cargo build --release --locked -p opcda-bridge-gateway --target
-i686-pc-windows-msvc`. A plain host-target build is not release-equivalent; the client has
-  its own independent x86_64 Windows release target.
-- **Test**: `cargo test --workspace`
-- **Lint**: `cargo fmt --check --all` and
-  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- **Coverage**: `cargo llvm-cov --workspace --lcov`
-- **Cross-version compatibility**: `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`
-- **Report drift**: `python3 scripts/generate-compatibility-report.py --check`
-
-### Security and release validation
-
-All GitHub Actions in `.github/workflows/` are pinned to immutable commit SHAs. Change-aware
-security workflows run CodeQL, Semgrep, full-history Gitleaks, actionlint, zizmor, Buf
-Protobuf checks (lint, formatting, and compatibility), and bounded cargo-fuzz smoke tests.
-Tagged binary releases publish SHA-256 checksums, a CycloneDX SBOM, keyless Sigstore
-signatures, and GitHub artifact provenance attestations; `workflow_dispatch` builds package
-artifacts without publishing.
-
-Whenever the compiled Rust validation in `.github/workflows/checks.yml` runs, its `Semver checks`
-job also runs cargo-semver-checks for the published library crates `opcda-bridge`,
-`opcda-bridge-proto`, and `opcda-bridge-client` against each crate's latest crates.io release.
-The job's result is part of the required `check` status; the Windows gateway is a binary and is
-not checked.
-
-SonarQube Cloud analyzes the Rust workspace through `sonar-project.properties` and
-`.github/workflows/sonar.yml`. The configuration keeps crate and compatibility source roots
-separate from integration tests and fuzz targets, imports the workspace LCOV report, and excludes
-build output from analysis. Relevant pull requests and pushes to `main` run a required
-`Required Sonar quality status` aggregate, with a full scan every Wednesday at 04:47 UTC and an
-available manual dispatch; fork pull requests intentionally skip the secret-bearing analysis. A
-post-failure diagnostic step queries the Compute Engine task and the organization's visible
-project list using the analysis token, printing response metadata and server-side error fields
-without printing the token itself.
-
-The gateway crate is Windows-only (COM); the client crate is cross-platform. Tests that require
-the `OpcClient` trait use a mock implementation so they run on all platforms.
-
-The cross-version workflow exercises published 0.3.2 and 0.4.3 boundary clients against current
-and historical gateway services backed by mock `OpcClient` implementations. An exact package pair
-does not need prior CI evidence when its negotiated protocol ranges overlap, but the CLI reports
-such pairings as `unverified`. Release-plz pull requests regenerate the isolated test workspace's
-lockfile before running the same locked test command when package manifests change, because path
-package versions change in the release branch. After a release commit, the release workflow
-proposes the matching compatibility-test lockfile as a separate `release-plz-*` pull request;
-the existing release-PR auto-merge workflow merges it only after the normal required checks pass,
-so generated repository changes never bypass the PR path. Historical clients must keep an exact
-direct dependency on the protocol crate version they originally shipped with;
-otherwise Cargo can resolve their semver range to a newer generated Rust enum whose added variants
-break compilation before the compatibility test can exercise the wire boundary.
-
-An intentional Protobuf break requires the `breaking-protobuf` label, a new or changed catalog
-boundary, updated evidence, and regenerated compatibility reports. Release-integrity validation
-rejects publishable package versions that do not fall within exactly one catalog release line.
-
-`buf.yaml` applies Buf's `STANDARD` lint rules, and the Protobuf workflow also requires
-`buf format --diff --exit-code` to pass. The commented `except` entries in `buf.yaml` cover names
-fixed by the published wire contract: the `bridge` package and file layout, the `Bridge` service,
-and the shared or domain-named RPC response messages. The exceptions apply to the whole module,
-so they also exempt new elements from those rules. Never rename packages, services, RPCs,
-messages, fields, or enum values, or change field numbers or types, merely to satisfy lint; add
-a documented exception instead.
-
-### Coverage enforcement
-
-Coverage is tracked by Codecov and enforced at **100%** via `codecov.yml` (project and patch
-targets both at 100% with a 1% threshold). CI fails if coverage drops. All code — including error
-branches, edge cases, and default values — must be tested. When adding new code, add
-corresponding tests in the same PR to maintain 100% coverage.
-
-### Test design for the gateway
-
-The gateway binary (`opcda-bridge-gateway`) depends on `opc-da-client` only on Windows
-(`#[cfg(target_os = "windows")]`). To keep the gateway's core logic testable on all platforms,
-an `OpcClient` trait (in `crates/opcda-bridge-gateway/src/opc.rs`) abstracts OPC DA operations. The concrete
-adapter (`opc_da_adapter.rs`) wraps the native browse-session client and is Windows-only. The run
-loop (`crates/opcda-bridge-gateway/src/run.rs`) that serves the gRPC service and drains it on shutdown is generic
-over `OpcClient` too, so it runs under tests on any platform even though the gateway only ships
-for Windows. Both `server`'s and `run`'s tests share one `MockOpcClient`
-(`crates/opcda-bridge-gateway/src/test_support.rs`) to exercise all RPC handler and shutdown paths without touching
-COM.
-
-Index lifecycle tests must cover an active build with an obsolete runtime error, exact database
-operation diagnostics, failed/cancelled generation cleanup, read-only search access, and
-deterministic full-text ranking. Operational SQLite errors such as lock contention must not be
-treated as corrupt-cache evidence and must not trigger quarantine.
-
-### Config file precedence
-
-Both binaries resolve every configurable setting with **CLI flag > environment variable >
-config file > built-in default** precedence
-(`crates/opcda-bridge-gateway/src/config.rs`, `crates/opcda-bridge-client/src/config.rs`).
-To keep this composable while satisfying the 100% coverage gate:
-
-- Path discovery (`config_path_from_exe` / `config_path_from`) is a pure function taking
-  environment values as explicit arguments rather than reading `std::env` inline, so every
-  permutation is testable without the `ENV_MUTEX` dance.
-- `load_config_file(path, missing_is_error)` takes an explicit bool rather than inferring intent:
-  an auto-discovered path silently falls back to defaults when absent (`missing_is_error =
-false`), but an explicit `--config` path is a hard error if missing (`true`). Malformed TOML is
-  always a hard error regardless.
-- To layer a config file _underneath_ clap's own `CLI > env` resolution, config-backed fields
-  drop their clap `default_value` and become `Option<T>`; a `.or(config_value).unwrap_or(default)`
-  chain is applied once after parsing.
-
-### Logging
-
-`crates/opcda-bridge-gateway/src/logging.rs` builds a layered `tracing-subscriber` registry: a non-blocking rolling
-file writer (`tracing-appender`) is always on, and a stdout layer is added only when
-`std::io::stdout().is_terminal()` — a Windows service has no console, so the file layer must never
-depend on one being present. The `WorkerGuard` returned by `tracing_appender::non_blocking` must
-be held for the process lifetime (a local binding in `main()` that lives until the function
-returns is enough); dropping it early silently truncates buffered log lines on exit. Settings
-resolve through the same CLI > env > config > default precedence as the rest of the config
-surface, with `RUST_LOG` folded into `--log-level` via clap's `env` attribute exactly like
-`--port`/`OPC_BRIDGE_PORT`.
-
-`init_tracing` installs a process-global subscriber, and `try_init()` can only succeed once per
-process — `cargo test` runs every unit test in a crate in one shared process, so which test
-"wins" that single real installation is not deterministic. To stay testable under the 100%
-coverage gate anyway, `init_tracing` is a thin wrapper around
-`init_tracing_with_stdout(settings, attach_stdout: bool)`: "is a console attached" becomes an
-explicit, injectable parameter instead of being read inline. Tests drive every layer-construction
-branch (JSON vs. pretty format, stdout attached vs. detached) directly through that `bool` and
-deliberately never assert whether `try_init()` returned `Ok` or `Err` — only that the code path
-leading up to it runs.
-
-### Windows service
-
-`crates/opcda-bridge-gateway/src/service.rs` follows the same "extract a testable pure representation, map it onto
-the real Windows type in a thin shim" pattern as `logging.rs`. The top of the file is
-platform-neutral and covered by Linux tests: `ServiceDefinition`/`build_service_definition` (what
-to register), `service_launch_arguments` (which CLI flags become the service's permanent launch
-arguments), `ServiceLifecycle` (a plain mirror of `windows_service::service::ServiceState` that
-pins down the intended `StartPending → Running → StopPending → Stopped` reporting order, with
-`Running` emitted only after listener readiness), and
-`is_scm_launch_error_code` (the raw `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` check, kept as a
-plain `Option<i32>` comparison rather than matching on the Windows-only `windows_service::Error`
-directly). Only the `#[cfg(target_os = "windows")] mod windows_impl` submodule — the actual
-`ServiceManager`/`service_dispatcher`/`service_control_handler` glue — is invisible to the Linux
-coverage run, and it is kept intentionally thin: `install`/`uninstall`/`start`/`stop`/`status`
-each just map a `ServiceDefinition`/`SERVICE_NAME` onto the matching `windows_service` API call.
-
-`main()` cannot call into itself from library code (the bin and lib are separate compilation
-units), so the config/logging/COM/listener bootstrap that both console mode and the service entry
-point need lives in `run::run_gateway()`, not in `main.rs`. `main()` is now a thin dispatcher:
-parse `Cli`, dispatch any `ServiceCommand` subcommand to `service::*`, otherwise try
-`service::run_as_service()` and fall back to `run::run_gateway()` only when
-`service::is_run_outside_scm` recognizes the "not launched by the SCM" error — the same
-`run_gateway()` call console mode always made, just reached from a second entry point.
-
-Reporting `StopPending` happens from _inside_ the async `shutdown` future passed to
-`run_gateway`, at the instant the control handler's oneshot channel resolves — before the actual
-request-drain begins, not after `run_gateway` returns (too late to be meaningful) and not from
-inside the control handler closure itself (which doesn't have the `ServiceStatusHandle` yet,
-since that's the return value of the same `register()` call the closure is passed to).
-`ServiceStatusHandle` is `Clone` and documented safe to use from any thread, so the closure's
-registration and the shutdown future's status report use two independent clones of the same
-handle.
-
-`install` requires flags before the subcommand (e.g. `opcda-bridge-gateway.exe --port 7700
-install`, not `install --port 7700`) since the SCM always launches a service's executable bare —
-whatever the operator wants applied every time the service starts must be baked into the
-registration itself via `service_launch_arguments`, not left to how the process happened to be
-invoked once at install time.
-
-### Client output formats
-
-`crates/opcda-bridge-client/src/output.rs` holds `OutputFormat` (`Table`/`Json`) and the two pure functions every
-command routes through: `render<T: Tabled + Serialize>(rows, format)` and `format_error(err,
-format)`. Command-specific rows and browse/search event structures derive serialization separately,
-so JSON keys remain the Rust field names — the external contract for scripted consumers — while
-table headers stay controlled separately via `#[tabled(rename = "...")]`.
-`WriteRow.error` is `Option<String>` rather than the pre-JSON code's `.unwrap_or_default()`
-collapse to `""`, so JSON can distinguish "no error" (`null`) from an actual empty string; the
-table rendering still shows an empty cell for `None` via `#[tabled(rename = "Error",
-display("display::option", ""))]` (the built-in `tabled::derive::display::option` helper, which
-takes the fallback-for-`None` string as its second argument).
-
-`--json` is a plain boolean flag, not linked to `--output` via clap's `conflicts_with` —
-`conflicts_with` can misfire against env-sourced values, so precedence between the two is instead
-resolved once in code (`output::resolve_from_cli`: `--json` always wins if set, otherwise
-`--output`) rather than left to clap. Browse JSON emits page/session/completeness metadata, while
-search JSON emits newline-delimited progressive events.
-
-`host`/`config`/`output`/`json` on `Cli` are all `#[arg(..., global = true)]`, so they can be
-passed either before or after the subcommand (clap's default otherwise requires top-level flags
-to precede the subcommand token, which is easy to trip over when a flag like `--json` is added
-after a command's positional args out of habit).
-
-`main()` can no longer return `anyhow::Result<()>` once errors need format-aware rendering:
-`lib::run() -> ExitCode` resolves the CLI-only output format (`output::resolve_from_cli`) _before_
-calling `config::load_config`, so a config-load failure — which happens before the config file's
-own `output` key could ever be known — still gets reported in a sensible format (`--json`/
-`--output`/`OPC_BRIDGE_OUTPUT`, or `table` if none of those were given). Only once the config
-loads successfully does the fully-resolved `CLI > env > config > default` format apply to the
-command's own result. `run()` itself is a thin `Cli::parse()` wrapper around the real, unit-tested
-entry point `run_with_cli(cli: Cli) -> ExitCode` — the same "inject the otherwise-unparseable
-input as a parameter" pattern `logging.rs` uses for `is_terminal()` — so every branch (success,
-command error, config-load error, both output formats) is covered by tests that construct a `Cli`
-directly instead of needing to control `std::env::args()`. The one line real coverage can't reach
-that way — `run()`'s own body, which only ever runs from the compiled binary — is covered instead
-by `client/tests/main_integration.rs` spawning the real binary against a closed local port
-(`127.0.0.1:1`, an immediate, deterministic connection refusal) so the full `run() ->
-run_with_cli() -> fail()` path executes at least once outside of unit tests, alongside the
-pre-existing `--help` integration test (which alone doesn't reach this: clap exits the process
-from inside `Cli::parse()` before `run_with_cli` is ever called).
-
-### Client library (`opcda-bridge`)
-
-The reusable client library lives in `crates/opcda-bridge` and owns the typed
-capabilities, browse-session, search, connect/list-servers/read/write API extracted from the CLI's
-`crates/opcda-bridge-client/src/commands.rs`. It has no CLI presentation dependencies, so
-downstream Rust applications can depend on `opcda-bridge` without pulling in `clap`, `tabled`,
-`serde_json`, or `toml`.
-
-- **API surface**: `Client::connect(host: &str)`, `.capabilities(server)`, `.browse(server,
-page_size)`, `.browse_page(request)`, `.close_browse_session(session_id)`, `.search_stream(request)`,
-  `.list_servers()`, `.read(server, tags)`, and `.write(server, tag, value)` return typed Rust values
-  (`Capabilities`, `BrowsePage`, `SearchStream`, `Vec<String>`, `Vec<TagValue>`, and `WriteResult`).
-- **Paging contract**: browse methods request one page and never automatically follow continuation
-  tokens. Use `BrowsePageRequest::next` or an explicit application-level collection loop when bulk
-  results are intended.
-- **Dependency boundary**: `opcda-bridge` depends on the published `opcda-bridge-proto`,
-  `tonic`, `tonic-prost`, `uuid`, and `thiserror`. Runtime crates such as `tokio` and
-  `tokio-stream` are only dev-dependencies because browse and search use tonic streams directly.
-- **Error contract**: `Error::Connect(tonic::transport::Error)` and `Error::Rpc(tonic::Status)`
-  use transparent error rendering so the CLI's existing error output remains unchanged.
-- **Published distribution**: `opcda-bridge` is consumed from crates.io with a normal SemVer
-  dependency (`opcda-bridge = "0.4"`). Git dependencies are not part of the supported consumer
-  path.
-- **OPC DA client publication**: Publish `bytehound-opc-da-client` through
-  `.github/workflows/publish-opcda-client.yml` from an authenticated GitHub CLI session rather
-  than requiring local Cargo registry credentials. Pass the exact upstream `opc-cli` ref and run
-  the workflow with `dry_run=true` first; after it succeeds, rerun with `dry_run=false`. The
-  Windows workflow supplies the repository's `CARGO_REGISTRY_TOKEN` secret only to the publishing
-  step. Never paste or print that token.
-- **Release automation**: the four published crates are independently versioned. release-plz runs
-  separate release-PR and publish jobs, creates package-specific tags, publishes only packages
-  with releasable changes, and cascades releases through the configured
-  `changelog_include` dependency edges when a reusable library or protocol change requires a
-  dependent rebuild. GitHub Releases are enabled only for the client and gateway packages; the
-  protocol and reusable library publish to crates.io without binary archives. The
-  `release_commits` allowlist excludes both scoped and unscoped release-plz commit forms; the
-  package-aware `release-integrity` check rejects release PRs containing only generated metadata,
-  and a crates.io rate limit bounds publishing if another guard regresses. Client/gateway runtime
-  compatibility is defined by protocol and capability versions, not equal crate versions.
-- **Pre-1.0 API versioning**: adding fields to a public Rust struct is a source-breaking change
-  for downstream struct literals even when the protobuf wire change is additive. A breaking change
-  to a published library crate (`opcda-bridge`, `opcda-bridge-proto`, or `opcda-bridge-client`)
-  bumps that crate's minor version in the same pull request (for example, `0.5.x` to `0.6.0`) and
-  updates any matching `[workspace.dependencies]` requirement in the root `Cargo.toml`. The
-  `Semver checks` job compares each crate with its latest crates.io release and accepts a breaking
-  change only when the manifest carries such a bump. The compatibility catalog's current release
-  line already spans later `0.x` versions, so a Rust-only API break needs no catalog change;
-  Protobuf wire breaks still follow the `breaking-protobuf` process. Leave non-breaking version
-  bumps to release-plz.
+The detailed user-facing references are linked from the [README](README.md).

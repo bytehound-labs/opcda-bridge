@@ -26,8 +26,11 @@ running binary without opening an OPC DA server. The client compatibility comman
 handshake for deployment checks; `GetCapabilities` remains the per-server operational capability
 endpoint and supports older clients.
 
-The gateway must run on the Windows machine hosting the OPC DA server. See the repository README
-for service installation, configuration, and firewall setup.
+The gateway must run on the Windows machine hosting the OPC DA server. See the repository's
+[deployment, service, and firewall guide](https://github.com/bytehound-labs/opcda-bridge/blob/main/docs/gateway-deployment.md)
+for installation and configuration, and the
+[indexing and search guide](https://github.com/bytehound-labs/opcda-bridge/blob/main/docs/indexing-and-search.md)
+for index operations and large-namespace acceptance.
 
 Tag browsing uses native one-level OPC DA enumeration with bounded pages. The gateway owns opaque
 browse sessions and continuation tokens, preserves exact ItemIDs separately from display names,
