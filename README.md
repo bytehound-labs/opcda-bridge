@@ -651,11 +651,12 @@ CI is change-aware: documentation-only changes do not rebuild the workspace, whi
 checks still complete for branch protection. Release-plz compatibility lockfile updates are
 proposed as checked `release-plz-*` pull requests rather than pushed directly to `main`.
 
-CI validates Rust code and package metadata, lints and format-checks the Protobuf schema with Buf
-and checks its compatibility against `main`, runs CodeQL and Semgrep analysis, scans complete Git
-history with the open-source Gitleaks CLI, and audits workflow files with actionlint and zizmor.
-Configuration, output, and protocol boundaries have property tests plus standalone cargo-fuzz
-smoke targets.
+CI validates Rust code and package metadata, checks the public API of the published library crates
+for semver compatibility against their latest crates.io releases, lints and format-checks the
+Protobuf schema with Buf and checks its compatibility against `main`, runs CodeQL and Semgrep
+analysis, scans complete Git history with the open-source Gitleaks CLI, and audits workflow files
+with actionlint and zizmor. Configuration, output, and protocol boundaries have property tests plus
+standalone cargo-fuzz smoke targets.
 
 SonarQube Cloud analyzes the Rust workspace for maintainability, reliability, security, complexity,
 and duplication issues. Rust coverage is imported from the same `cargo llvm-cov` LCOV report used
