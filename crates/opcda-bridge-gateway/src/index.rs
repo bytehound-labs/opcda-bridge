@@ -7724,7 +7724,7 @@ fn build_owner_path(database_path: &Path, server: &str) -> PathBuf {
     let database_path = canonical_database_path(database_path);
     let file_name = database_path
         .file_name()
-        .map_or_else(|| "index.sqlite3".into(), |name| name.to_os_string());
+        .map_or_else(|| "index.sqlite3".into(), std::ffi::OsStr::to_os_string);
     database_path.with_file_name(format!(
         "{}.{}.build.owner",
         file_name.to_string_lossy(),

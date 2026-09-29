@@ -399,17 +399,14 @@ impl HostMetricsProvider for WindowsHostMetrics {
         let available_memory_percent = Self::collect_memory();
         let disk_free_bytes = self.collect_disk_free();
 
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                return HostMetrics {
-                    available_memory_percent,
-                    process_working_set_bytes: working_set,
-                    process_private_bytes: private_bytes,
-                    disk_free_bytes,
-                    ..HostMetrics::default()
-                };
-            }
+        let Ok(mut state) = self.state.lock() else {
+            return HostMetrics {
+                available_memory_percent,
+                process_working_set_bytes: working_set,
+                process_private_bytes: private_bytes,
+                disk_free_bytes,
+                ..HostMetrics::default()
+            };
         };
         let elapsed = state
             .sampled_at

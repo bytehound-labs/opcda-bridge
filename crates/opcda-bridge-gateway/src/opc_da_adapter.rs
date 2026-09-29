@@ -123,8 +123,7 @@ impl OpcClient for OpcDaAdapter {
     ) -> anyhow::Result<InventoryHandle> {
         if !(1..=MAX_NATIVE_INVENTORY_BATCH_SIZE).contains(&batch_size) {
             anyhow::bail!(
-                "native inventory batch size must be between 1 and {}",
-                MAX_NATIVE_INVENTORY_BATCH_SIZE
+                "native inventory batch size must be between 1 and {MAX_NATIVE_INVENTORY_BATCH_SIZE}"
             );
         }
         let stream = self
@@ -156,8 +155,7 @@ impl OpcClient for OpcDaAdapter {
     ) -> anyhow::Result<InventoryHandle> {
         if !(1..=MAX_NATIVE_INVENTORY_BATCH_SIZE).contains(&batch_size) {
             anyhow::bail!(
-                "native inventory batch size must be between 1 and {}",
-                MAX_NATIVE_INVENTORY_BATCH_SIZE
+                "native inventory batch size must be between 1 and {MAX_NATIVE_INVENTORY_BATCH_SIZE}"
             );
         }
         let worker_client = OpcDaClient::new(ComConnector)?;
