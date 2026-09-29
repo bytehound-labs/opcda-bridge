@@ -39,6 +39,11 @@ struct BrowseOutput {
     pages: u32,
 }
 
+/// Render one browse command result.
+///
+/// JSON keeps `session_id` and the table keeps the `Session:` line. That
+/// opaque handle is required to continue or close the session. The CodeQL
+/// model names this function.
 pub(super) fn render_browse(
     page: BrowsePage,
     pages: u32,
@@ -152,8 +157,7 @@ pub async fn cmd_browse(
         );
     }
 
-    // Stdout is the command result required to continue or close the session.
-    // codeql[rust/cleartext-logging]: browse session id is the operator continuation handle, not a secret
+    // Stdout is the command result, including the opaque continuation handle.
     println!("{}", render_browse(combined, pages, format)?);
     Ok(())
 }
@@ -208,6 +212,18 @@ struct CloseSessionRow {
     session_id: String,
 }
 
+/// Render the closed-session command result.
+///
+/// The opaque session handle stays in JSON and in the table `Closed Session`
+/// line. Stdout is the command result, not a credential store. The CodeQL
+/// model names this function.
+pub(super) fn render_close_browse_session(
+    session_id: String,
+    format: OutputFormat,
+) -> anyhow::Result<String> {
+    output::render(vec![CloseSessionRow { session_id }], format)
+}
+
 pub async fn cmd_close_browse_session(
     host: String,
     session_id: String,
@@ -215,9 +231,6 @@ pub async fn cmd_close_browse_session(
 ) -> anyhow::Result<()> {
     let mut client = Client::connect(&host).await?;
     client.close_browse_session(session_id.clone()).await?;
-    println!(
-        "{}",
-        output::render(vec![CloseSessionRow { session_id }], format)?
-    );
+    println!("{}", render_close_browse_session(session_id, format)?);
     Ok(())
 }

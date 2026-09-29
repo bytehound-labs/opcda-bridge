@@ -1,0 +1,10 @@
+extensions:
+  - addsTo:
+      pack: codeql/rust-all
+      extensible: barrierModel
+    data:
+      # Browse and close-session stdout is the operator continuation handle,
+      # not a credential. These rows are the models-as-data log-injection
+      # barriers that CleartextLoggingExtensions promotes.
+      - ["opcda_bridge_client::commands::browse::render_browse", "ReturnValue", "log-injection", "manual"]
+      - ["opcda_bridge_client::commands::browse::render_close_browse_session", "ReturnValue", "log-injection", "manual"]

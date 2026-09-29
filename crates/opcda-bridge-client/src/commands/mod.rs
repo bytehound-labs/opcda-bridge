@@ -24,7 +24,7 @@ pub use write::cmd_write;
 #[cfg(test)]
 use browse::{
     ensure_page_bound, merge_warnings, next_browse_page_count, render_browse,
-    should_fetch_browse_page, stopped_at_browse_safety_cap,
+    render_close_browse_session, should_fetch_browse_page, stopped_at_browse_safety_cap,
 };
 #[cfg(test)]
 use compatibility::{render_compatibility, version_range};
@@ -906,8 +906,18 @@ mod tests {
         assert_eq!(value["nodes"][0]["item_id"], "Exact.ItemID");
         assert_eq!(value["complete"], false);
         let table = render_browse(typed, 1, OutputFormat::Table).unwrap();
+        assert!(table.contains("Session: session"));
         assert!(table.contains("Next page token: next"));
         assert!(table.contains("Warning: partial"));
+
+        let closed_json =
+            render_close_browse_session("session".into(), OutputFormat::Json).unwrap();
+        let closed: serde_json::Value = serde_json::from_str(&closed_json).unwrap();
+        assert_eq!(closed[0]["session_id"], "session");
+        let closed_table =
+            render_close_browse_session("session".into(), OutputFormat::Table).unwrap();
+        assert!(closed_table.contains("Closed Session"));
+        assert!(closed_table.contains("session"));
 
         assert_eq!(merge_warnings(None, None), None);
         assert_eq!(merge_warnings(Some("a".into()), None).as_deref(), Some("a"));
