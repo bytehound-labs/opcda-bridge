@@ -2560,6 +2560,42 @@ fn parse_indexed_breadcrumbs(value: String) -> rusqlite::Result<Vec<String>> {
     })
 }
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::{BrowseSource, IndexDb, IndexedMatch, NamespaceOrganization};
+    use crate::opc::InventoryEntry;
+    use std::path::Path;
+
+    pub fn search_all_modes(
+        query: &str,
+        entries: &[InventoryEntry],
+        limit: u32,
+    ) -> anyhow::Result<[Vec<IndexedMatch>; 4]> {
+        const SERVER: &str = "fuzz";
+
+        let mut database = IndexDb::open(Path::new(":memory:"))?;
+        let generation = database.start_generation(
+            SERVER,
+            NamespaceOrganization::Unspecified,
+            BrowseSource::Unspecified,
+            "0",
+        )?;
+        database.insert_entries(SERVER, generation, entries)?;
+
+        Ok([
+            database.search(SERVER, generation, query, 0, limit)?,
+            database.search(SERVER, generation, query, 1, limit)?,
+            database.search(SERVER, generation, query, 2, limit)?,
+            database.search(SERVER, generation, query, 3, limit)?,
+        ])
+    }
+
+    pub fn parse_breadcrumbs(value: String) -> rusqlite::Result<Vec<String>> {
+        super::parse_indexed_breadcrumbs(value)
+    }
+}
+
 #[derive(Default)]
 struct CleanupStats {
     batches: u64,
@@ -7808,6 +7844,7 @@ mod tests {
     };
     use crate::test_support::MockOpcClient;
     use chrono::TimeZone;
+    use proptest::prelude::*;
     use std::collections::{HashMap, VecDeque};
     use std::error::Error;
     use std::sync::Arc;
@@ -9400,6 +9437,118 @@ mod tests {
         assert_eq!(SearchMode::try_from(2), Ok(SearchMode::Prefix));
         assert_eq!(SearchMode::try_from(3), Ok(SearchMode::Contains));
         assert_eq!(SearchMode::try_from(4), Err(()));
+    }
+
+    fn in_memory_index_with(entries: &[InventoryEntry]) -> (IndexDb, u64) {
+        let mut database = IndexDb::open(Path::new(":memory:")).unwrap();
+        let generation = database
+            .start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")
+            .unwrap();
+        database.insert_entries("S", generation, entries).unwrap();
+        (database, generation)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn indexed_query_normalization_is_idempotent(value in any::<String>()) {
+            let normalized = normalize_query(&value);
+            prop_assert_eq!(normalize_query(&normalized), normalized);
+        }
+
+        #[test]
+        fn indexed_search_preserves_match_tier_order(
+            // SQLite FTS5 trigram matching does not support supplementary-plane query scalars.
+            value in prop::collection::vec(
+                proptest::char::range(' ', '~'),
+                0..32,
+            )
+            .prop_map(|chars| chars.into_iter().collect::<String>()),
+        ) {
+            let query = format!("fuzz{value}");
+            let item_prefix = format!("{query}\0prefix");
+            let item_contains = format!("contains:{query}:suffix");
+            let entries = [
+                inventory_entry(&query, "0"),
+                inventory_entry("zzzz", &query),
+                inventory_entry(&format!("{query} suffix"), "2"),
+                inventory_entry("zzzz", &item_prefix),
+                inventory_entry(&format!("prefix {query} suffix"), "4"),
+                inventory_entry("zzzz", &item_contains),
+                inventory_entry("zzzz", "6"),
+            ];
+            let (database, generation) = in_memory_index_with(&entries);
+            let item_ids = |mode| {
+                database
+                    .search("S", generation, &query, mode, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.item_id)
+                    .collect::<Vec<_>>()
+            };
+
+            prop_assert_eq!(item_ids(0), item_ids(3));
+            prop_assert_eq!(
+                item_ids(1),
+                vec!["0".to_string(), query.clone()]
+            );
+            prop_assert_eq!(
+                item_ids(2),
+                vec![
+                    "0".to_string(),
+                    query.clone(),
+                    "2".to_string(),
+                    item_prefix.clone()
+                ]
+            );
+            prop_assert_eq!(
+                item_ids(3),
+                vec![
+                    "0".to_string(),
+                    query,
+                    "2".to_string(),
+                    item_prefix,
+                    "4".to_string(),
+                    item_contains,
+                ]
+            );
+        }
+
+        #[test]
+        fn indexed_record_storage_round_trips_fields_and_breadcrumbs(
+            item_id in any::<String>(),
+            display_name in any::<String>(),
+            breadcrumbs in prop::collection::vec(any::<String>(), 0..8),
+            branch_and_item in any::<bool>(),
+        ) {
+            let item_id = if item_id.is_empty() {
+                "fuzz-item".to_string()
+            } else {
+                item_id
+            };
+            let kind = if branch_and_item {
+                InventoryNodeKind::BranchAndItem
+            } else {
+                InventoryNodeKind::Item
+            };
+            let entry = InventoryEntry {
+                item_id: item_id.clone(),
+                display_name: display_name.clone(),
+                kind,
+                breadcrumbs: breadcrumbs.clone(),
+            };
+            let expected = IndexedMatch {
+                item_id,
+                display_name,
+                kind,
+                breadcrumbs,
+            };
+            let (database, generation) = in_memory_index_with(std::slice::from_ref(&entry));
+            let matches = database.search("S", generation, &entry.item_id, 1, 10).unwrap();
+
+            prop_assert_eq!(matches, vec![expected]);
+        }
     }
 
     #[test]

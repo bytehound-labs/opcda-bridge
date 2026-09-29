@@ -37,6 +37,8 @@ jobs:
               - 'fuzz/**'
               - 'crates/opcda-bridge-client/src/config.rs'
               - 'crates/opcda-bridge-client/src/output.rs'
+              - 'crates/opcda-bridge-gateway/Cargo.toml'
+              - 'crates/opcda-bridge-gateway/src/index.rs'
               - 'crates/opcda-bridge-proto/**'
               - 'Cargo.lock'
               - '.github/workflows/fuzz.yml'
@@ -72,6 +74,14 @@ jobs:
       - name: Fuzz Protobuf payload decoding
         working-directory: fuzz
         run: cargo fuzz run proto_payload -- -runs=100
+
+      - name: Fuzz indexed search queries and ranking
+        working-directory: fuzz
+        run: cargo fuzz run search_query -- -runs=100
+
+      - name: Fuzz index record storage and breadcrumbs
+        working-directory: fuzz
+        run: cargo fuzz run index_record -- -runs=100
 
   security:
     name: Required fuzz smoke status
