@@ -87,17 +87,27 @@ pub fn load_config(explicit_path: Option<&Path>) -> anyhow::Result<ClientConfig>
     match explicit_path {
         Some(path) => load_config_file(path, true),
         None => {
-            let path = config_path_from(
-                std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-                std::env::var("HOME").ok().as_deref(),
-                std::env::var("APPDATA").ok().as_deref(),
-                cfg!(target_os = "windows"),
-            );
-            match path {
-                Some(p) => load_config_file(&p, false),
-                None => Ok(ClientConfig::default()),
-            }
+            let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
+            let home = std::env::var("HOME").ok();
+            let appdata = std::env::var("APPDATA").ok();
+            load_config_from_env(
+                xdg_config_home.as_deref(),
+                home.as_deref(),
+                appdata.as_deref(),
+            )
         }
+    }
+}
+
+fn load_config_from_env(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+) -> anyhow::Result<ClientConfig> {
+    let path = config_path_from(xdg_config_home, home, appdata, cfg!(target_os = "windows"));
+    match path {
+        Some(path) => load_config_file(&path, false),
+        None => Ok(ClientConfig::default()),
     }
 }
 
@@ -273,42 +283,12 @@ mod tests {
         assert!(err.to_string().contains("config file not found"));
     }
 
-    // std::env::set_var/remove_var mutate process-global state, but `cargo
-    // test` runs tests in parallel threads by default; this guards the one
-    // test below that touches real XDG_CONFIG_HOME/HOME/APPDATA env vars.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_load_config_default_discovery_absent_env() {
-        // With none of XDG_CONFIG_HOME/HOME/APPDATA visible, discovery
-        // should yield no path and fall back to defaults without error.
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = [
-            std::env::var("XDG_CONFIG_HOME").ok(),
-            std::env::var("HOME").ok(),
-            std::env::var("APPDATA").ok(),
-        ];
-        // ENV_MUTEX serializes these Rust 2024 environment mutations.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("HOME");
-            std::env::remove_var("APPDATA");
-        }
-        let result = load_config(None);
-        // ENV_MUTEX serializes this Rust 2024 environment mutation block.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            for (var, value) in ["XDG_CONFIG_HOME", "HOME", "APPDATA"]
-                .iter()
-                .zip(saved.iter())
-            {
-                if let Some(v) = value {
-                    std::env::set_var(var, v);
-                }
-            }
-        }
-        assert_eq!(result.unwrap(), ClientConfig::default());
+        assert_eq!(
+            load_config_from_env(None, None, None).unwrap(),
+            ClientConfig::default()
+        );
     }
 
     #[test]

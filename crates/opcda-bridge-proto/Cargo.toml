@@ -12,6 +12,9 @@ documentation = "https://docs.rs/opcda-bridge-proto"
 keywords = ["opc", "opc-da", "grpc", "protobuf", "tonic"]
 categories = ["network-programming", "api-bindings"]
 
+[lints]
+workspace = true
+
 [dependencies]
 prost.workspace = true
 tonic.workspace = true

@@ -16,6 +16,9 @@ categories = [
   "hardware-support",
 ]
 
+[lints]
+workspace = true
+
 [dependencies]
 opcda-bridge.workspace = true
 anyhow.workspace = true

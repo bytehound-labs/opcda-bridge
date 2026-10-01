@@ -47,6 +47,10 @@ pub mod compatibility {
     }
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "tonic's generated async-trait methods redundantly mark futures as must-use"
+)]
 pub mod bridge {
     tonic::include_proto!("bridge");
 }

@@ -269,6 +269,7 @@ impl WindowsHostMetrics {
         }
     }
 
+    #[allow(unsafe_code)]
     fn collect_system() -> Option<SystemCounters> {
         use windows_sys::Win32::Foundation::FILETIME;
         use windows_sys::Win32::System::Threading::GetSystemTimes;
@@ -277,6 +278,8 @@ impl WindowsHostMetrics {
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
         // The Windows metrics API has no safe Rust binding.
+        // SAFETY: Each pointer is a live, writable FILETIME on the stack and remains valid for
+        // the call.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let success = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
         if success == 0 {
@@ -292,6 +295,7 @@ impl WindowsHostMetrics {
         })
     }
 
+    #[allow(unsafe_code)]
     fn collect_process() -> (Option<u64>, Option<u64>, Option<ProcessCounters>) {
         use std::mem::size_of;
         use windows_sys::Win32::System::ProcessStatus::{
@@ -302,6 +306,8 @@ impl WindowsHostMetrics {
         };
 
         // The Windows metrics API has no safe Rust binding.
+        // SAFETY: GetCurrentProcess takes no pointers and returns a current-process pseudo-handle;
+        // it is valid for this process and must not be closed.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let process = unsafe { GetCurrentProcess() };
         let mut memory = PROCESS_MEMORY_COUNTERS_EX {
@@ -309,6 +315,8 @@ impl WindowsHostMetrics {
             ..PROCESS_MEMORY_COUNTERS_EX::default()
         };
         // The Windows metrics API has no safe Rust binding.
+        // SAFETY: `memory` is live, writable, and correctly aligned; its base layout matches
+        // `PROCESS_MEMORY_COUNTERS`, and `cb` gives the extended structure size required here.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let memory_ok = unsafe {
             GetProcessMemoryInfo(
@@ -320,6 +328,8 @@ impl WindowsHostMetrics {
 
         let mut io = IO_COUNTERS::default();
         // The Windows metrics API has no safe Rust binding.
+        // SAFETY: `process` is a valid current-process pseudo-handle and `io` is a live,
+        // writable `IO_COUNTERS` for the duration of the call.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let io_ok = unsafe { GetProcessIoCounters(process, &mut io) != 0 };
         (
@@ -332,6 +342,7 @@ impl WindowsHostMetrics {
         )
     }
 
+    #[allow(unsafe_code)]
     fn collect_memory() -> Option<f64> {
         use std::mem::size_of;
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -341,6 +352,7 @@ impl WindowsHostMetrics {
             ..MEMORYSTATUSEX::default()
         };
         // The Windows metrics API has no safe Rust binding.
+        // SAFETY: `memory` is a live, writable `MEMORYSTATUSEX`; `dwLength` is its exact size.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let success = unsafe { GlobalMemoryStatusEx(&mut memory) };
         if success == 0 || memory.ullTotalPhys == 0 {
@@ -349,6 +361,7 @@ impl WindowsHostMetrics {
         Some(memory.ullAvailPhys as f64 * 100.0 / memory.ullTotalPhys as f64)
     }
 
+    #[allow(unsafe_code)]
     fn collect_disk_free(&self) -> Option<u64> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
@@ -362,6 +375,8 @@ impl WindowsHostMetrics {
         wide.push(0);
         let mut available = 0_u64;
         // The Windows metrics API has no safe Rust binding.
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path kept alive through the call, `available`
+        // is writable, and the two optional output pointers may be null.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let success = unsafe {
             GetDiskFreeSpaceExW(
@@ -384,17 +399,14 @@ impl HostMetricsProvider for WindowsHostMetrics {
         let available_memory_percent = Self::collect_memory();
         let disk_free_bytes = self.collect_disk_free();
 
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                return HostMetrics {
-                    available_memory_percent,
-                    process_working_set_bytes: working_set,
-                    process_private_bytes: private_bytes,
-                    disk_free_bytes,
-                    ..HostMetrics::default()
-                };
-            }
+        let Ok(mut state) = self.state.lock() else {
+            return HostMetrics {
+                available_memory_percent,
+                process_working_set_bytes: working_set,
+                process_private_bytes: private_bytes,
+                disk_free_bytes,
+                ..HostMetrics::default()
+            };
         };
         let elapsed = state
             .sampled_at
