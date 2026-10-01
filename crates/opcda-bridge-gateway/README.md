@@ -26,6 +26,20 @@ running binary without opening an OPC DA server. The client compatibility comman
 handshake for deployment checks; `GetCapabilities` remains the per-server operational capability
 endpoint and supports older clients.
 
+## Server implementation
+
+The gRPC server entry point is `src/server/mod.rs`, which keeps
+`opcda_bridge_gateway::server::BridgeService` as the public service path. The server modules divide
+responsibilities as follows:
+
+- `service.rs` contains `BridgeService` and the tonic RPC handlers.
+- `map.rs` contains protocol and error mappings.
+- `search.rs` contains bounded live namespace-search traversal.
+- `tests.rs` contains service-level tests for RPC mappings, search events and limits, and temporary
+  browse-session cleanup.
+
+Keep protocol behavior and the service's public path stable when changing this internal structure.
+
 The gateway must run on the Windows machine hosting the OPC DA server. See the repository's
 [deployment, service, and firewall guide](https://github.com/bytehound-labs/opcda-bridge/blob/main/docs/gateway-deployment.md)
 for installation and configuration, and the
