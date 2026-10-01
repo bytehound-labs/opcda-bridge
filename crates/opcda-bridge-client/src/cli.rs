@@ -352,10 +352,8 @@ mod tests {
     use opcda_bridge_proto::bridge::{
         GetGatewayInfoResponse, ProtocolFeature, ProtocolFeatureKind, WriteResponse,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn cli(command: Commands, host: String) -> Cli {
         Cli {
@@ -664,29 +662,32 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn global_flags_and_environment_parse() {
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: ENV_MUTEX is held across setup, parsing, and cleanup, preventing another
-        // test that uses this lock from interleaving environment mutations.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            std::env::set_var("OPC_BRIDGE_HOST", "envhost:8888");
-            std::env::set_var("OPC_BRIDGE_OUTPUT", "json");
+        const CHILD_MARKER: &str = "OPCDA_BRIDGE_CLIENT_CLI_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let args = Cli::try_parse_from(["opcda-bridge", "servers", "--json"]).unwrap();
+            assert_eq!(args.host.as_deref(), Some("envhost:8888"));
+            assert_eq!(args.output, Some(OutputFormat::Json));
+            assert!(args.json);
+            return;
         }
-        let args = Cli::try_parse_from(["opcda-bridge", "servers", "--json"]).unwrap();
-        assert_eq!(args.host.as_deref(), Some("envhost:8888"));
-        assert_eq!(args.output, Some(OutputFormat::Json));
-        assert!(args.json);
-        // SAFETY: The same guard is still held, and cleanup restores the variables modified
-        // during setup.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            std::env::remove_var("OPC_BRIDGE_HOST");
-            std::env::remove_var("OPC_BRIDGE_OUTPUT");
-        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::tests::global_flags_and_environment_parse",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("OPC_BRIDGE_HOST", "envhost:8888")
+            .env("OPC_BRIDGE_OUTPUT", "json")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

@@ -273,48 +273,31 @@ mod tests {
         assert!(err.to_string().contains("config file not found"));
     }
 
-    // std::env::set_var/remove_var mutate process-global state, but `cargo
-    // test` runs tests in parallel threads by default; this guards the one
-    // test below that touches real XDG_CONFIG_HOME/HOME/APPDATA env vars.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
-    #[allow(unsafe_code)]
     fn test_load_config_default_discovery_absent_env() {
-        // With none of XDG_CONFIG_HOME/HOME/APPDATA visible, discovery
-        // should yield no path and fall back to defaults without error.
-        let _guard = ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let saved = [
-            std::env::var("XDG_CONFIG_HOME").ok(),
-            std::env::var("HOME").ok(),
-            std::env::var("APPDATA").ok(),
-        ];
-        // ENV_MUTEX serializes these Rust 2024 environment mutations.
-        // SAFETY: ENV_MUTEX remains held while this test changes and restores all three values.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::remove_var("HOME");
-            std::env::remove_var("APPDATA");
+        const CHILD_MARKER: &str = "OPCDA_BRIDGE_CLIENT_CONFIG_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert_eq!(load_config(None).unwrap(), ClientConfig::default());
+            return;
         }
-        let result = load_config(None);
-        // ENV_MUTEX serializes this Rust 2024 environment mutation block.
-        // SAFETY: The same guard is still held, and each value is restored from this test's
-        // snapshot.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            for (var, value) in ["XDG_CONFIG_HOME", "HOME", "APPDATA"]
-                .iter()
-                .zip(saved.iter())
-            {
-                if let Some(v) = value {
-                    std::env::set_var(var, v);
-                }
-            }
-        }
-        assert_eq!(result.unwrap(), ClientConfig::default());
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::test_load_config_default_discovery_absent_env",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("HOME")
+            .env_remove("APPDATA")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
