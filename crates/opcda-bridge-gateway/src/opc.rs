@@ -143,6 +143,10 @@ impl Default for InventoryPacing {
     }
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait emits redundant must-use annotations for boxed futures"
+)]
 #[async_trait::async_trait]
 pub trait InventoryStream: Send {
     async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>>;
@@ -205,6 +209,10 @@ pub enum OpcValue {
     Bool(bool),
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait emits redundant must-use annotations for boxed futures"
+)]
 #[async_trait::async_trait]
 pub trait OpcClient: Send + Sync + 'static {
     async fn list_servers(&self, host: &str) -> anyhow::Result<Vec<String>>;
