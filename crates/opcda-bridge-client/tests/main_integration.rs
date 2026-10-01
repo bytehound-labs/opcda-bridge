@@ -14,6 +14,18 @@ fn test_client_help() {
 }
 
 #[test]
+fn test_client_output_environment_variable_is_parsed() {
+    let client_bin = env!("CARGO_BIN_EXE_opcda-bridge-client");
+    let output = Command::new(client_bin)
+        .arg("servers")
+        .env("OPC_BRIDGE_OUTPUT", "not-a-format")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not-a-format"));
+}
+
+#[test]
 fn test_browse_and_search_help_expose_scalable_options() {
     let client_bin = env!("CARGO_BIN_EXE_opcda-bridge-client");
     let browse = Command::new(client_bin)

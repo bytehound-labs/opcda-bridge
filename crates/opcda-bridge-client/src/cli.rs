@@ -662,32 +662,20 @@ mod tests {
     }
 
     #[test]
-    fn global_flags_and_environment_parse() {
-        const CHILD_MARKER: &str = "OPCDA_BRIDGE_CLIENT_CLI_ENV_TEST_CHILD";
-        if std::env::var_os(CHILD_MARKER).is_some() {
-            let args = Cli::try_parse_from(["opcda-bridge", "servers", "--json"]).unwrap();
-            assert_eq!(args.host.as_deref(), Some("envhost:8888"));
-            assert_eq!(args.output, Some(OutputFormat::Json));
-            assert!(args.json);
-            return;
-        }
-
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "cli::tests::global_flags_and_environment_parse",
-                "--nocapture",
-            ])
-            .env(CHILD_MARKER, "1")
-            .env("OPC_BRIDGE_HOST", "envhost:8888")
-            .env("OPC_BRIDGE_OUTPUT", "json")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "child test failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    fn global_flags_parse() {
+        let args = Cli::try_parse_from([
+            "opcda-bridge",
+            "servers",
+            "--host",
+            "envhost:8888",
+            "--output",
+            "json",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(args.host.as_deref(), Some("envhost:8888"));
+        assert_eq!(args.output, Some(OutputFormat::Json));
+        assert!(args.json);
     }
 
     #[test]

@@ -87,17 +87,27 @@ pub fn load_config(explicit_path: Option<&Path>) -> anyhow::Result<ClientConfig>
     match explicit_path {
         Some(path) => load_config_file(path, true),
         None => {
-            let path = config_path_from(
-                std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-                std::env::var("HOME").ok().as_deref(),
-                std::env::var("APPDATA").ok().as_deref(),
-                cfg!(target_os = "windows"),
-            );
-            match path {
-                Some(p) => load_config_file(&p, false),
-                None => Ok(ClientConfig::default()),
-            }
+            let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
+            let home = std::env::var("HOME").ok();
+            let appdata = std::env::var("APPDATA").ok();
+            load_config_from_env(
+                xdg_config_home.as_deref(),
+                home.as_deref(),
+                appdata.as_deref(),
+            )
         }
+    }
+}
+
+fn load_config_from_env(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+) -> anyhow::Result<ClientConfig> {
+    let path = config_path_from(xdg_config_home, home, appdata, cfg!(target_os = "windows"));
+    match path {
+        Some(path) => load_config_file(&path, false),
+        None => Ok(ClientConfig::default()),
     }
 }
 
@@ -275,28 +285,9 @@ mod tests {
 
     #[test]
     fn test_load_config_default_discovery_absent_env() {
-        const CHILD_MARKER: &str = "OPCDA_BRIDGE_CLIENT_CONFIG_ENV_TEST_CHILD";
-        if std::env::var_os(CHILD_MARKER).is_some() {
-            assert_eq!(load_config(None).unwrap(), ClientConfig::default());
-            return;
-        }
-
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "config::tests::test_load_config_default_discovery_absent_env",
-                "--nocapture",
-            ])
-            .env(CHILD_MARKER, "1")
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("HOME")
-            .env_remove("APPDATA")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "child test failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+        assert_eq!(
+            load_config_from_env(None, None, None).unwrap(),
+            ClientConfig::default()
         );
     }
 
