@@ -70,7 +70,9 @@ The workspace publishes four independently versioned crates:
 - `opcda-bridge-proto` — Protobuf schema and generated types.
 - `opcda-bridge` — reusable, typed Rust client library.
 - `opcda-bridge-client` — cross-platform CLI.
-- `opcda-bridge-gateway` — Windows OPC DA gateway and namespace index.
+- `opcda-bridge-gateway` — Windows OPC DA gateway and namespace index. Its gRPC service separates
+  RPC handling, protocol/error mappings, and live search; see the gateway crate README for the
+  source module layout.
 
 GitHub release archives are provided for the client and gateway. Package compatibility is
 negotiated through protocol and capability versions; equal package versions are not required.

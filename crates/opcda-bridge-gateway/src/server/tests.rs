@@ -1,0 +1,1461 @@
+use super::super::{map::*, search::*};
+use super::*;
+use crate::browse::MAX_PAGE_SIZE;
+use crate::config::IndexConfig;
+use crate::index::{IndexOperationError, IndexState, IndexStatus};
+use crate::opc::{
+    BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource, InventoryProgress,
+    NamespaceOrganization, OpcValue, TagValue, WriteResult,
+};
+use crate::test_support::MockOpcClient;
+use opcda_bridge_proto::bridge::{
+    BrowseRequest, BrowseSource as ProtoBrowseSource, GetCapabilitiesRequest,
+    GetGatewayInfoRequest, IndexControllerState, IndexHealthState, IndexPauseReason,
+    ListServersRequest, NamespaceOrganization as ProtoNamespaceOrganization, ProtocolFeatureKind,
+    ReadRequest, SearchCompleted, SearchIndexState, SearchMatchMode, SearchProgress, SearchRequest,
+    WriteRequest, bridge_server::Bridge, search_event::Event,
+    write_request::TypedValue as ProtoTypedValue,
+};
+use std::sync::Arc;
+use tempfile::tempdir;
+use tokio::sync::mpsc;
+
+fn service() -> BridgeService<MockOpcClient> {
+    BridgeService::new(MockOpcClient::default())
+}
+
+#[test]
+fn maps_types_and_defaults() {
+    assert_eq!(resolve_host(""), "localhost");
+    assert_eq!(resolve_host("nas"), "nas");
+    assert_eq!(
+        map_namespace_organization(NamespaceOrganization::Hierarchical),
+        ProtoNamespaceOrganization::Hierarchical
+    );
+    assert_eq!(
+        map_namespace_organization(NamespaceOrganization::Flat),
+        ProtoNamespaceOrganization::Flat
+    );
+    assert_eq!(
+        map_namespace_organization(NamespaceOrganization::Unspecified),
+        ProtoNamespaceOrganization::Unspecified
+    );
+    assert_eq!(map_browse_source(BrowseSource::Da3), ProtoBrowseSource::Da3);
+    assert_eq!(map_browse_source(BrowseSource::Da2), ProtoBrowseSource::Da2);
+    assert_eq!(
+        map_browse_source(BrowseSource::Flat),
+        ProtoBrowseSource::Flat
+    );
+    assert_eq!(
+        map_browse_source(BrowseSource::Derived),
+        ProtoBrowseSource::Derived
+    );
+    assert_eq!(
+        map_browse_source(BrowseSource::Unspecified),
+        ProtoBrowseSource::Unspecified
+    );
+    assert!(is_expandable(BrowseNodeKind::Branch));
+    assert!(is_expandable(BrowseNodeKind::BranchAndItem));
+    assert!(!is_expandable(BrowseNodeKind::Item));
+}
+
+#[test]
+fn maps_index_status_progress_matches_and_errors() {
+    for (state, expected) in [
+        (IndexState::NotIndexed, SearchIndexState::NotIndexed),
+        (IndexState::Partial, SearchIndexState::Partial),
+        (IndexState::Ready, SearchIndexState::Ready),
+        (IndexState::Stale, SearchIndexState::Stale),
+        (IndexState::Refreshing, SearchIndexState::Refreshing),
+        (IndexState::Promoting, SearchIndexState::Refreshing),
+        (IndexState::Failed, SearchIndexState::Failed),
+        (IndexState::Deleting, SearchIndexState::Deleting),
+    ] {
+        assert_eq!(map_index_state(state), expected);
+    }
+
+    let mapped = map_index_status(IndexStatus {
+        server: "S".into(),
+        state: IndexState::Promoting,
+        auto_refresh_enabled: true,
+        active_generation: 3,
+        entry_count: 5,
+        unique_item_count: 4,
+        started_at: Some("start".into()),
+        completed_at: Some("complete".into()),
+        last_error: Some("warning".into()),
+        database_bytes: 1024,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        progress: Some(InventoryProgress {
+            branches_visited: 1,
+            entries_seen: 2,
+            unique_items: 2,
+            active_time_ms: 3,
+            paused_time_ms: 4,
+            items_per_second: 5.5,
+            estimated_remaining_ms: Some(6),
+        }),
+        effective_limits: Some(crate::controller::InventoryLimits {
+            item_rate_per_second: 7,
+            batch_size: 8,
+            duty_cycle_percent: 9,
+        }),
+        controller_state: Some(crate::controller::ControllerState::Ramping),
+        pause_reason: Some(crate::controller::PauseReason::Foreground),
+        recovery_deadline: None,
+        foreground_metrics: crate::index::ForegroundMetrics::default(),
+        host_metrics: crate::controller::HostMetrics::default(),
+        health: crate::index::HealthProbeState::Healthy,
+        sentinel_configured: true,
+        storage: crate::index::StorageDiagnostics::default(),
+        scheduler: crate::index::SchedulerDiagnostics::default(),
+    });
+    assert_eq!(mapped.server, "S");
+    assert_eq!(mapped.state, SearchIndexState::Refreshing as i32);
+    assert!(mapped.promoting);
+    assert_eq!(mapped.active_generation, 3);
+    assert_eq!(mapped.entry_count, 5);
+    assert_eq!(mapped.unique_item_count, 4);
+    assert_eq!(mapped.started_at.as_deref(), Some("start"));
+    assert_eq!(mapped.completed_at.as_deref(), Some("complete"));
+    assert_eq!(mapped.last_error.as_deref(), Some("warning"));
+    assert_eq!(mapped.database_bytes, 1024);
+    assert!(mapped.health.unwrap().sentinel_configured);
+    assert_eq!(
+        mapped.organization,
+        ProtoNamespaceOrganization::Hierarchical as i32
+    );
+    assert_eq!(mapped.source, ProtoBrowseSource::Da2 as i32);
+    let progress = mapped.progress.unwrap();
+    assert_eq!(progress.branches_visited, 1);
+    assert_eq!(progress.entries_seen, 2);
+    assert_eq!(progress.unique_items, 2);
+    assert_eq!(progress.active_time_ms, 3);
+    assert_eq!(progress.paused_time_ms, 4);
+    assert_eq!(progress.items_per_second, 5.5);
+    assert_eq!(progress.estimated_remaining_ms, Some(6));
+    let limits = mapped.effective_limits.unwrap();
+    assert_eq!(limits.item_rate_per_second, 7);
+    assert_eq!(limits.batch_size, 8);
+    assert_eq!(limits.duty_cycle_percent, 9);
+    assert_eq!(
+        mapped.controller_state,
+        IndexControllerState::Ramping as i32
+    );
+    assert_eq!(
+        mapped.pause_reason,
+        Some(IndexPauseReason::Foreground as i32)
+    );
+    assert_eq!(mapped.pause_reason_detail.as_deref(), Some("foreground"));
+    assert_eq!(
+        mapped.health.unwrap().state,
+        IndexHealthState::Healthy as i32
+    );
+
+    let base = IndexStatus {
+        server: "S".into(),
+        state: IndexState::Ready,
+        auto_refresh_enabled: true,
+        active_generation: 1,
+        entry_count: 0,
+        unique_item_count: 0,
+        started_at: None,
+        completed_at: None,
+        last_error: None,
+        database_bytes: 0,
+        organization: NamespaceOrganization::Unspecified,
+        source: BrowseSource::Unspecified,
+        progress: None,
+        effective_limits: None,
+        controller_state: None,
+        pause_reason: None,
+        recovery_deadline: None,
+        foreground_metrics: crate::index::ForegroundMetrics::default(),
+        host_metrics: crate::controller::HostMetrics::default(),
+        health: crate::index::HealthProbeState::Unavailable,
+        sentinel_configured: false,
+        storage: crate::index::StorageDiagnostics::default(),
+        scheduler: crate::index::SchedulerDiagnostics::default(),
+    };
+    for (state, expected) in [
+        (
+            crate::controller::ControllerState::Ramping,
+            IndexControllerState::Ramping,
+        ),
+        (
+            crate::controller::ControllerState::Steady,
+            IndexControllerState::Steady,
+        ),
+        (
+            crate::controller::ControllerState::Throttled,
+            IndexControllerState::Throttled,
+        ),
+        (
+            crate::controller::ControllerState::Paused(crate::controller::PauseReason::Operator),
+            IndexControllerState::Paused,
+        ),
+    ] {
+        let mut status = base.clone();
+        status.controller_state = Some(state);
+        assert_eq!(map_index_status(status).controller_state, expected as i32);
+    }
+    for reason in [
+        crate::controller::PauseReason::Foreground,
+        crate::controller::PauseReason::OpcHealth,
+        crate::controller::PauseReason::HostCpu,
+        crate::controller::PauseReason::Memory,
+        crate::controller::PauseReason::Disk,
+        crate::controller::PauseReason::Database,
+        crate::controller::PauseReason::Operator,
+        crate::controller::PauseReason::Circuit,
+        crate::controller::PauseReason::Maintenance,
+    ] {
+        let mut status = base.clone();
+        status.pause_reason = Some(reason);
+        let mapped = map_index_status(status);
+        assert_eq!(mapped.pause_reason_detail.as_deref(), Some(reason.as_str()));
+        if reason == crate::controller::PauseReason::Maintenance {
+            assert_eq!(mapped.pause_reason, None);
+        } else {
+            assert!(mapped.pause_reason.is_some());
+        }
+    }
+    let mut deleting = base.clone();
+    deleting.state = IndexState::Deleting;
+    assert_eq!(
+        map_index_status(deleting).state,
+        SearchIndexState::Deleting as i32
+    );
+
+    for (health, expected) in [
+        (
+            crate::index::HealthProbeState::Unavailable,
+            IndexHealthState::Unavailable,
+        ),
+        (
+            crate::index::HealthProbeState::Healthy,
+            IndexHealthState::Healthy,
+        ),
+        (
+            crate::index::HealthProbeState::Unhealthy,
+            IndexHealthState::Unhealthy,
+        ),
+    ] {
+        let mut status = base.clone();
+        status.health = health;
+        assert_eq!(
+            map_index_status(status).health.unwrap().state,
+            expected as i32
+        );
+    }
+
+    for (kind, expected) in [
+        (
+            crate::opc::InventoryNodeKind::Item,
+            opcda_bridge_proto::bridge::BrowseNodeKind::Item,
+        ),
+        (
+            crate::opc::InventoryNodeKind::BranchAndItem,
+            opcda_bridge_proto::bridge::BrowseNodeKind::BranchAndItem,
+        ),
+    ] {
+        let mapped = map_index_match(crate::index::IndexedMatch {
+            item_id: "S.Tag".into(),
+            display_name: "Tag".into(),
+            kind,
+            breadcrumbs: vec!["S".into()],
+        });
+        assert_eq!(mapped.item_id, "S.Tag");
+        assert_eq!(mapped.display_name, "Tag");
+        assert_eq!(mapped.kind, expected as i32);
+        assert_eq!(mapped.breadcrumbs, vec!["S"]);
+    }
+
+    assert_eq!(
+        index_error(IndexOperationError::NotEnrolled { server: "S".into() }).code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        index_error(IndexOperationError::Deleting { server: "S".into() }).code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        index_error(IndexOperationError::Internal(anyhow::anyhow!(
+            "database failed"
+        )))
+        .code(),
+        tonic::Code::Internal
+    );
+}
+
+#[test]
+fn maps_wire_shapes_and_search_matching() {
+    let nodes = [
+        (BrowseNodeKind::Branch, "branch"),
+        (BrowseNodeKind::Item, "item"),
+        (BrowseNodeKind::BranchAndItem, "both"),
+    ]
+    .into_iter()
+    .map(|(kind, node_key)| BrowseNode {
+        node_key: node_key.into(),
+        display_name: node_key.into(),
+        kind,
+        item_id: Some(format!("{node_key}.item")),
+    })
+    .collect();
+    let page = map_browse_page(
+        "session".into(),
+        BrowsePage {
+            nodes,
+            next_page_token: Some("next".into()),
+            complete: false,
+            organization: NamespaceOrganization::Flat,
+            source: BrowseSource::Derived,
+            warning: Some("partial".into()),
+        },
+    );
+    assert_eq!(page.session_id, "session");
+    assert_eq!(page.nodes.len(), 3);
+    assert_eq!(page.next_page_token.as_deref(), Some("next"));
+    assert_eq!(page.organization, ProtoNamespaceOrganization::Flat as i32);
+    assert_eq!(page.source, ProtoBrowseSource::Derived as i32);
+    assert_eq!(page.warning.as_deref(), Some("partial"));
+    assert_eq!(page.nodes[0].item_id, None);
+    assert_eq!(page.nodes[1].item_id.as_deref(), Some("item.item"));
+    assert_eq!(page.nodes[2].item_id.as_deref(), Some("both.item"));
+
+    let values = map_to_proto_tag_values(
+        [
+            ("aut", "AUT"),
+            ("empty", ""),
+            ("embedded", "A\"B"),
+            ("literal-quotes", "\"AUT\""),
+        ]
+        .into_iter()
+        .map(|(tag_id, value)| TagValue {
+            tag_id: tag_id.into(),
+            value: value.into(),
+            quality: "good".into(),
+            timestamp: "now".into(),
+        })
+        .collect(),
+    );
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.tag_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aut", "empty", "embedded", "literal-quotes"]
+    );
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["AUT", "", "A\"B", "\"AUT\""]
+    );
+    assert_eq!(values[0].quality, "good");
+    assert_eq!(values[0].timestamp, "now");
+
+    let response = map_to_write_response(WriteResult {
+        tag_id: "tag".into(),
+        success: false,
+        error: Some("failed".into()),
+    });
+    assert_eq!(response.tag_id, "tag");
+    assert!(!response.success);
+    assert_eq!(response.error.as_deref(), Some("failed"));
+
+    let node = BrowseNode {
+        node_key: "opaque".into(),
+        display_name: "Temperature".into(),
+        kind: BrowseNodeKind::Item,
+        item_id: Some("device.temperature".into()),
+    };
+    assert!(search_matches(&node, "Temp", SearchMatchMode::Prefix));
+    assert!(search_matches(
+        &node,
+        "device",
+        SearchMatchMode::Unspecified
+    ));
+    assert!(!search_matches(
+        &node,
+        "pressure",
+        SearchMatchMode::Contains
+    ));
+    assert_eq!(
+        search_mode(SearchMatchMode::Exact as i32).unwrap(),
+        SearchMatchMode::Exact
+    );
+    assert_eq!(
+        search_mode(i32::MAX).unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(internal("operation failed").message(), "operation failed");
+}
+
+#[test]
+fn validates_search_modes_and_limits() {
+    let mut request = SearchRequest {
+        query: String::new(),
+        ..Default::default()
+    };
+    assert_eq!(
+        validate_search(&request).unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    request.query = "x".into();
+    request.match_mode = SearchMatchMode::Contains as i32;
+    assert_eq!(
+        validate_search(&request).unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    request.query = "xy".into();
+    request.max_results = MAX_SEARCH_RESULTS + 1;
+    assert_eq!(
+        validate_search(&request).unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    request.max_results = 0;
+    request.match_mode = SearchMatchMode::Unspecified as i32;
+    assert_eq!(
+        validate_search(&request).unwrap(),
+        (SearchMatchMode::Contains, DEFAULT_SEARCH_RESULTS)
+    );
+    request.match_mode = SearchMatchMode::Prefix as i32;
+    request.max_results = 12;
+    assert_eq!(
+        validate_search(&request).unwrap(),
+        (SearchMatchMode::Prefix, 12)
+    );
+}
+
+#[test]
+fn search_matching_preserves_exact_item_ids() {
+    let node = BrowseNode {
+        node_key: "opaque".into(),
+        display_name: "PV".into(),
+        kind: BrowseNodeKind::Item,
+        item_id: Some("FCS0201!204FI00510.PV".into()),
+    };
+    assert!(search_matches(&node, "PV", SearchMatchMode::Exact));
+    assert!(search_matches(&node, "204FI", SearchMatchMode::Contains));
+    assert!(!search_matches(&node, "MV", SearchMatchMode::Exact));
+}
+
+#[tokio::test]
+async fn capabilities_are_typed() {
+    let service = service();
+    let response = service
+        .clone()
+        .get_capabilities(Request::new(GetCapabilitiesRequest { server: "S".into() }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.protocol_version,
+        gateway_release_line().namespace_protocol.to_string()
+    );
+    assert!(response.supports_browse_sessions);
+    assert_eq!(response.max_page_size, MAX_PAGE_SIZE);
+}
+
+#[tokio::test]
+async fn gateway_info_reports_generated_protocol_contract() {
+    let response = service()
+        .get_gateway_info(Request::new(GetGatewayInfoRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.compatibility_schema_version,
+        opcda_bridge_proto::compatibility::SCHEMA_VERSION
+    );
+    assert_eq!(response.features.len(), 3);
+    assert_eq!(response.features[0].kind, ProtocolFeatureKind::Core as i32);
+    assert_eq!(
+        response.features[1].min_version,
+        opcda_bridge_proto::compatibility::NAMESPACE_PROTOCOL_VERSION
+    );
+    assert_eq!(
+        response.features[2].kind,
+        ProtocolFeatureKind::IndexedSearch as i32
+    );
+}
+
+#[tokio::test]
+async fn browse_returns_session_page_and_metadata() {
+    let response = service()
+        .browse(Request::new(BrowseRequest {
+            server: "S".into(),
+            page_size: 10,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!response.session_id.is_empty());
+    assert!(response.complete);
+}
+
+#[tokio::test]
+async fn browse_rejects_invalid_page_size() {
+    let result = service()
+        .browse(Request::new(BrowseRequest {
+            server: "S".into(),
+            page_size: MAX_PAGE_SIZE + 1,
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn browse_rejects_unknown_parent() {
+    let response = service()
+        .browse(Request::new(BrowseRequest {
+            server: "S".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let result = service()
+        .browse(Request::new(BrowseRequest {
+            server: "S".into(),
+            session_id: Some(response.session_id),
+            parent_node_key: Some("unknown".into()),
+            ..Default::default()
+        }))
+        .await;
+    assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn search_stream_emits_progress_matches_and_completion() {
+    let service = service();
+    let response = service
+        .search(Request::new(SearchRequest {
+            server: "S".into(),
+            query: "tag".into(),
+            match_mode: SearchMatchMode::Contains as i32,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let mut stream = response.into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = tokio_stream::StreamExt::next(&mut stream).await {
+        events.push(event.unwrap().event.unwrap());
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Progress(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Completed(_)))
+    );
+}
+
+#[tokio::test]
+async fn search_stream_preserves_event_order_and_payloads() {
+    let mock = MockOpcClient::default();
+    *mock.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+        nodes: vec![BrowseNode {
+            node_key: "native".into(),
+            display_name: "tag".into(),
+            kind: BrowseNodeKind::Item,
+            item_id: Some("tag.item".into()),
+        }],
+        next_page_token: None,
+        complete: true,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        warning: None,
+    });
+    let service = BridgeService::new(mock);
+    let mut stream = service
+        .search(Request::new(SearchRequest {
+            server: "S".into(),
+            query: "tag".into(),
+            match_mode: SearchMatchMode::Prefix as i32,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let events = {
+        let mut events = Vec::new();
+        while let Some(event) = tokio_stream::StreamExt::next(&mut stream).await {
+            events.push(event.unwrap().event.unwrap());
+        }
+        events
+    };
+
+    assert_eq!(events.len(), 4);
+    assert!(matches!(
+        events[0],
+        Event::Progress(SearchProgress {
+            visited_nodes: 0,
+            matches: 0,
+            partial: false,
+        })
+    ));
+    let search_match = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Match(search_match) => Some(search_match),
+            _ => None,
+        })
+        .expect("expected a match event");
+    let node = search_match.node.as_ref().expect("match node");
+    assert_eq!(node.display_name, "tag");
+    assert_eq!(node.item_id.as_deref(), Some("tag.item"));
+    assert_eq!(search_match.breadcrumbs.len(), 1);
+    assert_eq!(search_match.breadcrumbs[0].node_key, node.node_key);
+    assert_eq!(search_match.breadcrumbs[0].display_name, "tag");
+    assert!(matches!(
+        events[2],
+        Event::Progress(SearchProgress {
+            visited_nodes: 1,
+            matches: 1,
+            partial: false,
+        })
+    ));
+    assert!(matches!(
+        events[3],
+        Event::Completed(SearchCompleted {
+            complete: true,
+            cancelled: false,
+            truncated: false,
+            warning: None,
+        })
+    ));
+}
+
+#[tokio::test]
+async fn search_traverses_pages_scopes_and_deduplicates_items() {
+    let mock = MockOpcClient::default();
+    *mock.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+        nodes: vec![BrowseNode {
+            node_key: "scope-native".into(),
+            display_name: "scope".into(),
+            kind: BrowseNodeKind::Item,
+            item_id: None,
+        }],
+        next_page_token: None,
+        complete: true,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        warning: None,
+    });
+    let service = BridgeService::new(mock);
+    let initial = service
+        .browse(Request::new(BrowseRequest {
+            server: "S".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let scope_node_key = initial.nodes[0].node_key.clone();
+
+    let root_page = BrowsePage {
+        nodes: vec![
+            BrowseNode {
+                node_key: "branch-native".into(),
+                display_name: "tag-area".into(),
+                kind: BrowseNodeKind::Branch,
+                item_id: None,
+            },
+            BrowseNode {
+                node_key: "branch-item-native".into(),
+                display_name: "tag".into(),
+                kind: BrowseNodeKind::BranchAndItem,
+                item_id: Some("tag.item".into()),
+            },
+            BrowseNode {
+                node_key: "duplicate-native".into(),
+                display_name: "tag-duplicate".into(),
+                kind: BrowseNodeKind::Item,
+                item_id: Some("tag.item".into()),
+            },
+        ],
+        next_page_token: Some("native-next".into()),
+        complete: false,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        warning: None,
+    };
+    let empty_page = || BrowsePage {
+        nodes: Vec::new(),
+        next_page_token: None,
+        complete: true,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        warning: None,
+    };
+    service.client.browse_page_results.lock().unwrap().extend([
+        Ok(root_page),
+        Ok(empty_page()),
+        Ok(empty_page()),
+        Ok(empty_page()),
+    ]);
+
+    let response = service
+        .search(Request::new(SearchRequest {
+            server: "S".into(),
+            session_id: Some(initial.session_id),
+            scope_node_key: Some(scope_node_key),
+            query: "tag".into(),
+            match_mode: SearchMatchMode::Contains as i32,
+            include_branches: true,
+            refresh: true,
+            max_results: 10,
+        }))
+        .await
+        .unwrap();
+    let mut stream = response.into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = tokio_stream::StreamExt::next(&mut stream).await {
+        events.push(event.unwrap().event.unwrap());
+    }
+    let matches: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Match(value) => Some(value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(matches.len(), 2);
+    assert!(matches.iter().any(|value| value.breadcrumbs.len() == 2));
+    assert!(
+        events.iter().any(|event| {
+            matches!(event, Event::Progress(SearchProgress { partial: true, .. }))
+        })
+    );
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            Event::Completed(SearchCompleted {
+                complete: true,
+                truncated: false,
+                ..
+            })
+        )
+    }));
+}
+
+#[tokio::test]
+async fn search_truncates_at_result_limit_and_closes_temporary_session() {
+    let mock = MockOpcClient::default();
+    *mock.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+        nodes: vec![BrowseNode {
+            node_key: "native".into(),
+            display_name: "tag".into(),
+            kind: BrowseNodeKind::Item,
+            item_id: Some("tag.item".into()),
+        }],
+        next_page_token: None,
+        complete: true,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        warning: None,
+    });
+    let service = BridgeService::new(mock);
+    let mut stream = service
+        .search(Request::new(SearchRequest {
+            server: "S".into(),
+            query: "tag".into(),
+            match_mode: SearchMatchMode::Prefix as i32,
+            max_results: 1,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut completed = None;
+    while let Some(event) = tokio_stream::StreamExt::next(&mut stream).await {
+        if let Event::Completed(value) = event.unwrap().event.unwrap() {
+            completed = Some(value);
+        }
+    }
+    let completed = completed.unwrap();
+    assert!(!completed.complete);
+    assert!(completed.truncated);
+    assert_eq!(
+        completed.warning.as_deref(),
+        Some("search result limit reached")
+    );
+}
+
+#[tokio::test]
+async fn search_reports_browse_errors_and_close_errors() {
+    let mock = MockOpcClient::default();
+    *mock.browse_page_result.lock().unwrap() = Err("browse failed".into());
+    *mock.close_browse_session_result.lock().unwrap() = Err("close failed".into());
+    let service = BridgeService::new(mock);
+    let mut stream = service
+        .search(Request::new(SearchRequest {
+            server: "S".into(),
+            query: "tag".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut errors = 0;
+    while let Some(event) = tokio_stream::StreamExt::next(&mut stream).await {
+        if event.is_err() {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 1);
+}
+
+#[tokio::test]
+async fn search_handles_closed_streams_and_visit_limit() {
+    let make_request = || SearchRequest {
+        query: "tag".into(),
+        match_mode: SearchMatchMode::Contains as i32,
+        ..Default::default()
+    };
+
+    let service = service();
+    let session = service.browse.open_session("S").await.unwrap();
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    assert!(
+        run_search_inner(
+            Arc::clone(&service.browse),
+            "S",
+            &session,
+            &make_request(),
+            SearchMatchMode::Contains,
+            10,
+            &tx,
+        )
+        .await
+        .is_ok()
+    );
+
+    let mock = MockOpcClient::default();
+    *mock.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+        nodes: vec![BrowseNode {
+            node_key: "native".into(),
+            display_name: "tag".into(),
+            kind: BrowseNodeKind::Item,
+            item_id: Some("tag.item".into()),
+        }],
+        next_page_token: None,
+        complete: true,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        warning: None,
+    });
+    let service = BridgeService::new(mock);
+    let session = service.browse.open_session("S").await.unwrap();
+    let (tx, mut rx) = mpsc::channel(1);
+    let manager = Arc::clone(&service.browse);
+    let request = make_request();
+    let handle = tokio::spawn(async move {
+        run_search_inner(
+            manager,
+            "S",
+            &session,
+            &request,
+            SearchMatchMode::Contains,
+            10,
+            &tx,
+        )
+        .await
+    });
+    let _ = rx.recv().await.unwrap();
+    drop(rx);
+    assert!(handle.await.unwrap().is_ok());
+
+    let mock = MockOpcClient::default();
+    *mock.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+        nodes: vec![BrowseNode {
+            node_key: "native".into(),
+            display_name: "tag".into(),
+            kind: BrowseNodeKind::Item,
+            item_id: Some("tag.item".into()),
+        }],
+        next_page_token: None,
+        complete: true,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        warning: None,
+    });
+    let service = BridgeService::new(mock);
+    let session = service.browse.open_session("S").await.unwrap();
+    let (tx, mut rx) = mpsc::channel(1);
+    let manager = Arc::clone(&service.browse);
+    let request = make_request();
+    let handle = tokio::spawn(async move {
+        run_search_inner(
+            manager,
+            "S",
+            &session,
+            &request,
+            SearchMatchMode::Contains,
+            1,
+            &tx,
+        )
+        .await
+    });
+    let _ = rx.recv().await.unwrap();
+    let _ = rx.recv().await.unwrap();
+    drop(rx);
+    assert_eq!(
+        handle.await.unwrap().unwrap_err().code(),
+        tonic::Code::Cancelled
+    );
+
+    let service = BridgeService::new(MockOpcClient::default());
+    let session = service.browse.open_session("S").await.unwrap();
+    let (tx, mut rx) = mpsc::channel(1);
+    let manager = Arc::clone(&service.browse);
+    let request = make_request();
+    let handle = tokio::spawn(async move {
+        run_search_inner(
+            manager,
+            "S",
+            &session,
+            &request,
+            SearchMatchMode::Contains,
+            10,
+            &tx,
+        )
+        .await
+    });
+    let _ = rx.recv().await.unwrap();
+    let _ = rx.recv().await.unwrap();
+    drop(rx);
+    assert_eq!(
+        handle.await.unwrap().unwrap_err().code(),
+        tonic::Code::Cancelled
+    );
+
+    let service = BridgeService::new(MockOpcClient::default());
+    let session = service.browse.open_session("S").await.unwrap();
+    let (tx, mut rx) = mpsc::channel(1);
+    let manager = Arc::clone(&service.browse);
+    let request = make_request();
+    let handle = tokio::spawn(async move {
+        run_search_inner(
+            manager,
+            "S",
+            &session,
+            &request,
+            SearchMatchMode::Contains,
+            10,
+            &tx,
+        )
+        .await
+    });
+    let _ = rx.recv().await.unwrap();
+    drop(rx);
+    assert!(handle.await.unwrap().is_ok());
+
+    let service = BridgeService::new(MockOpcClient::default());
+    let session = service.browse.open_session("S").await.unwrap();
+    let (tx, mut rx) = mpsc::channel(1);
+    let manager = Arc::clone(&service.browse);
+    let request = make_request();
+    let handle = tokio::spawn(async move {
+        run_search_inner(
+            manager,
+            "S",
+            &session,
+            &request,
+            SearchMatchMode::Contains,
+            10,
+            &tx,
+        )
+        .await
+    });
+    let _ = rx.recv().await.unwrap();
+    let _ = rx.recv().await.unwrap();
+    drop(rx);
+    assert_eq!(
+        handle.await.unwrap().unwrap_err().code(),
+        tonic::Code::Cancelled
+    );
+
+    let mock = MockOpcClient::default();
+    *mock.browse_page_result.lock().unwrap() = Ok(BrowsePage {
+        nodes: (0..MAX_SEARCH_VISITED)
+            .map(|index| BrowseNode {
+                node_key: format!("node-{index}"),
+                display_name: "not-a-match".into(),
+                kind: BrowseNodeKind::Item,
+                item_id: None,
+            })
+            .collect(),
+        next_page_token: None,
+        complete: true,
+        organization: NamespaceOrganization::Hierarchical,
+        source: BrowseSource::Da2,
+        warning: None,
+    });
+    let service = BridgeService::new(mock);
+    let session = service.browse.open_session("S").await.unwrap();
+    let (tx, mut rx) = mpsc::channel(2);
+    run_search_inner(
+        Arc::clone(&service.browse),
+        "S",
+        &session,
+        &make_request(),
+        SearchMatchMode::Contains,
+        10,
+        &tx,
+    )
+    .await
+    .unwrap();
+    let _ = rx.recv().await.unwrap();
+    let completed = rx.recv().await.unwrap().unwrap().event.unwrap();
+    assert!(matches!(
+        completed,
+        Event::Completed(SearchCompleted {
+            truncated: true,
+            warning: Some(_),
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn search_rejects_invalid_query() {
+    let result = service()
+        .search(Request::new(SearchRequest::default()))
+        .await;
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn indexed_search_handlers_validate_map_and_execute_requests() {
+    let directory = tempdir().unwrap();
+    let config = GatewayConfig {
+        index: IndexConfig {
+            database_path: Some(
+                directory
+                    .path()
+                    .join("index.sqlite3")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            enabled: Some(false),
+            ..IndexConfig::default()
+        },
+        ..GatewayConfig::default()
+    };
+    let service = BridgeService::with_index_config(MockOpcClient::default(), &config);
+    service.start_background_indexing();
+
+    let status = service
+        .get_search_index_status(Request::new(GetSearchIndexStatusRequest {
+            server: "S".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.state, SearchIndexState::NotIndexed as i32);
+
+    assert_eq!(
+        service
+            .control_search_index(Request::new(ControlSearchIndexRequest {
+                server: "S".into(),
+                action: i32::MAX,
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .control_search_index(Request::new(ControlSearchIndexRequest {
+                server: "S".into(),
+                action: SearchIndexControlAction::Unspecified as i32,
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .search_index(Request::new(SearchIndexRequest {
+                server: "S".into(),
+                query: "mock".into(),
+                match_mode: i32::MAX,
+                max_results: 10,
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .refresh_search_index(Request::new(RefreshSearchIndexRequest {
+                server: "Other".into(),
+                force: true,
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    service
+        .refresh_search_index(Request::new(RefreshSearchIndexRequest {
+            server: "S".into(),
+            force: true,
+        }))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if service.index.status("S").await.unwrap().state == IndexState::Ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        service.index.status("S").await.unwrap().state,
+        IndexState::Ready
+    );
+
+    let result = service
+        .search_index(Request::new(SearchIndexRequest {
+            server: "S".into(),
+            query: "mock".into(),
+            match_mode: SearchMatchMode::Contains as i32,
+            max_results: 10,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].item_id, "Mock.Tag");
+    assert_eq!(result.status.unwrap().state, SearchIndexState::Ready as i32);
+
+    let controlled = service
+        .control_search_index(Request::new(ControlSearchIndexRequest {
+            server: "S".into(),
+            action: SearchIndexControlAction::Resume as i32,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(controlled.state, SearchIndexState::Ready as i32);
+    let disabled = service
+        .control_search_index(Request::new(ControlSearchIndexRequest {
+            server: "S".into(),
+            action: SearchIndexControlAction::DisableAutoRefresh as i32,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!disabled.configured);
+    let deleted = service
+        .control_search_index(Request::new(ControlSearchIndexRequest {
+            server: "S".into(),
+            action: SearchIndexControlAction::Delete as i32,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(deleted.state, SearchIndexState::Deleting as i32);
+    assert!(!deleted.configured);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = service
+                .get_search_index_status(Request::new(GetSearchIndexStatusRequest {
+                    server: "S".into(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            if status.state == SearchIndexState::NotIndexed as i32 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    service.shutdown_background_indexing().await;
+}
+
+#[tokio::test]
+async fn close_session_and_read_write_paths_work() {
+    let service = service();
+    let page = service
+        .browse(Request::new(BrowseRequest {
+            server: "S".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    service
+        .close_browse_session(Request::new(CloseBrowseSessionRequest {
+            session_id: page.session_id,
+        }))
+        .await
+        .unwrap();
+
+    let read = service
+        .read(Request::new(ReadRequest {
+            server: "S".into(),
+            tag_ids: vec!["tag".into()],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(read.values.is_empty());
+    let write = service
+        .write(Request::new(WriteRequest {
+            server: "S".into(),
+            tag_id: "tag".into(),
+            typed_value: Some(ProtoTypedValue::BoolValue(true)),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(write.success);
+}
+
+#[tokio::test]
+async fn handlers_map_values_and_surface_client_errors() {
+    let mock = MockOpcClient::default();
+    *mock.capabilities_result.lock().unwrap() = Ok(BrowseCapabilities {
+        organization: NamespaceOrganization::Unspecified,
+        source: BrowseSource::Flat,
+        supports_browse_sessions: false,
+        supports_search: true,
+        max_page_size: 10,
+    });
+    *mock.list_servers_result.lock().unwrap() = Ok(vec!["one".into(), "two".into()]);
+    *mock.read_tag_values_result.lock().unwrap() = Ok(vec![TagValue {
+        tag_id: "tag".into(),
+        value: "value".into(),
+        quality: "good".into(),
+        timestamp: "timestamp".into(),
+    }]);
+    *mock.write_tag_value_result.lock().unwrap() = Ok(WriteResult {
+        tag_id: "tag".into(),
+        success: false,
+        error: Some("bad value".into()),
+    });
+    let service = BridgeService::new(mock);
+
+    let capabilities = service
+        .get_capabilities(Request::new(GetCapabilitiesRequest { server: "S".into() }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        capabilities.organization,
+        ProtoNamespaceOrganization::Unspecified as i32
+    );
+    assert_eq!(capabilities.source, ProtoBrowseSource::Flat as i32);
+    assert!(!capabilities.supports_browse_sessions);
+
+    let servers = service
+        .list_servers(Request::new(ListServersRequest {
+            host: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(servers.servers, vec!["one", "two"]);
+
+    let read = service
+        .read(Request::new(ReadRequest {
+            server: "S".into(),
+            tag_ids: vec!["tag".into()],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.values[0].tag_id, "tag");
+    assert_eq!(read.values[0].value, "value");
+
+    for typed_value in [
+        ProtoTypedValue::StringValue("text".into()),
+        ProtoTypedValue::IntValue(1),
+        ProtoTypedValue::FloatValue(1.5),
+        ProtoTypedValue::BoolValue(true),
+    ] {
+        let write = service
+            .write(Request::new(WriteRequest {
+                server: "S".into(),
+                tag_id: "tag".into(),
+                typed_value: Some(typed_value),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(write.error.as_deref(), Some("bad value"));
+    }
+
+    let mock = MockOpcClient::default();
+    *mock.capabilities_result.lock().unwrap() = Err("capabilities failed".into());
+    assert_eq!(
+        BridgeService::new(mock)
+            .get_capabilities(Request::new(GetCapabilitiesRequest { server: "S".into() }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Internal
+    );
+
+    let mock = MockOpcClient::default();
+    *mock.list_servers_result.lock().unwrap() = Err("list failed".into());
+    assert_eq!(
+        BridgeService::new(mock)
+            .list_servers(Request::new(ListServersRequest {
+                host: "host".into(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Internal
+    );
+
+    let mock = MockOpcClient::default();
+    *mock.read_tag_values_result.lock().unwrap() = Err("read failed".into());
+    assert_eq!(
+        BridgeService::new(mock)
+            .read(Request::new(ReadRequest {
+                server: "S".into(),
+                tag_ids: vec![],
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Internal
+    );
+
+    let mock = MockOpcClient::default();
+    *mock.write_tag_value_result.lock().unwrap() = Err("write failed".into());
+    assert_eq!(
+        BridgeService::new(mock)
+            .write(Request::new(WriteRequest {
+                server: "S".into(),
+                tag_id: "tag".into(),
+                typed_value: Some(ProtoTypedValue::StringValue("value".into())),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Internal
+    );
+
+    let mock = MockOpcClient::default();
+    *mock.open_browse_session_result.lock().unwrap() = Err("open failed".into());
+    assert_eq!(
+        BridgeService::new(mock)
+            .browse(Request::new(BrowseRequest {
+                server: "S".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
+
+    let mock = MockOpcClient::default();
+    mock.browse_page_results
+        .lock()
+        .unwrap()
+        .push_back(Err("queued browse failed".into()));
+    assert!(
+        mock.browse_page("native", None, None, 10, false)
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn map_capabilities_clamps_page_size() {
+    let status = IndexStatus {
+        server: "S".into(),
+        state: IndexState::NotIndexed,
+        auto_refresh_enabled: false,
+        active_generation: 0,
+        entry_count: 0,
+        unique_item_count: 0,
+        started_at: None,
+        completed_at: None,
+        last_error: None,
+        database_bytes: 0,
+        organization: NamespaceOrganization::Unspecified,
+        source: BrowseSource::Unspecified,
+        progress: None,
+        effective_limits: None,
+        controller_state: None,
+        pause_reason: None,
+        recovery_deadline: None,
+        foreground_metrics: crate::index::ForegroundMetrics::default(),
+        host_metrics: crate::controller::HostMetrics::default(),
+        health: crate::index::HealthProbeState::Unavailable,
+        sentinel_configured: false,
+        storage: crate::index::StorageDiagnostics::default(),
+        scheduler: crate::index::SchedulerDiagnostics::default(),
+    };
+    let response = map_capabilities(
+        BrowseCapabilities {
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+            supports_browse_sessions: true,
+            supports_search: false,
+            max_page_size: u32::MAX,
+        },
+        &status,
+        50,
+    );
+    assert_eq!(response.max_page_size, MAX_PAGE_SIZE);
+
+    let legacy_release_line = opcda_bridge_proto::compatibility::release_line_for("0.3.1").unwrap();
+    let legacy_response = map_capabilities_for_release_line(
+        BrowseCapabilities {
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+            supports_browse_sessions: true,
+            supports_search: false,
+            max_page_size: MAX_PAGE_SIZE,
+        },
+        &status,
+        50,
+        legacy_release_line,
+    );
+    assert!(!legacy_response.supports_indexed_search);
+    assert!(legacy_response.indexed_search_protocol_version.is_empty());
+}
+
+#[test]
+fn typed_value_missing_is_invalid() {
+    assert_eq!(
+        typed_value_to_opc_value(None).unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        typed_value_to_opc_value(Some(ProtoTypedValue::IntValue(-1))).unwrap(),
+        OpcValue::Int(-1)
+    );
+}

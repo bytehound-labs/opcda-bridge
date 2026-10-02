@@ -36,6 +36,20 @@ operations. Browse sessions and continuation state stay on the gateway: clients 
 session, node, and page tokens back unchanged. A browsed node's display label is separate from its
 exact OPC ItemID, which remains the identifier for reads and writes.
 
+## Gateway server modules
+
+The gateway crate keeps its public server entry point in
+`crates/opcda-bridge-gateway/src/server/mod.rs`, which re-exports
+`opcda_bridge_gateway::server::BridgeService`. The implementation is divided into:
+
+- `service.rs` for service construction and tonic RPC handlers.
+- `map.rs` for protocol and error conversions.
+- `search.rs` for bounded live namespace-search traversal.
+- `tests.rs` for service-level behavior tests.
+
+These are internal boundaries; the gRPC protocol, public `BridgeService` path, and handler behavior
+remain defined by the gateway contract.
+
 The optional SQLite index stores namespace metadata such as exact ItemIDs, display names, node
 kinds, and breadcrumbs. It does not store live tag values. Indexed search operates on a completed
 generation and is separate from live browse, read, and write paths.
