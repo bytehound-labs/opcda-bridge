@@ -644,9 +644,9 @@ dependencies = [
 
 [[package]]
 name = "lazy_static"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libc"
@@ -802,7 +802,7 @@ dependencies = [
  "opcda-bridge 0.4.3",
  "opcda-bridge 0.5.1",
  "opcda-bridge-gateway 0.3.2",
- "opcda-bridge-gateway 0.5.10",
+ "opcda-bridge-gateway 0.5.11",
  "opcda-bridge-proto 0.3.2",
  "opcda-bridge-proto 0.4.3",
  "opcda-bridge-proto 0.5.0",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "anyhow",
  "async-trait",
