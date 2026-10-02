@@ -1,4 +1,18 @@
-use super::*;
+use super::{
+    BuildFileLock, DbStatus, Enrollment, IndexDb, IndexManager, SCHEMA_VERSION, StorageDiagnostics,
+    StoredIndexProfile, namespace_string, node_kind_number, normalize_query, parse_namespace,
+    parse_source, source_string, status, timestamp_now,
+};
+use crate::opc::{
+    BrowseSource, InventoryEntry, InventoryProgress, NamespaceOrganization, OpcClient,
+};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use std::fs;
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 impl<C: OpcClient> IndexManager<C> {
     #[cfg(test)]
