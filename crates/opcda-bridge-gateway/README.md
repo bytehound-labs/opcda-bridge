@@ -40,6 +40,16 @@ responsibilities as follows:
 
 Keep protocol behavior and the service's public path stable when changing this internal structure.
 
+The persistent index implementation keeps its public API and shared runtime state in `index.rs`,
+with focused modules for:
+
+- `index/enrollment.rs` — server enrollment, lifecycle controls, and refresh admission.
+- `index/scheduler.rs` — scheduled refresh, retry policy, build coordination, and cleanup workers.
+- `index/traversal.rs` — inventory coordination, traversal, health gates, and build finalization.
+- `index/store.rs` — SQLite schema, migrations, generation writes, and promotion.
+- `index/query.rs` — indexed search, candidate ranking, and the search cache.
+- `index/status.rs` — index status, foreground metrics, and storage diagnostics.
+
 The gateway must run on the Windows machine hosting the OPC DA server. See the repository's
 [deployment, service, and firewall guide](https://github.com/bytehound-labs/opcda-bridge/blob/main/docs/gateway-deployment.md)
 for installation and configuration, and the
