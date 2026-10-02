@@ -2,19 +2,18 @@
 
 use crate::config::ResolvedIndexConfig;
 use crate::controller::{
-    AdaptiveIndexController, ControllerConfig, ControllerObservation, HostMetrics,
-    HostMetricsProvider, InventoryLimits, default_host_metrics_provider,
+    AdaptiveIndexController, HostMetrics, HostMetricsProvider, InventoryLimits,
+    default_host_metrics_provider,
 };
 use crate::opc::{
     BrowseSource, InventoryCompleted, InventoryControl, InventoryEntry, InventoryEvent,
-    InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress, InventorySliceBackend,
-    InventorySliceObservation, InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE,
-    NamespaceOrganization, OpcClient,
+    InventoryNodeKind, InventoryPacing, InventoryProgress, InventorySliceBackend,
+    InventorySliceObservation, NamespaceOrganization, OpcClient,
 };
 use chrono::{DateTime, Local, Timelike};
 use fs2::FileExt;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use rusqlite::Connection;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{Seek, SeekFrom, Write};
@@ -23,7 +22,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use uuid::Uuid;
 
 mod enrollment;
 mod query;
@@ -1801,14 +1799,17 @@ fn node_kind_number(value: InventoryNodeKind) -> i64 {
 mod tests {
     use super::*;
     use super::{query::*, scheduler::*, status::*, store::*, traversal::*};
+    use crate::controller::ControllerObservation;
     use crate::opc::{
         BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, InventoryCompleted,
-        InventoryEntry, InventoryEvent, InventorySliceBackend, InventorySliceObservation,
-        InventoryStream, OpcValue, TagValue, WriteResult,
+        InventoryEntry, InventoryEvent, InventoryHandle, InventorySliceBackend,
+        InventorySliceObservation, InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE, OpcValue,
+        TagValue, WriteResult,
     };
     use crate::test_support::MockOpcClient;
     use chrono::TimeZone;
     use proptest::prelude::*;
+    use rusqlite::params;
     use std::collections::{HashMap, VecDeque};
     use std::error::Error;
     use std::sync::Arc;

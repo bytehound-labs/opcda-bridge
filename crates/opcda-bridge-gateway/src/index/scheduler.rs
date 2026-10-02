@@ -1,4 +1,23 @@
-use super::*;
+#[cfg(test)]
+use super::BuildReservationHook;
+use super::{
+    BackgroundTasks, CLEANUP_BATCH_PAUSE, CLEANUP_BATCH_SIZE, CLEANUP_RETRY_INITIAL_BACKOFF,
+    CLEANUP_RETRY_LIMIT, CleanupAttempt, CleanupBatch, CleanupBatchResult, CleanupStats,
+    CleanupTaskState, CleanupWorkerGuard, DATABASE_COORDINATIONS, DatabaseCoordination, IndexDb,
+    IndexManager, IndexState, IndexStatus, QueryCache, RETRY_INITIAL_BACKOFF, RETRY_MAX_BACKOFF,
+    default_host_metrics_provider, index_profile_is_compatible, maintenance_window_active,
+    parse_maintenance_windows, parse_timestamp,
+};
+use crate::config::ResolvedIndexConfig;
+use crate::opc::OpcClient;
+use chrono::Local;
+use rusqlite::{Connection, params};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
 impl<C: OpcClient> IndexManager<C> {
     pub fn new(client: Arc<C>, settings: ResolvedIndexConfig) -> Self {

@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    CacheKey, IndexDb, IndexManager, IndexState, IndexedMatch, IndexedSearch, SearchCandidate,
+    SearchRank, normalize_query,
+};
+use crate::opc::{InventoryNodeKind, OpcClient};
+use rusqlite::{OptionalExtension, params};
+use std::collections::{BinaryHeap, HashMap};
+use std::path::Path;
+use std::time::Instant;
 
 impl<C: OpcClient> IndexManager<C> {
     #[cfg(test)]
