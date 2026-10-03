@@ -3,6 +3,10 @@
 Windows gateway that exposes native OPC DA (COM/DCOM) servers over the network to
 [`opcda-bridge-client`](https://github.com/bytehound-labs/opcda-bridge) and other gRPC clients.
 
+The native COM adapter uses the separate
+[`bytehound-opc-da-client`](https://github.com/bytehound-labs/opc-cli) crate, maintained outside
+this workspace.
+
 The supported Windows gateway target is 32-bit x86
 (`i686-pc-windows-msvc`), including on 64-bit Windows. This is deliberate: the gateway loads
 native OPC DA/COM components alongside the server, and legacy installations may expose those

@@ -19,6 +19,12 @@ expand it into a generic industrial-protocol gateway.
   Do not substitute a host-target x64 build.
 - Do not create intermediate releases, tags, or publications. Release changes go through the
   approved release workflow.
+- The native dependency `bytehound-opc-da-client` is maintained in
+  [`bytehound-labs/opc-cli`](https://github.com/bytehound-labs/opc-cli), outside this workspace.
+  Its `Publish ByteHound OPC DA client` workflow and protected `crates-publish` environment are
+  the sole publication path. Do not add a duplicate publisher here or bypass that environment.
+  This repository's `release-plz` workflow publishes workspace crates; `release.yml` builds
+  binary archives.
 - Keep the deployment threat model accurate; see
   [gateway deployment](docs/gateway-deployment.md), [indexing operations](docs/indexing-and-search.md),
   and [the security policy](SECURITY.md).
@@ -31,6 +37,8 @@ expand it into a generic industrial-protocol gateway.
   the required checks pass. Do not change the local Git identity.
 - Add or update user-facing documentation with behavior, configuration, protocol, safety, or
   operational changes. Generated compatibility reports are not hand-edited.
+- Preserve the branch-protection required status contexts: `check`, `coverage`,
+  `release-integrity`, and `Required Sonar quality status`.
 - Never commit secrets, credentials, machine-local state, caches, build output, or temporary
   artifacts.
 - Protocol changes must preserve published Protobuf names, field numbers, and wire types. An

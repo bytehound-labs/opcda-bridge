@@ -22,13 +22,13 @@ the reusable library version implementing its protocol contract.
 
 Compatibility results have these meanings:
 
-| Result | Meaning |
-| --- | --- |
-| `full` | All advertised and required features overlap |
-| `partial` | Core read/write operations overlap, but an optional feature does not |
-| `incompatible` | Core compatibility or a required feature is unavailable |
-| `unknown` | The gateway cannot describe its protocol |
-| `unverified` | Protocol ranges overlap, but the exact package pair has no recorded test evidence |
+| Result         | Meaning                                                                           |
+| -------------- | --------------------------------------------------------------------------------- |
+| `full`         | All advertised and required features overlap                                      |
+| `partial`      | Core read/write operations overlap, but an optional feature does not              |
+| `incompatible` | Core compatibility or a required feature is unavailable                           |
+| `unknown`      | The gateway cannot describe its protocol                                          |
+| `unverified`   | Protocol ranges overlap, but the exact package pair has no recorded test evidence |
 
 Overlapping but unverified pairs remain usable. Optional features can be unsupported while core
 read/write operations remain compatible.
@@ -39,11 +39,11 @@ The canonical catalog is
 [`crates/opcda-bridge-proto/compatibility.toml`](../crates/opcda-bridge-proto/compatibility.toml).
 It defines the supported ranges for:
 
-| Feature | Contract | Operations |
-| --- | ---: | --- |
-| Core | 1 | Server discovery, reads, and writes |
-| Namespace | 2 | Capabilities, paged browse, browse sessions, and live search |
-| Indexed search | 2 | Durable on-demand index enrollment, search, and per-server scheduling controls |
+| Feature        | Contract | Operations                                                                     |
+| -------------- | -------: | ------------------------------------------------------------------------------ |
+| Core           |        1 | Server discovery, reads, and writes                                            |
+| Namespace      |        2 | Capabilities, paged browse, browse sessions, and live search                   |
+| Indexed search |        2 | Durable on-demand index enrollment, search, and per-server scheduling controls |
 
 The generated [compatibility report](../COMPATIBILITY.md) and
 [machine-readable compatibility catalog](../compatibility.json) are derived from that source.
@@ -52,11 +52,11 @@ generated output.
 
 The catalog's release lines are:
 
-| Release line | Package versions | Protocol boundary |
-| --- | --- | --- |
-| `legacy` | 0.1.0 through 0.3.1 | Core 1, original streaming browse |
-| `paged` | 0.3.2 through 0.3.999 | Core 1 and namespace 2 |
-| `indexed` | 0.4.0 through 0.4.999 | Core 1, namespace 2, indexed search 1 |
+| Release line        | Package versions        | Protocol boundary                     |
+| ------------------- | ----------------------- | ------------------------------------- |
+| `legacy`            | 0.1.0 through 0.3.1     | Core 1, original streaming browse     |
+| `paged`             | 0.3.2 through 0.3.999   | Core 1 and namespace 2                |
+| `indexed`           | 0.4.0 through 0.4.999   | Core 1, namespace 2, indexed search 1 |
 | `indexed-on-demand` | 0.5.0 through 0.999.999 | Core 1, namespace 2, indexed search 2 |
 
 The 0.5 indexed-search boundary changes index lifecycle semantics to durable on-demand enrollment
@@ -85,8 +85,9 @@ OPC DA `VT_BSTR` contents are preserved without display quoting.
 
 ## Versioning and protocol changes
 
-All four crates publish to crates.io. Each has its own version; GitHub Releases and binary archives
-are produced for the client and gateway. A client release does not need a matching gateway release.
+All four workspace crates publish to crates.io. Each has its own version; GitHub Releases and
+binary archives are produced for the client and gateway. A client release does not need a matching
+gateway release.
 
 The three published Rust libraries are pre-1.0. Adding a public Rust struct field can break
 downstream struct literals even when the Protobuf wire change is additive. Such a public API break

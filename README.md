@@ -50,14 +50,14 @@ opcda-bridge-client --host 192.168.1.50:7600 compatibility
 
 ## Documentation
 
-| Topic | Guide |
-| --- | --- |
-| Components and request flow | [Architecture](docs/architecture.md) |
-| Windows setup, service, and firewall | [Gateway deployment](docs/gateway-deployment.md) |
-| Persistent index operations and large-namespace acceptance | [Indexing and search](docs/indexing-and-search.md) |
-| Protocol negotiation and package compatibility | [Protocol and compatibility](docs/protocol-and-compatibility.md) |
-| Common connection, browse, and index issues | [Troubleshooting](docs/troubleshooting.md) |
-| Package releases and artifact verification | [Release and package verification](docs/release.md) |
+| Topic                                                      | Guide                                                            |
+| ---------------------------------------------------------- | ---------------------------------------------------------------- |
+| Components and request flow                                | [Architecture](docs/architecture.md)                             |
+| Windows setup, service, and firewall                       | [Gateway deployment](docs/gateway-deployment.md)                 |
+| Persistent index operations and large-namespace acceptance | [Indexing and search](docs/indexing-and-search.md)               |
+| Protocol negotiation and package compatibility             | [Protocol and compatibility](docs/protocol-and-compatibility.md) |
+| Common connection, browse, and index issues                | [Troubleshooting](docs/troubleshooting.md)                       |
+| Package releases and artifact verification                 | [Release and package verification](docs/release.md)              |
 
 The generated [compatibility report](COMPATIBILITY.md) and
 [machine-readable catalog](compatibility.json) describe protocol release lines and test evidence.
@@ -73,6 +73,10 @@ The workspace publishes four independently versioned crates:
 - `opcda-bridge-gateway` — Windows OPC DA gateway and namespace index. Its gRPC service separates
   RPC handling, protocol/error mappings, and live search; see the gateway crate README for the
   source module layout.
+
+The gateway's native OPC DA/COM adapter uses the separate
+[`bytehound-opc-da-client`](https://github.com/bytehound-labs/opc-cli) crate, which is maintained
+outside this workspace.
 
 GitHub release archives are provided for the client and gateway. Package compatibility is
 negotiated through protocol and capability versions; equal package versions are not required.
