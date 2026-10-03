@@ -179,9 +179,9 @@ dependencies = [
 
 [[package]]
 name = "bytehound-opc-da-client"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d480bd776f1b0ba01895fb7409178ec739916cd7559ccdef5e92f54844d5b63"
+checksum = "5dd1c94f4d014493b16585909bb0a95ce06bbedbebba296d37667ab906163cb5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -842,7 +842,7 @@ version = "0.5.11"
 dependencies = [
  "anyhow",
  "async-trait",
- "bytehound-opc-da-client 0.3.0",
+ "bytehound-opc-da-client 0.3.1",
  "chrono",
  "clap",
  "fs2",

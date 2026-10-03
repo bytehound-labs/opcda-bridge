@@ -76,7 +76,8 @@ The workspace publishes four independently versioned crates:
 
 The gateway's native OPC DA/COM adapter uses the separate
 [`bytehound-opc-da-client`](https://github.com/bytehound-labs/opc-cli) crate, which is maintained
-outside this workspace.
+outside this workspace. Gateway builds require version 0.3.1 or later for correct Browse
+marshalling when no property IDs are requested.
 
 GitHub release archives are provided for the client and gateway. Package compatibility is
 negotiated through protocol and capability versions; equal package versions are not required.
