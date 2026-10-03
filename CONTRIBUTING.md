@@ -178,6 +178,12 @@ The release workflow proposes a separate `release-plz-*` pull request for any ge
 compatibility-test lockfile update; that change follows the normal checks and auto-merge path
 instead of being pushed directly to `main`.
 
+The gateway's native COM dependency, `bytehound-opc-da-client`, is maintained in
+[`bytehound-labs/opc-cli`](https://github.com/bytehound-labs/opc-cli), outside this workspace. Its
+`Publish ByteHound OPC DA client` workflow there verifies the selected commit; publication is
+available only through that repository's protected `crates-publish` environment. Do not add a
+second publisher for this crate here.
+
 Versioning follows Cargo's rules for `0.x` crates, where a minor version bump marks a breaking
 release. A pull request that breaks the public API of `opcda-bridge`, `opcda-bridge-proto`, or
 `opcda-bridge-client`, including adding a field to a public struct that callers can construct with

@@ -2,11 +2,11 @@
 
 The workspace contains four independently versioned crates:
 
-| Package | Distribution |
-| --- | --- |
-| `opcda-bridge-proto` | crates.io |
-| `opcda-bridge` | crates.io |
-| `opcda-bridge-client` | crates.io and platform release archives |
+| Package                | Distribution                                      |
+| ---------------------- | ------------------------------------------------- |
+| `opcda-bridge-proto`   | crates.io                                         |
+| `opcda-bridge`         | crates.io                                         |
+| `opcda-bridge-client`  | crates.io and platform release archives           |
 | `opcda-bridge-gateway` | crates.io and the Windows gateway release archive |
 
 Client and gateway package versions do not need to match. Runtime compatibility comes from the
@@ -28,6 +28,13 @@ A manual dispatch of the **Release** workflow builds dry-run packages and upload
 workflow artifacts without creating a GitHub Release. This is a packaging check, not a release or
 publication. The separate **Release-plz** workflow includes the release/publish path and is not a
 dry-run control; dispatch it only as part of an approved release operation.
+
+The gateway's native Windows dependency, `bytehound-opc-da-client`, is not one of this workspace's
+four crates. It is maintained and published in
+[`bytehound-labs/opc-cli`](https://github.com/bytehound-labs/opc-cli) by that repository's
+**Publish ByteHound OPC DA client** workflow. The workflow tests and dry-runs the exact selected
+commit on Windows. A real publish runs only when `dry_run` is false and uses the protected
+`crates-publish` environment. Do not add or use a second publisher from this repository.
 
 ## Release integrity
 
