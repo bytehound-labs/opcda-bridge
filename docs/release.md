@@ -35,6 +35,8 @@ four crates. It is maintained and published in
 **Publish ByteHound OPC DA client** workflow. The workflow tests and dry-runs the exact selected
 commit on Windows. A real publish runs only when `dry_run` is false and uses the protected
 `crates-publish` environment. Do not add or use a second publisher from this repository.
+Gateway builds require client version 0.3.1 or later: version 0.3.0 marshals Browse requests with
+zero property IDs using a null pointer, which the RPC boundary rejects.
 
 ## Release integrity
 
