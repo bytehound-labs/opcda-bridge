@@ -71,8 +71,9 @@ The workspace publishes four independently versioned crates:
 - `opcda-bridge` — reusable, typed Rust client library.
 - `opcda-bridge-client` — cross-platform CLI.
 - `opcda-bridge-gateway` — Windows OPC DA gateway and namespace index. Its gRPC service separates
-  RPC handling, protocol/error mappings, and live search; see the gateway crate README for the
-  source module layout.
+  RPC handling, protocol/error mappings, and live search. The index keeps a stable facade over
+  focused enrollment, scheduling, traversal, storage, query, and status modules; the gateway crate
+  README describes their responsibilities.
 
 The gateway's native OPC DA/COM adapter uses the separate
 [`bytehound-opc-da-client`](https://github.com/bytehound-labs/opc-cli) crate, which is maintained

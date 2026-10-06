@@ -1,26 +1,601 @@
 use super::{
-    BuildEventOutcome, BuildFinalizationContext, BuildFinalizationGuard, BuildLoopOutcome,
-    BuildReadiness, BuildRunState, CoordinatedInventoryControl, CoordinatedInventoryStream,
-    ForegroundMetrics, HealthProbeAction, HealthProbeObservation, HealthProbeState,
-    HealthSentinelObservation, IndexManager, InventoryRootPlan, MaintenanceWindow,
-    PauseOverlayState, RuntimeBuild, RuntimeState, WorkerEventAction, WorkerFinishedGuard,
-    WorkerInventoryMessage, instant_timestamp, maintenance_window_active,
-    parse_maintenance_windows, scheduler, timestamp_now, wait_with_cancellation,
+    ForegroundMetrics, HealthProbeState, IndexManager, MaintenanceWindow, PauseOverlayState,
+    RuntimeBuild, RuntimeState, instant_timestamp, maintenance_window_active,
+    parse_maintenance_windows, percentile, scheduler, timestamp_now, wait_with_cancellation,
 };
+use crate::config::ResolvedIndexConfig;
 use crate::controller::{
     AdaptiveIndexController, ControllerConfig, ControllerObservation, InventoryLimits,
 };
 use crate::opc::{
     BrowseSource, InventoryCompleted, InventoryControl, InventoryEntry, InventoryEvent,
-    InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress,
+    InventoryHandle, InventoryNodeKind, InventoryPacing, InventoryProgress, InventorySliceBackend,
     InventorySliceObservation, InventoryStream, MAX_NATIVE_INVENTORY_BATCH_SIZE,
     NamespaceOrganization, OpcClient,
 };
 use chrono::Local;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+pub(super) struct HealthProbeObservation {
+    pub(super) healthy: bool,
+    pub(super) failure_reason: String,
+    pub(super) sentinel_configured: bool,
+}
+
+pub(super) struct HealthSentinelObservation {
+    pub(super) healthy: bool,
+    pub(super) failure_reason: Option<String>,
+}
+
+pub(super) struct BuildRunState {
+    pub(super) pending: Vec<InventoryEntry>,
+    pub(super) last_progress: InventoryProgress,
+    pub(super) telemetry: BuildTelemetry,
+    pub(super) completed: bool,
+    pub(super) cancelled: bool,
+    pub(super) failed: Option<String>,
+    pub(super) completion_warning: Option<String>,
+    pub(super) completion_profile: Option<(NamespaceOrganization, BrowseSource)>,
+    pub(super) terminal: bool,
+    pub(super) accounted_active_time_ms: u64,
+    pub(super) persisted_item_count: u64,
+    pub(super) drained_event_count: u64,
+    pub(super) received_entry_count: u64,
+    pub(super) rate_limiter: ItemRateLimiter,
+    pub(super) controller: Option<AdaptiveIndexController>,
+    pub(super) effective_duty_cycle_percent: u8,
+    pub(super) last_commit_at: Instant,
+    pub(super) next_health_probe: Instant,
+    pub(super) health_backoff: Duration,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct BuildTelemetry {
+    pub(super) slice_count: u64,
+    pub(super) slice_nodes_returned: u64,
+    pub(super) slice_native_operations: u64,
+    pub(super) slice_elapsed_ms: u64,
+    pub(super) slice_elapsed_max_ms: u64,
+    pub(super) slice_entries_delta: u64,
+    pub(super) slice_entries_delta_max: u64,
+    pub(super) slice_unique_items_delta: u64,
+    pub(super) da2_slices: u64,
+    pub(super) da3_slices: u64,
+    pub(super) last_slice_entries_seen: u64,
+    pub(super) last_slice_unique_items: u64,
+    pub(super) progress_events: u64,
+    pub(super) item_entries: u64,
+    pub(super) branch_and_item_entries: u64,
+    pub(super) commit_attempts: u64,
+    pub(super) commit_failures: u64,
+    pub(super) committed_entries: u64,
+    pub(super) commit_elapsed_ms: u64,
+    pub(super) commit_elapsed_max_ms: u64,
+    pub(super) commit_latency_samples_ms: VecDeque<u64>,
+    pub(super) terminal_event_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TerminalBuildCounts {
+    pub(super) last_progress_entries_seen: u64,
+    pub(super) last_progress_unique_items: u64,
+    pub(super) persisted_items: u64,
+    pub(super) drained_events: u64,
+    pub(super) received_entry_events: u64,
+    pub(super) pending_entries: u64,
+    pub(super) pending_unique_items: u64,
+}
+
+pub(super) struct BuildFinalizationContext<'a> {
+    pub(super) server: &'a str,
+    pub(super) generation: u64,
+    pub(super) control: &'a Arc<dyn InventoryControl>,
+    pub(super) control_was_cancelled_before_cleanup: bool,
+    pub(super) ownership: &'a Arc<()>,
+    pub(super) build_started: Instant,
+}
+
+pub(super) enum BuildReadiness {
+    Ready,
+    Cancelled,
+    Failed(String),
+}
+
+pub(super) enum HealthProbeAction {
+    Ready,
+    Wait(Duration),
+    Probe,
+}
+
+pub(super) enum BuildEventOutcome {
+    Continue,
+    Stop,
+    Cancelled,
+    Failed(String),
+}
+
+pub(super) enum BuildLoopOutcome {
+    Finished,
+    Failed(String),
+}
+
+pub(super) struct CoordinatedInventoryControl {
+    pub(super) state: Arc<CoordinatedInventoryControlState>,
+}
+
+pub(super) struct CoordinatedInventoryControlState {
+    pub(super) controls: Mutex<HashMap<usize, Arc<dyn InventoryControl>>>,
+    pub(super) cancelled: AtomicBool,
+    pub(super) worker_stop_requested: AtomicBool,
+    pub(super) paused: AtomicBool,
+    pub(super) pacing: Mutex<InventoryPacing>,
+}
+
+pub(super) struct CoordinatedInventoryStream {
+    pub(super) receiver: UnboundedReceiver<anyhow::Result<InventoryEvent>>,
+    pub(super) control: Arc<CoordinatedInventoryControl>,
+    pub(super) coordinator: Option<tokio::task::JoinHandle<()>>,
+    pub(super) terminal_event_seen: bool,
+}
+
+pub(super) struct InventoryRootPlan {
+    pub(super) root_entries: Vec<InventoryEntry>,
+    pub(super) worker_roots: Vec<String>,
+    pub(super) organization: NamespaceOrganization,
+    pub(super) source: BrowseSource,
+}
+
+pub(super) enum WorkerInventoryMessage {
+    Started {
+        worker_id: usize,
+    },
+    Entry(InventoryEntry),
+    Progress {
+        worker_id: usize,
+        progress: InventoryProgress,
+    },
+    Slice(InventorySliceObservation),
+    Completed {
+        worker_id: usize,
+        result: InventoryCompleted,
+    },
+    Failed {
+        worker_id: usize,
+        error: String,
+    },
+    Finished {
+        _worker_id: usize,
+    },
+}
+
+pub(super) enum WorkerEventAction {
+    Continue,
+    Completed,
+    Stop,
+}
+
+pub(super) struct WorkerFinishedGuard {
+    pub(super) sender: UnboundedSender<WorkerInventoryMessage>,
+    pub(super) worker_id: usize,
+}
+
+pub(super) struct ItemRateLimiter {
+    pub(super) rate: f64,
+    pub(super) capacity: f64,
+    pub(super) tokens: f64,
+    pub(super) last_refill: Instant,
+}
+
+pub(super) struct BuildFinalizationGuard<C: OpcClient> {
+    pub(super) manager: Arc<IndexManager<C>>,
+    pub(super) server: String,
+    pub(super) generation: u64,
+    pub(super) control: Arc<dyn InventoryControl>,
+    pub(super) ownership: Arc<()>,
+    pub(super) armed: bool,
+}
+
+impl BuildTelemetry {
+    pub(super) fn record_entry(&mut self, kind: InventoryNodeKind) {
+        match kind {
+            InventoryNodeKind::Item => self.item_entries += 1,
+            InventoryNodeKind::BranchAndItem => self.branch_and_item_entries += 1,
+        }
+    }
+
+    pub(super) fn record_progress(&mut self) {
+        self.progress_events += 1;
+    }
+
+    pub(super) fn record_slice(&mut self, slice: &InventorySliceObservation) {
+        let entries_delta = slice
+            .entries_seen
+            .saturating_sub(self.last_slice_entries_seen);
+        let unique_items_delta = slice
+            .unique_items
+            .saturating_sub(self.last_slice_unique_items);
+        self.last_slice_entries_seen = slice.entries_seen;
+        self.last_slice_unique_items = slice.unique_items;
+        self.slice_count += 1;
+        self.slice_nodes_returned += slice.nodes_returned;
+        self.slice_native_operations += slice.native_operations;
+        self.slice_elapsed_ms += slice.elapsed_ms;
+        self.slice_elapsed_max_ms = self.slice_elapsed_max_ms.max(slice.elapsed_ms);
+        self.slice_entries_delta += entries_delta;
+        self.slice_entries_delta_max = self.slice_entries_delta_max.max(entries_delta);
+        self.slice_unique_items_delta += unique_items_delta;
+        match slice.backend {
+            InventorySliceBackend::Da2 => self.da2_slices += 1,
+            InventorySliceBackend::Da3 => self.da3_slices += 1,
+        }
+    }
+
+    pub(super) fn record_commit(&mut self, inserted: u64, elapsed: Duration, failed: bool) {
+        let elapsed_ms = elapsed.as_millis().try_into().unwrap_or(u64::MAX);
+        self.commit_attempts += 1;
+        self.commit_failures += u64::from(failed);
+        self.committed_entries += inserted;
+        self.commit_elapsed_ms = self.commit_elapsed_ms.saturating_add(elapsed_ms);
+        self.commit_elapsed_max_ms = self.commit_elapsed_max_ms.max(elapsed_ms);
+        if self.commit_latency_samples_ms.len() == 256 {
+            self.commit_latency_samples_ms.pop_front();
+        }
+        self.commit_latency_samples_ms.push_back(elapsed_ms);
+    }
+
+    pub(super) fn commit_latency_percentile(&self, percentile_value: usize) -> Option<u64> {
+        let mut values = self
+            .commit_latency_samples_ms
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        percentile(&values, percentile_value)
+    }
+
+    pub(super) fn record_terminal_event(&mut self, elapsed: Duration) {
+        self.terminal_event_ms = Some(elapsed.as_millis().try_into().unwrap_or(u64::MAX));
+    }
+}
+
+impl BuildRunState {
+    pub(super) fn new(
+        settings: &ResolvedIndexConfig,
+        controller: Option<AdaptiveIndexController>,
+    ) -> Self {
+        Self {
+            pending: Vec::new(),
+            last_progress: InventoryProgress {
+                branches_visited: 0,
+                entries_seen: 0,
+                unique_items: 0,
+                active_time_ms: 0,
+                paused_time_ms: 0,
+                items_per_second: 0.0,
+                estimated_remaining_ms: None,
+            },
+            telemetry: BuildTelemetry::default(),
+            completed: false,
+            cancelled: false,
+            failed: None,
+            completion_warning: None,
+            completion_profile: None,
+            terminal: false,
+            accounted_active_time_ms: 0,
+            persisted_item_count: 0,
+            drained_event_count: 0,
+            received_entry_count: 0,
+            rate_limiter: ItemRateLimiter::new(settings.item_rate_limit, settings.burst_size),
+            controller,
+            effective_duty_cycle_percent: settings.duty_cycle_percent,
+            last_commit_at: Instant::now(),
+            next_health_probe: Instant::now(),
+            health_backoff: Duration::from_secs(1),
+        }
+    }
+
+    pub(super) fn record_completion(&mut self, result: InventoryCompleted, elapsed: Duration) {
+        self.terminal = true;
+        self.telemetry.record_terminal_event(elapsed);
+        self.completed = result.complete;
+        self.cancelled = result.cancelled;
+        self.completion_profile = Some((result.organization, result.source));
+        if result.truncated {
+            self.failed = Some(
+                result
+                    .warning
+                    .unwrap_or_else(|| "inventory was truncated".to_string()),
+            );
+        } else {
+            self.completion_warning = result.warning;
+        }
+    }
+
+    pub(super) fn terminal_counts(&self) -> TerminalBuildCounts {
+        let pending_unique_items = self
+            .pending
+            .iter()
+            .map(|entry| entry.item_id.as_str())
+            .collect::<HashSet<_>>()
+            .len() as u64;
+        TerminalBuildCounts {
+            last_progress_entries_seen: self.last_progress.entries_seen,
+            last_progress_unique_items: self.last_progress.unique_items,
+            persisted_items: self.persisted_item_count,
+            drained_events: self.drained_event_count,
+            received_entry_events: self.received_entry_count,
+            pending_entries: self.pending.len() as u64,
+            pending_unique_items,
+        }
+    }
+}
+
+impl Drop for WorkerFinishedGuard {
+    fn drop(&mut self) {
+        let _ = self.sender.send(WorkerInventoryMessage::Finished {
+            _worker_id: self.worker_id,
+        });
+    }
+}
+
+impl CoordinatedInventoryControl {
+    pub(super) fn new(initial_pacing: InventoryPacing) -> Arc<Self> {
+        Arc::new(Self {
+            state: Arc::new(CoordinatedInventoryControlState {
+                controls: Mutex::new(HashMap::new()),
+                cancelled: AtomicBool::new(false),
+                worker_stop_requested: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
+                pacing: Mutex::new(initial_pacing),
+            }),
+        })
+    }
+
+    pub(super) fn register(
+        &self,
+        worker_id: usize,
+        control: Arc<dyn InventoryControl>,
+    ) -> anyhow::Result<bool> {
+        if self.should_stop_workers() {
+            control.cancel();
+            return Ok(false);
+        }
+        let pacing = self
+            .state
+            .pacing
+            .lock()
+            .map_err(|_| anyhow::anyhow!("coordinated inventory pacing lock poisoned"))?
+            .to_owned();
+        control.set_pacing(pacing)?;
+        if self.state.paused.load(Ordering::Acquire) {
+            control.pause();
+        }
+        let mut controls = self
+            .state
+            .controls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("coordinated inventory control lock poisoned"))?;
+        if self.should_stop_workers() {
+            control.cancel();
+            return Ok(false);
+        }
+        controls.insert(worker_id, Arc::clone(&control));
+        Ok(true)
+    }
+
+    pub(super) fn unregister(&self, worker_id: usize) {
+        if let Ok(mut controls) = self.state.controls.lock() {
+            controls.remove(&worker_id);
+        }
+    }
+
+    pub(super) fn snapshot_controls(&self) -> Vec<Arc<dyn InventoryControl>> {
+        self.state
+            .controls
+            .lock()
+            .map(|controls| controls.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn set_pacing(&self, pacing: InventoryPacing) -> anyhow::Result<()> {
+        *self
+            .state
+            .pacing
+            .lock()
+            .map_err(|_| anyhow::anyhow!("coordinated inventory pacing lock poisoned"))? = pacing;
+        for control in self.snapshot_controls() {
+            if let Err(error) = control.set_pacing(pacing) {
+                self.cancel();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn pause_all(&self) {
+        self.state.paused.store(true, Ordering::Release);
+        for control in self.snapshot_controls() {
+            control.pause();
+        }
+    }
+
+    pub(super) fn resume_all(&self) {
+        self.state.paused.store(false, Ordering::Release);
+        for control in self.snapshot_controls() {
+            control.resume();
+        }
+    }
+
+    pub(super) fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::Release);
+        self.state
+            .worker_stop_requested
+            .store(true, Ordering::Release);
+        self.stop_registered_workers();
+    }
+
+    pub(super) fn stop_workers(&self) {
+        self.state
+            .worker_stop_requested
+            .store(true, Ordering::Release);
+        self.stop_registered_workers();
+    }
+
+    pub(super) fn stop_registered_workers(&self) {
+        for control in self.snapshot_controls() {
+            control.cancel();
+        }
+    }
+
+    pub(super) fn should_stop_workers(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+            || self.state.worker_stop_requested.load(Ordering::Acquire)
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl InventoryControl for CoordinatedInventoryControl {
+    fn pause(&self) {
+        self.pause_all();
+    }
+
+    fn resume(&self) {
+        self.resume_all();
+    }
+
+    fn cancel(&self) {
+        self.cancel();
+    }
+
+    fn set_pacing(&self, pacing: InventoryPacing) -> anyhow::Result<()> {
+        self.set_pacing(pacing)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::opc::InventoryStream for CoordinatedInventoryStream {
+    async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+        let event = self.receiver.recv().await;
+        if matches!(event.as_ref(), Some(Ok(InventoryEvent::Completed(_)))) {
+            self.terminal_event_seen = true;
+        }
+        event
+    }
+
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        if !self.terminal_event_seen {
+            self.control.cancel();
+        }
+        let Some(coordinator) = self.coordinator.take() else {
+            return Ok(());
+        };
+        coordinator
+            .await
+            .map_err(|error| anyhow::anyhow!("coordinated inventory task failed: {error}"))
+    }
+}
+
+impl Drop for CoordinatedInventoryStream {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
+
+impl ItemRateLimiter {
+    pub(super) fn new(rate: u32, burst_size: u32) -> Self {
+        let capacity = f64::from(burst_size.max(1));
+        Self {
+            rate: f64::from(rate),
+            capacity,
+            tokens: capacity,
+            last_refill: Instant::now(),
+        }
+    }
+
+    pub(super) async fn acquire(&mut self, control: &Arc<dyn InventoryControl>) -> bool {
+        if self.rate <= 0.0 {
+            return !control.is_cancelled();
+        }
+        loop {
+            if control.is_cancelled() {
+                return false;
+            }
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+            self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+            self.last_refill = now;
+            if self.tokens >= 1.0 {
+                self.tokens -= 1.0;
+                return true;
+            }
+            let wait = Duration::from_secs_f64((1.0 - self.tokens) / self.rate);
+            if !wait_with_cancellation(control, wait).await {
+                return false;
+            }
+        }
+    }
+}
+
+impl<C: OpcClient> BuildFinalizationGuard<C> {
+    pub(super) fn new(
+        manager: Arc<IndexManager<C>>,
+        server: String,
+        generation: u64,
+        control: Arc<dyn InventoryControl>,
+        ownership: Arc<()>,
+    ) -> Self {
+        Self {
+            manager,
+            server,
+            generation,
+            control,
+            ownership,
+            armed: true,
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<C: OpcClient> Drop for BuildFinalizationGuard<C> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.control.cancel();
+        self.manager.fail_generation_and_schedule_cleanup(
+            &self.server,
+            self.generation,
+            "namespace index build unwound unexpectedly",
+        );
+        self.manager.finish_build_for_control_owned(
+            &self.server,
+            &self.control,
+            &self.ownership,
+            Some("namespace index build unwound unexpectedly".into()),
+        );
+        tracing::error!(target: "opcda_bridge_gateway::index",
+            process_id = std::process::id(),
+            database = %self.manager.settings.database_path.display(),
+            server = %self.server,
+            generation = self.generation,
+            "namespace index build unwound unexpectedly; ownership was released"
+        );
+    }
+}
 
 impl<C: OpcClient> IndexManager<C> {
     pub(super) async fn start_refresh_inventory(

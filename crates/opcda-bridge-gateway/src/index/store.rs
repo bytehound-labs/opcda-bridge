@@ -1,18 +1,143 @@
 use super::{
-    BuildFileLock, DbStatus, Enrollment, IndexDb, IndexManager, SCHEMA_VERSION, StorageDiagnostics,
-    StoredIndexProfile, namespace_string, node_kind_number, normalize_query, parse_namespace,
-    parse_source, source_string, status, timestamp_now,
+    BuildFileLock, IndexManager, StorageDiagnostics, normalize_query, status, timestamp_now,
 };
 use crate::opc::{
-    BrowseSource, InventoryEntry, InventoryProgress, NamespaceOrganization, OpcClient,
+    BrowseSource, InventoryEntry, InventoryNodeKind, InventoryProgress, NamespaceOrganization,
+    OpcClient,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+pub(super) const SCHEMA_VERSION: i64 = 4;
+
+pub(super) struct IndexDb {
+    pub(super) path: PathBuf,
+    pub(super) connection: Connection,
+    #[cfg(test)]
+    pub(super) reject_next_prefix_query_map: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Enrollment {
+    pub(super) auto_refresh_enabled: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct DbStatus {
+    pub(super) generation: u64,
+    pub(super) state: String,
+    pub(super) organization: NamespaceOrganization,
+    pub(super) source: BrowseSource,
+    pub(super) started_at: String,
+    pub(super) completed_at: Option<String>,
+    pub(super) entry_count: u64,
+    pub(super) unique_item_count: u64,
+    pub(super) last_error: Option<String>,
+}
+
+pub(super) struct StatusRows {
+    pub(super) active: Option<DbStatus>,
+    pub(super) staging: Option<DbStatus>,
+    pub(super) failed: Option<DbStatus>,
+    pub(super) failed_after_active: Option<DbStatus>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StoredIndexProfile {
+    pub(super) organization: NamespaceOrganization,
+    pub(super) source: BrowseSource,
+    pub(super) compatibility_fallback: bool,
+}
+
+impl IndexDb {
+    #[cfg(test)]
+    pub(super) fn take_prefix_query_map_rejection(&self) -> bool {
+        self.reject_next_prefix_query_map
+            .swap(false, Ordering::AcqRel)
+    }
+}
+
+impl StatusRows {
+    pub(super) fn from_rows(rows: &[DbStatus]) -> Self {
+        let active = rows.iter().find(|row| row.state == "active").cloned();
+        let staging = rows.iter().find(|row| row.state == "staging").cloned();
+        let failed = rows.iter().find(|row| row.state == "failed").cloned();
+        let failed_after_active = active.as_ref().and_then(|active| {
+            failed
+                .as_ref()
+                .filter(|failed| failed.generation > active.generation)
+                .cloned()
+        });
+        Self {
+            active,
+            staging,
+            failed,
+            failed_after_active,
+        }
+    }
+}
+
+pub(super) fn namespace_string(value: NamespaceOrganization) -> &'static str {
+    match value {
+        NamespaceOrganization::Unspecified => "unspecified",
+        NamespaceOrganization::Flat => "flat",
+        NamespaceOrganization::Hierarchical => "hierarchical",
+    }
+}
+
+pub(super) fn parse_namespace(value: &str) -> NamespaceOrganization {
+    match value {
+        "flat" => NamespaceOrganization::Flat,
+        "hierarchical" => NamespaceOrganization::Hierarchical,
+        _ => NamespaceOrganization::Unspecified,
+    }
+}
+
+pub(super) fn source_string(value: BrowseSource) -> &'static str {
+    match value {
+        BrowseSource::Unspecified => "unspecified",
+        BrowseSource::Da3 => "da3",
+        BrowseSource::Da2 => "da2",
+        BrowseSource::Flat => "flat",
+        BrowseSource::Derived => "derived",
+    }
+}
+
+pub(super) fn parse_source(value: &str) -> BrowseSource {
+    match value {
+        "da3" => BrowseSource::Da3,
+        "da2" => BrowseSource::Da2,
+        "flat" => BrowseSource::Flat,
+        "derived" => BrowseSource::Derived,
+        _ => BrowseSource::Unspecified,
+    }
+}
+
+pub(super) fn index_profile_is_compatible(
+    indexed_organization: NamespaceOrganization,
+    indexed_source: BrowseSource,
+    compatibility_fallback: bool,
+    raw_organization: NamespaceOrganization,
+    raw_source: BrowseSource,
+) -> bool {
+    indexed_organization == raw_organization
+        && (indexed_source == raw_source
+            || (compatibility_fallback
+                && indexed_source == BrowseSource::Da2
+                && raw_source == BrowseSource::Da3))
+}
+
+pub(super) fn node_kind_number(value: InventoryNodeKind) -> i64 {
+    match value {
+        InventoryNodeKind::Item => 1,
+        InventoryNodeKind::BranchAndItem => 2,
+    }
+}
 
 impl<C: OpcClient> IndexManager<C> {
     #[cfg(test)]

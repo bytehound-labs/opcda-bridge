@@ -23,6 +23,14 @@ Status distinguishes `not-indexed`, `partial`, `ready`, `stale`, `refreshing`, `
 data. A no-match result is authoritative only when the index is complete. A non-fatal completion
 warning does not by itself make a usable active generation failed.
 
+## Index implementation
+
+`index.rs` is the `IndexManager` facade and retains stable public type re-exports. Internal
+responsibilities are split across enrollment, scheduling and cleanup, traversal and health,
+SQLite storage and generation promotion, indexed search and ranking, and status and metrics
+modules. The test suite follows the same domains under `index/tests/`, with shared fixtures in
+`index/tests/mod.rs`.
+
 ## Client commands
 
 Use the live `search` command when the gateway should traverse the OPC server. It streams results
