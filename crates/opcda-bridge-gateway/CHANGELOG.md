@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.12](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.11...opcda-bridge-gateway-v0.5.12) - 2026-10-06
+
+### Other
+
+- *(gateway-index)* split index domains
+- *(gateway)* split namespace index modules
+- remove duplicate client publish workflow ([#182](https://github.com/bytehound-labs/opcda-bridge/pull/182))
+- add workspace lints
+
 ## [0.5.11](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.5.10...opcda-bridge-gateway-v0.5.11) - 2026-10-02
 
 ### Other
