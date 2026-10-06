@@ -1,16 +1,196 @@
 use super::{
-    DbStatus, Enrollment, ForegroundGuard, ForegroundMetrics, HealthProbeState, IndexDb,
-    IndexManager, IndexState, IndexStatus, RuntimeBuild, RuntimeState, RuntimeStatus,
-    SchedulerDiagnostics, StatusRows, StorageDiagnostics, instant_timestamp, parse_timestamp,
-    scheduler, system_time_timestamp,
+    DbStatus, Enrollment, IndexDb, IndexManager, RuntimeBuild, RuntimeState, StatusRows,
+    instant_timestamp, parse_timestamp, scheduler, system_time_timestamp,
 };
-use crate::controller::{HostMetrics, HostMetricsProvider};
+use crate::controller::{HostMetrics, HostMetricsProvider, InventoryLimits};
 use crate::opc::{BrowseSource, InventoryProgress, NamespaceOrganization, OpcClient};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexState {
+    NotIndexed,
+    Partial,
+    Ready,
+    Stale,
+    Refreshing,
+    Promoting,
+    Failed,
+    Deleting,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexStatus {
+    pub server: String,
+    pub state: IndexState,
+    pub auto_refresh_enabled: bool,
+    pub active_generation: u64,
+    pub entry_count: u64,
+    pub unique_item_count: u64,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub last_error: Option<String>,
+    pub database_bytes: u64,
+    pub organization: NamespaceOrganization,
+    pub source: BrowseSource,
+    pub progress: Option<InventoryProgress>,
+    pub effective_limits: Option<InventoryLimits>,
+    pub controller_state: Option<crate::controller::ControllerState>,
+    pub pause_reason: Option<crate::controller::PauseReason>,
+    pub recovery_deadline: Option<String>,
+    pub foreground_metrics: ForegroundMetrics,
+    pub host_metrics: HostMetrics,
+    pub health: HealthProbeState,
+    pub sentinel_configured: bool,
+    pub storage: StorageDiagnostics,
+    pub scheduler: SchedulerDiagnostics,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForegroundMetrics {
+    pub active_count: u64,
+    pub operations: u64,
+    pub errors: u64,
+    pub bad_quality: u64,
+    pub latency_p50_ms: Option<u64>,
+    pub latency_p95_ms: Option<u64>,
+    pub latency_max_ms: Option<u64>,
+    pub last_error: bool,
+    pub last_bad_quality: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HealthProbeState {
+    #[default]
+    Unavailable,
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageDiagnostics {
+    pub main_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    pub free_bytes: Option<u64>,
+    pub last_commit_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchedulerDiagnostics {
+    pub next_refresh_at: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_success_duration_ms: Option<u64>,
+    pub retry_after: Option<String>,
+    pub consecutive_failures: u32,
+    pub circuit_open: bool,
+}
+
+pub struct ForegroundGuard<C: OpcClient> {
+    pub(super) manager: Arc<IndexManager<C>>,
+    pub(super) server: String,
+}
+
+#[derive(Default)]
+pub(super) struct ForegroundMetricState {
+    pub(super) latencies_ms: VecDeque<u64>,
+    pub(super) operations: u64,
+    pub(super) errors: u64,
+    pub(super) bad_quality: u64,
+    pub(super) last_error: bool,
+    pub(super) last_bad_quality: bool,
+    pub(super) last_health_failure_at: Option<Instant>,
+    pub(super) last_bad_quality_at: Option<Instant>,
+}
+
+impl ForegroundMetricState {
+    pub(super) fn record_health_at(
+        &mut self,
+        now: Instant,
+        latency_ms: u64,
+        error: bool,
+        bad_quality: bool,
+        health_failure: bool,
+    ) {
+        const WINDOW: usize = 128;
+        self.latencies_ms.push_back(latency_ms);
+        if self.latencies_ms.len() > WINDOW {
+            self.latencies_ms.pop_front();
+        }
+        self.operations = self.operations.saturating_add(1);
+        self.errors += u64::from(error);
+        self.bad_quality += u64::from(bad_quality);
+        self.last_error = error;
+        self.last_bad_quality = bad_quality;
+        if health_failure {
+            self.last_health_failure_at = Some(now);
+        }
+        if bad_quality {
+            self.last_bad_quality_at = Some(now);
+        }
+    }
+
+    pub(super) fn recent_health_failure(&self, now: Instant, max_age: Duration) -> bool {
+        self.last_health_failure_at
+            .is_some_and(|recorded| now.saturating_duration_since(recorded) <= max_age)
+    }
+
+    pub(super) fn recent_bad_quality(&self, now: Instant, max_age: Duration) -> bool {
+        self.last_bad_quality_at
+            .is_some_and(|recorded| now.saturating_duration_since(recorded) <= max_age)
+    }
+
+    pub(super) fn snapshot(&self, active_count: u64) -> ForegroundMetrics {
+        let mut sorted = self.latencies_ms.iter().copied().collect::<Vec<_>>();
+        sorted.sort_unstable();
+        ForegroundMetrics {
+            active_count,
+            operations: self.operations,
+            errors: self.errors,
+            bad_quality: self.bad_quality,
+            latency_p50_ms: percentile(&sorted, 50),
+            latency_p95_ms: percentile(&sorted, 95),
+            latency_max_ms: sorted.last().copied(),
+            last_error: self.last_error,
+            last_bad_quality: self.last_bad_quality,
+        }
+    }
+}
+
+pub(super) fn percentile(values: &[u64], percentile: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let rank = (values.len() * percentile).div_ceil(100).max(1);
+    let index = (rank - 1).min(values.len() - 1);
+    values.get(index).copied()
+}
+
+#[derive(Default)]
+pub(super) struct RuntimeStatus {
+    pub(super) build: Option<RuntimeBuild>,
+    pub(super) last_error: Option<String>,
+    pub(super) retry_after: Option<SystemTime>,
+    pub(super) consecutive_failures: u32,
+    pub(super) circuit_open: bool,
+    pub(super) health: HealthProbeState,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct PauseOverlayState {
+    pub(super) maintenance: bool,
+    pub(super) health: bool,
+}
+
+impl<C: OpcClient> Drop for ForegroundGuard<C> {
+    fn drop(&mut self) {
+        self.manager.foreground_end(&self.server);
+    }
+}
 
 impl<C: OpcClient> IndexManager<C> {
     pub fn max_results(&self) -> u32 {

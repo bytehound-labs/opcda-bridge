@@ -50,6 +50,21 @@ The gateway crate keeps its public server entry point in
 These are internal boundaries; the gRPC protocol, public `BridgeService` path, and handler behavior
 remain defined by the gateway contract.
 
+The persistent index keeps `index.rs` as the `IndexManager` facade, cross-domain wiring, and stable
+public type re-exports. Its internal responsibilities are divided by domain:
+
+- `index/enrollment.rs` for server lifecycle and refresh admission.
+- `index/scheduler.rs` for maintenance, task ownership, retries, and cleanup.
+- `index/traversal.rs` for inventory coordination, traversal state, telemetry, health, and
+  finalization.
+- `index/store.rs` for persisted records, migrations, and generation promotion.
+- `index/query.rs` for search caches, candidate ranking, and indexed queries.
+- `index/status.rs` for public status types, foreground metrics, and diagnostics.
+
+Index tests mirror those boundaries under `index/tests/`, with shared fixtures in
+`index/tests/mod.rs`.
+These module paths are implementation details; public index type paths remain stable.
+
 The optional SQLite index stores namespace metadata such as exact ItemIDs, display names, node
 kinds, and breadcrumbs. It does not store live tag values. Indexed search operates on a completed
 generation and is separate from live browse, read, and write paths.

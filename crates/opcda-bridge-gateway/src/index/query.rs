@@ -1,12 +1,114 @@
-use super::{
-    CacheKey, IndexDb, IndexManager, IndexState, IndexedMatch, IndexedSearch, SearchCandidate,
-    SearchRank, normalize_query,
-};
+use super::{IndexDb, IndexManager, IndexState, IndexStatus};
 use crate::opc::{InventoryNodeKind, OpcClient};
 use rusqlite::{OptionalExtension, params};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::path::Path;
 use std::time::Instant;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedMatch {
+    pub item_id: String,
+    pub display_name: String,
+    pub kind: InventoryNodeKind,
+    pub breadcrumbs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexedSearch {
+    pub matches: Vec<IndexedMatch>,
+    pub has_more: bool,
+    pub status: IndexStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Unspecified,
+    Exact,
+    Prefix,
+    Contains,
+}
+
+pub(super) struct QueryCache {
+    pub(super) values: HashMap<CacheKey, IndexedSearch>,
+    pub(super) order: VecDeque<CacheKey>,
+    pub(super) capacity: usize,
+}
+
+impl QueryCache {
+    pub(super) fn get(&mut self, key: &CacheKey) -> Option<IndexedSearch> {
+        let value = self.values.get(key).cloned()?;
+        self.order.retain(|existing| existing != key);
+        self.order.push_back(key.clone());
+        Some(value)
+    }
+
+    pub(super) fn insert(&mut self, key: CacheKey, value: IndexedSearch) {
+        self.values.insert(key.clone(), value);
+        self.order.retain(|existing| existing != &key);
+        self.order.push_back(key);
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.values.remove(&oldest);
+            }
+        }
+    }
+
+    pub(super) fn clear_server(&mut self, server: &str) {
+        self.values.retain(|key, _| key.server != server);
+        self.order.retain(|key| key.server != server);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct CacheKey {
+    pub(super) server: String,
+    pub(super) generation: u64,
+    pub(super) query: String,
+    pub(super) mode: i32,
+    pub(super) limit: u32,
+}
+
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) struct SearchCandidate {
+    pub(super) rank: SearchRank,
+    pub(super) item_id: String,
+}
+
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) struct SearchRank {
+    pub(super) tier: u8,
+    pub(super) display_name_len: usize,
+    pub(super) display_name_norm: String,
+    pub(super) item_id_norm: String,
+}
+
+impl TryFrom<i32> for SearchMode {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Unspecified),
+            1 => Ok(Self::Exact),
+            2 => Ok(Self::Prefix),
+            3 => Ok(Self::Contains),
+            _ => Err(()),
+        }
+    }
+}
+
+pub(crate) fn normalize_query(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+#[cfg(test)]
+pub(super) type SearchGate = Option<(
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+)>;
 
 impl<C: OpcClient> IndexManager<C> {
     #[cfg(test)]

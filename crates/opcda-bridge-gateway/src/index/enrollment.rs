@@ -1,11 +1,51 @@
 use super::{
-    BuildFileLock, IndexControlAction, IndexManager, IndexOperationError, IndexStatus,
-    RuntimeBuild, timestamp_now,
+    BuildFileLock, IndexControlAction, IndexManager, IndexStatus, RuntimeBuild, timestamp_now,
 };
 use crate::opc::{InventoryControl, InventoryHandle, OpcClient};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+
+/// A typed index-operation failure suitable for stable gRPC status mapping.
+#[derive(Debug)]
+pub enum IndexOperationError {
+    UnknownServer { server: String },
+    NotEnrolled { server: String },
+    Deleting { server: String },
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for IndexOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownServer { server } => {
+                write!(formatter, "OPC DA server {server:?} is not registered")
+            }
+            Self::NotEnrolled { server } => {
+                write!(
+                    formatter,
+                    "namespace index for OPC DA server {server:?} is not enrolled"
+                )
+            }
+            Self::Deleting { server } => {
+                write!(
+                    formatter,
+                    "namespace index for OPC DA server {server:?} is being deleted"
+                )
+            }
+            Self::Internal(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for IndexOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Internal(error) => Some(error.root_cause()),
+            Self::UnknownServer { .. } | Self::NotEnrolled { .. } | Self::Deleting { .. } => None,
+        }
+    }
+}
 
 impl<C: OpcClient> IndexManager<C> {
     pub async fn refresh(

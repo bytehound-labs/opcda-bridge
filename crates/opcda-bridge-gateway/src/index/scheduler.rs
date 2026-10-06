@@ -1,23 +1,667 @@
-#[cfg(test)]
-use super::BuildReservationHook;
 use super::{
-    BackgroundTasks, CLEANUP_BATCH_PAUSE, CLEANUP_BATCH_SIZE, CLEANUP_RETRY_INITIAL_BACKOFF,
-    CLEANUP_RETRY_LIMIT, CleanupAttempt, CleanupBatch, CleanupBatchResult, CleanupStats,
-    CleanupTaskState, CleanupWorkerGuard, DATABASE_COORDINATIONS, DatabaseCoordination, IndexDb,
-    IndexManager, IndexState, IndexStatus, QueryCache, RETRY_INITIAL_BACKOFF, RETRY_MAX_BACKOFF,
-    default_host_metrics_provider, index_profile_is_compatible, maintenance_window_active,
-    parse_maintenance_windows, parse_timestamp,
+    HealthProbeState, IndexDb, IndexManager, IndexState, IndexStatus, QueryCache,
+    index_profile_is_compatible, parse_timestamp,
 };
 use crate::config::ResolvedIndexConfig;
-use crate::opc::OpcClient;
-use chrono::Local;
+use crate::controller::{InventoryLimits, default_host_metrics_provider};
+use crate::opc::{InventoryControl, InventoryProgress, OpcClient};
+use chrono::{DateTime, Local, Timelike};
+use fs2::FileExt;
 use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::future::Future;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
+
+pub(super) const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(300);
+
+pub(super) const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(86_400);
+
+pub(super) const CLEANUP_BATCH_SIZE: usize = 10_000;
+
+pub(super) const CLEANUP_BATCH_PAUSE: Duration = Duration::from_millis(1);
+
+pub(super) const CLEANUP_RETRY_LIMIT: u32 = 3;
+
+pub(super) const CLEANUP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Clone)]
+pub(super) struct RuntimeBuild {
+    pub(super) control: Option<Arc<dyn InventoryControl>>,
+    pub(super) progress: Option<InventoryProgress>,
+    pub(super) started_at: String,
+    pub(super) foreground_users: usize,
+    pub(super) operator_paused: bool,
+    pub(super) quiet_until: Option<Instant>,
+    pub(super) effective_limits: Option<InventoryLimits>,
+    pub(super) controller_state: Option<crate::controller::ControllerState>,
+    pub(super) pause_reason: Option<crate::controller::PauseReason>,
+    pub(super) recovery_deadline: Option<Instant>,
+    pub(super) last_commit_latency_ms: Option<u64>,
+}
+
+#[derive(Default)]
+pub(super) struct RuntimeState {
+    pub(super) build: Option<RuntimeBuild>,
+    pub(super) retry_after: Option<SystemTime>,
+    pub(super) last_error: Option<String>,
+    pub(super) consecutive_failures: u32,
+    pub(super) circuit_open: bool,
+    pub(super) health: HealthProbeState,
+    pub(super) sentinel_checked_at: Option<Instant>,
+}
+
+pub(super) struct BackgroundTasks {
+    pub(super) state: Mutex<BackgroundTaskState>,
+    pub(super) shutdown: tokio::sync::watch::Sender<bool>,
+    pub(super) idle: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) panic_next_cleanup_worker: AtomicBool,
+    #[cfg(test)]
+    pub(super) cleanup_batch_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
+    #[cfg(test)]
+    pub(super) cleanup_writer_gate_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
+    #[cfg(test)]
+    pub(super) cleanup_notification_hook: Mutex<Option<Arc<CleanupNotificationHook>>>,
+}
+
+#[derive(Default)]
+pub(super) struct BackgroundTaskState {
+    pub(super) active: usize,
+    pub(super) shutting_down: bool,
+}
+
+pub(super) struct BackgroundTaskGuard {
+    pub(super) tasks: Arc<BackgroundTasks>,
+}
+
+#[derive(Default)]
+pub(super) struct CleanupTaskState {
+    pub(super) running: bool,
+    pub(super) requested: bool,
+    #[cfg(test)]
+    pub(super) failures: usize,
+}
+
+pub(super) struct DatabaseCoordination {
+    pub(super) writer_gate: Arc<Mutex<()>>,
+    pub(super) active_builds: Arc<Mutex<HashSet<String>>>,
+    pub(super) build_owners: Arc<Mutex<HashMap<String, Arc<()>>>>,
+    pub(super) build_changed: Arc<tokio::sync::Notify>,
+}
+
+pub(super) static DATABASE_COORDINATIONS: OnceLock<
+    Mutex<HashMap<PathBuf, Weak<DatabaseCoordination>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+pub(super) struct CleanupBatchHook {
+    pub(super) started: std::sync::mpsc::SyncSender<()>,
+    pub(super) release: Mutex<std::sync::mpsc::Receiver<()>>,
+    pub(super) fired: AtomicBool,
+}
+
+#[cfg(test)]
+pub(super) struct BuildReservationHook {
+    pub(super) started: std::sync::mpsc::SyncSender<()>,
+    pub(super) release: Mutex<std::sync::mpsc::Receiver<()>>,
+    pub(super) fired: AtomicBool,
+}
+
+#[cfg(test)]
+pub(super) struct CleanupNotificationHook {
+    pub(super) started: Arc<tokio::sync::Notify>,
+    pub(super) release: Arc<tokio::sync::Notify>,
+    pub(super) fired: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MaintenanceWindow {
+    pub(super) start_minute: u16,
+    pub(super) end_minute: u16,
+}
+
+#[derive(Debug)]
+pub(super) struct BuildFileLock {
+    pub(super) file: Option<fs::File>,
+    #[cfg(windows)]
+    pub(super) owner_path: Option<PathBuf>,
+}
+
+pub(super) fn is_lock_conflict(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock || matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+pub(super) fn build_lock_path(database_path: &Path, server: &str) -> PathBuf {
+    let database_path = canonical_database_path(database_path);
+    let file_name = database_path
+        .file_name()
+        .map_or_else(|| "index.sqlite3".into(), std::ffi::OsStr::to_os_string);
+    database_path.with_file_name(format!(
+        "{}.{}.build.lock",
+        file_name.to_string_lossy(),
+        stable_server_hash(server)
+    ))
+}
+
+#[derive(Default)]
+pub(super) struct CleanupStats {
+    pub(super) batches: u64,
+    pub(super) entries: u64,
+    pub(super) fts_entries: u64,
+    pub(super) generations: u64,
+    pub(super) stopped_for_shutdown: bool,
+    pub(super) deferred_for_build: bool,
+}
+
+pub(super) struct CleanupBatch {
+    pub(super) entries: u64,
+    pub(super) fts_entries: u64,
+    pub(super) generations: u64,
+}
+
+pub(super) enum CleanupBatchResult {
+    Shutdown,
+    Deferred,
+    NoObsoleteGenerations,
+    Deleted(CleanupBatch),
+}
+
+pub(super) enum CleanupAttempt {
+    Retry,
+    Return,
+    Finished,
+}
+
+pub(super) struct CleanupWorkerGuard {
+    pub(super) active: Arc<AtomicBool>,
+    pub(super) path: PathBuf,
+    pub(super) background_tasks: Arc<BackgroundTasks>,
+    pub(super) cleanup_tasks: Arc<Mutex<HashMap<String, CleanupTaskState>>>,
+    pub(super) coordination: Arc<DatabaseCoordination>,
+}
+
+impl BackgroundTasks {
+    pub(super) fn new() -> Self {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        Self {
+            state: Mutex::new(BackgroundTaskState::default()),
+            shutdown,
+            idle: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            panic_next_cleanup_worker: AtomicBool::new(false),
+            #[cfg(test)]
+            cleanup_batch_hook: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_writer_gate_hook: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_notification_hook: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_cleanup_notification_hook(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.cleanup_notification_hook.lock().unwrap() = Some(Arc::new(CleanupNotificationHook {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            fired: AtomicBool::new(false),
+        }));
+        (started, release)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_for_cleanup_notification_hook(&self) {
+        let hook = self
+            .cleanup_notification_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            hook.started.notify_one();
+            hook.release.notified().await;
+        }
+    }
+
+    pub(super) fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    pub(super) fn is_shutting_down(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.shutting_down)
+            .unwrap_or(true)
+    }
+
+    pub(super) fn request_shutdown(&self) {
+        let should_notify = self
+            .state
+            .lock()
+            .map(|mut state| {
+                if state.shutting_down {
+                    false
+                } else {
+                    state.shutting_down = true;
+                    true
+                }
+            })
+            .unwrap_or(true);
+        if should_notify {
+            let _ = self.shutdown.send(true);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn panic_next_cleanup_worker(&self) {
+        self.panic_next_cleanup_worker
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_cleanup_batch_hook(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.cleanup_batch_hook.lock().unwrap() = Some(Arc::new(CleanupBatchHook {
+            started,
+            release: Mutex::new(release_rx),
+            fired: AtomicBool::new(false),
+        }));
+        (started_rx, release)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_cleanup_batch_hook(&self) {
+        let hook = self
+            .cleanup_batch_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            let _ = hook.started.send(());
+            if let Ok(release) = hook.release.lock() {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_cleanup_writer_gate_hook(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.cleanup_writer_gate_hook.lock().unwrap() = Some(Arc::new(CleanupBatchHook {
+            started,
+            release: Mutex::new(release_rx),
+            fired: AtomicBool::new(false),
+        }));
+        (started_rx, release)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_cleanup_writer_gate_hook(&self) {
+        let hook = self
+            .cleanup_writer_gate_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            let _ = hook.started.send(());
+            if let Ok(release) = hook.release.lock() {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    pub(super) fn spawn<F>(self: &Arc<Self>, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.shutting_down {
+            return false;
+        }
+        state.active = state.active.saturating_add(1);
+        drop(state);
+
+        let tasks = Arc::clone(self);
+        tokio::spawn(async move {
+            let _guard = BackgroundTaskGuard { tasks };
+            future.await;
+        });
+        true
+    }
+
+    pub(super) async fn wait_for_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            let active = self.state.lock().map(|state| state.active).unwrap_or(0);
+            if active == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for BackgroundTaskGuard {
+    fn drop(&mut self) {
+        let became_idle = self
+            .tasks
+            .state
+            .lock()
+            .map(|mut state| {
+                state.active = state.active.saturating_sub(1);
+                state.active == 0
+            })
+            .unwrap_or(true);
+        if became_idle {
+            self.tasks.idle.notify_one();
+        }
+    }
+}
+
+impl MaintenanceWindow {
+    pub(super) fn parse(value: &str) -> anyhow::Result<Self> {
+        let (start, end) = value
+            .split_once('-')
+            .ok_or_else(|| anyhow::anyhow!("maintenance window must use HH:MM-HH:MM"))?;
+        Ok(Self {
+            start_minute: parse_clock(start)?,
+            end_minute: parse_clock(end)?,
+        })
+    }
+
+    pub(super) fn contains(self, minute: u16) -> bool {
+        if self.start_minute == self.end_minute {
+            return true;
+        }
+        if self.start_minute < self.end_minute {
+            (self.start_minute..self.end_minute).contains(&minute)
+        } else {
+            minute >= self.start_minute || minute < self.end_minute
+        }
+    }
+}
+
+pub(super) fn parse_clock(value: &str) -> anyhow::Result<u16> {
+    let (hour, minute) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("maintenance window clock must use HH:MM"))?;
+    let hour = hour
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("maintenance window hour is invalid"))?;
+    let minute = minute
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("maintenance window minute is invalid"))?;
+    if hour >= 24 || minute >= 60 {
+        anyhow::bail!("maintenance window clock is outside 00:00-23:59");
+    }
+    Ok(hour * 60 + minute)
+}
+
+pub(super) fn parse_maintenance_windows(
+    values: &[String],
+) -> anyhow::Result<Vec<MaintenanceWindow>> {
+    values
+        .iter()
+        .map(|value| MaintenanceWindow::parse(value))
+        .collect()
+}
+
+pub(super) fn maintenance_window_active(
+    windows: &[MaintenanceWindow],
+    now: DateTime<Local>,
+) -> bool {
+    if windows.is_empty() {
+        return false;
+    }
+    let minute = (now.hour() * 60 + now.minute()) as u16;
+    windows
+        .iter()
+        .copied()
+        .any(|window| window.contains(minute))
+}
+
+pub(super) async fn wait_with_cancellation(
+    control: &Arc<dyn InventoryControl>,
+    duration: Duration,
+) -> bool {
+    let deadline = Instant::now() + duration;
+    loop {
+        if control.is_cancelled() {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
+}
+
+impl BuildFileLock {
+    pub(super) fn acquire(database_path: &Path, server: &str) -> anyhow::Result<Self> {
+        if database_path == Path::new(":memory:") {
+            return Ok(Self {
+                file: None,
+                #[cfg(windows)]
+                owner_path: None,
+            });
+        }
+        Self::acquire_with(database_path, server, |file, metadata| {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(metadata)?;
+            file.sync_all()
+        })
+    }
+
+    pub(super) fn acquire_with<F>(
+        database_path: &Path,
+        server: &str,
+        initialize: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+    {
+        Self::acquire_with_open(
+            database_path,
+            server,
+            |lock_path| {
+                OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(lock_path)
+            },
+            initialize,
+        )
+    }
+
+    pub(super) fn acquire_with_open<F, O>(
+        database_path: &Path,
+        server: &str,
+        open: O,
+        initialize: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+        O: FnOnce(&Path) -> std::io::Result<fs::File>,
+    {
+        let lock_path = build_lock_path(database_path, server);
+        lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(fs::create_dir_all)
+            .transpose()?;
+        let mut file = match open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if is_lock_conflict(&error) => {
+                let owner = read_lock_owner(&lock_path, database_path, server);
+                anyhow::bail!(
+                    "namespace index build lock is already held at {} ({})",
+                    lock_path.display(),
+                    if owner.trim().is_empty() {
+                        error.to_string()
+                    } else {
+                        owner.trim().to_string()
+                    }
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = file.try_lock_exclusive() {
+            let owner = read_lock_owner(&lock_path, database_path, server);
+            anyhow::bail!(
+                "namespace index build lock is already held at {} ({})",
+                lock_path.display(),
+                if owner.trim().is_empty() {
+                    error.to_string()
+                } else {
+                    owner.trim().to_string()
+                }
+            );
+        }
+        let metadata = format!("process_id={}\nserver={server}\n", std::process::id());
+        if let Err(error) = initialize(&mut file, metadata.as_bytes()) {
+            let _ = FileExt::unlock(&file);
+            return Err(error.into());
+        }
+        #[cfg(windows)]
+        if let Err(error) = fs::write(build_owner_path(database_path, server), metadata.as_bytes())
+        {
+            let _ = FileExt::unlock(&file);
+            return Err(error.into());
+        }
+        Ok(Self {
+            file: Some(file),
+            #[cfg(windows)]
+            owner_path: Some(build_owner_path(database_path, server)),
+        })
+    }
+
+    pub(super) fn is_held(database_path: &Path, server: &str) -> anyhow::Result<bool> {
+        Self::is_held_with(database_path, server, FileExt::try_lock_exclusive)
+    }
+
+    pub(super) fn is_held_with<F>(
+        database_path: &Path,
+        server: &str,
+        try_lock: F,
+    ) -> anyhow::Result<bool>
+    where
+        F: FnOnce(&fs::File) -> std::io::Result<()>,
+    {
+        if database_path == Path::new(":memory:") {
+            return Ok(false);
+        }
+        let lock_path = build_lock_path(database_path, server);
+        let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if is_lock_conflict(&error) => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        match try_lock(&file) {
+            Ok(()) => {
+                FileExt::unlock(&file)?;
+                Ok(false)
+            }
+            Err(error) if is_lock_conflict(&error) => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for BuildFileLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            #[cfg(windows)]
+            if let Some(owner_path) = self.owner_path.take() {
+                match fs::remove_file(&owner_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => tracing::warn!(target: "opcda_bridge_gateway::index",
+                        process_id = std::process::id(),
+                        owner = %owner_path.display(),
+                        error = %error,
+                        "unable to remove namespace index build owner metadata"
+                    ),
+                }
+            }
+            let _ = FileExt::unlock(&file);
+            drop(file);
+        }
+    }
+}
+
+impl Drop for CleanupWorkerGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+        spawn_cleanup_worker_if_idle(
+            Arc::clone(&self.active),
+            self.path.clone(),
+            Arc::clone(&self.background_tasks),
+            Arc::clone(&self.cleanup_tasks),
+            Arc::clone(&self.coordination),
+            false,
+        );
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn build_owner_path(database_path: &Path, server: &str) -> PathBuf {
+    let database_path = canonical_database_path(database_path);
+    let file_name = database_path
+        .file_name()
+        .map_or_else(|| "index.sqlite3".into(), std::ffi::OsStr::to_os_string);
+    database_path.with_file_name(format!(
+        "{}.{}.build.owner",
+        file_name.to_string_lossy(),
+        stable_server_hash(server)
+    ))
+}
+
+#[cfg(windows)]
+pub(super) fn read_lock_owner(lock_path: &Path, database_path: &Path, server: &str) -> String {
+    fs::read_to_string(build_owner_path(database_path, server))
+        .or_else(|_| fs::read_to_string(lock_path))
+        .unwrap_or_else(|_| "owner details unavailable".to_string())
+}
+
+#[cfg(not(windows))]
+pub(super) fn read_lock_owner(lock_path: &Path, _database_path: &Path, _server: &str) -> String {
+    fs::read_to_string(lock_path).unwrap_or_else(|_| "owner details unavailable".to_string())
+}
 
 impl<C: OpcClient> IndexManager<C> {
     pub fn new(client: Arc<C>, settings: ResolvedIndexConfig) -> Self {
