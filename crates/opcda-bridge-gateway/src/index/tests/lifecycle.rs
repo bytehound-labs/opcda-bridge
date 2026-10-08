@@ -257,6 +257,169 @@ async fn disabled_global_scheduler_does_not_block_manual_refresh_or_search() {
 }
 
 #[tokio::test]
+async fn auto_refresh_preference_is_distinct_from_gateway_policy() {
+    for (enabled, paused) in [(false, false), (false, true), (true, true), (true, false)] {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(MockOpcClient::default());
+        let mut config = settings(directory.path().join("index.sqlite3"));
+        config.enabled = enabled;
+        config.paused = paused;
+        let manager = Arc::new(IndexManager::new(Arc::clone(&client), config));
+
+        manager.start_background_indexing();
+        assert_eq!(
+            manager.background_started.load(Ordering::Acquire),
+            enabled && !paused
+        );
+        manager.refresh("S", true).await.unwrap();
+        wait_for_build(&manager, IndexState::Ready).await;
+
+        let status = manager.status("S").await.unwrap();
+        assert!(status.auto_refresh_enabled);
+        assert_eq!(
+            status.scheduler.auto_refresh_policy,
+            if !enabled {
+                AutoRefreshPolicy::Disabled
+            } else if paused {
+                AutoRefreshPolicy::Paused
+            } else {
+                AutoRefreshPolicy::Allowed
+            }
+        );
+        assert_eq!(
+            status.scheduler.next_refresh_at.is_some(),
+            enabled && !paused,
+            "enabled={enabled}, paused={paused}"
+        );
+        let generation = status.active_generation;
+        let disabled = manager
+            .control("S", IndexControlAction::DisableAutoRefresh)
+            .await
+            .unwrap();
+        assert!(!disabled.auto_refresh_enabled);
+        assert!(disabled.scheduler.next_refresh_at.is_none());
+        assert_eq!(disabled.active_generation, generation);
+        assert_eq!(
+            manager
+                .search("S", "mock", 3, 10)
+                .await
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+
+        *client.inventory_events.lock().unwrap() = MockOpcClient::default()
+            .inventory_events
+            .into_inner()
+            .unwrap();
+        manager.refresh("S", true).await.unwrap();
+        wait_for_build(&manager, IndexState::Ready).await;
+        assert!(!manager.status("S").await.unwrap().auto_refresh_enabled);
+        let reenabled = manager
+            .control("S", IndexControlAction::EnableAutoRefresh)
+            .await
+            .unwrap();
+        assert!(reenabled.auto_refresh_enabled);
+        assert_eq!(
+            reenabled.scheduler.next_refresh_at.is_some(),
+            enabled && !paused
+        );
+        assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 2);
+        manager.shutdown_background_indexing().await;
+    }
+}
+
+#[tokio::test]
+async fn gateway_auto_refresh_policy_is_reported_without_an_active_index() {
+    for (enabled, paused, policy) in [
+        (true, false, AutoRefreshPolicy::Allowed),
+        (false, false, AutoRefreshPolicy::Disabled),
+        (true, true, AutoRefreshPolicy::Paused),
+    ] {
+        let mut config = settings(PathBuf::from(":memory:"));
+        config.enabled = enabled;
+        config.paused = paused;
+        let manager = IndexManager::new(Arc::new(MockOpcClient::default()), config);
+        let status = manager.status("S").await.unwrap();
+        assert_eq!(status.state, IndexState::NotIndexed);
+        assert_eq!(status.scheduler.auto_refresh_policy, policy);
+        assert!(status.scheduler.next_refresh_at.is_none());
+        manager.deleting.lock().unwrap().insert("S".into());
+        let deleting = manager.status("S").await.unwrap();
+        assert_eq!(deleting.state, IndexState::Deleting);
+        assert_eq!(deleting.scheduler.auto_refresh_policy, policy);
+    }
+}
+
+#[tokio::test]
+async fn automatic_refresh_runs_only_when_gateway_policy_allows_it() {
+    for (enabled, paused) in [(false, false), (false, true), (true, true), (true, false)] {
+        let directory = tempdir().unwrap();
+        let client = Arc::new(MockOpcClient::default());
+        let mut config = settings(directory.path().join("scheduled.sqlite3"));
+        config.enabled = enabled;
+        config.paused = paused;
+        config.refresh_interval_seconds = 1;
+        let manager = Arc::new(IndexManager::new(Arc::clone(&client), config));
+        seed_active_generation(
+            &manager,
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            "0",
+        );
+
+        manager.start_background_indexing();
+        if enabled && !paused {
+            wait_for_counter(&client.inventory_start_count, 1).await;
+            wait_for_build(&manager, IndexState::Ready).await;
+            assert!(manager.status("S").await.unwrap().active_generation > 1);
+        } else {
+            assert!(!manager.background_started.load(Ordering::Acquire));
+            assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 0);
+            assert_eq!(manager.status("S").await.unwrap().active_generation, 1);
+        }
+        manager.shutdown_background_indexing().await;
+    }
+}
+
+#[tokio::test]
+async fn disabling_auto_refresh_preserves_an_active_build_and_cached_generation() {
+    let manager = Arc::new(IndexManager::new(
+        Arc::new(MockOpcClient::default()),
+        settings(PathBuf::from(":memory:")),
+    ));
+    seed_active_generation(
+        &manager,
+        NamespaceOrganization::Hierarchical,
+        BrowseSource::Da2,
+        &timestamp_now(),
+    );
+    let control = Arc::new(RecordingInventoryControl::default());
+    let ownership = insert_runtime_build(&manager, control.clone());
+
+    let status = manager
+        .control("S", IndexControlAction::DisableAutoRefresh)
+        .await
+        .unwrap();
+    assert!(!status.auto_refresh_enabled);
+    assert_eq!(status.state, IndexState::Refreshing);
+    assert_eq!(status.active_generation, 1);
+    assert!(status.scheduler.next_refresh_at.is_none());
+    assert!(!control.cancelled.load(Ordering::Acquire));
+    assert_eq!(
+        manager
+            .search("S", "persisted", 3, 10)
+            .await
+            .unwrap()
+            .matches
+            .len(),
+        1
+    );
+    manager.finish_build_owned("S", &ownership, None);
+}
+
+#[tokio::test]
 async fn auto_refresh_can_be_disabled_without_deleting_searchable_data() {
     let directory = tempdir().unwrap();
     let manager = Arc::new(IndexManager::new(

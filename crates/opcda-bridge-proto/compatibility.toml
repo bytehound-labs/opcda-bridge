@@ -44,7 +44,7 @@ status = "supported"
 core_protocol = 1
 namespace_protocol = 2
 indexed_search_protocol = 2
-notes = "Adds durable on-demand index enrollment and per-server scheduling controls."
+notes = "Adds durable on-demand index enrollment and per-server scheduling controls. Gateway scheduling-policy diagnostics are optional and wire-additive."
 
 [[evidence]]
 client_line = "indexed"

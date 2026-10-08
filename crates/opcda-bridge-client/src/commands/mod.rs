@@ -663,6 +663,9 @@ mod tests {
                 last_commit_latency_ms: Some(21),
             }),
             scheduler: Some(opcda_bridge_proto::bridge::IndexSchedulerDiagnostics {
+                auto_refresh_policy: Some(
+                    opcda_bridge_proto::bridge::IndexAutoRefreshPolicy::Allowed as i32,
+                ),
                 next_refresh_at: Some("next".into()),
                 last_attempt_at: Some("attempt".into()),
                 last_success_at: Some("success".into()),
@@ -783,6 +786,7 @@ mod tests {
         assert_eq!(value["host"]["disk_free_bytes"], 16);
         assert_eq!(value["storage"]["last_commit_latency_ms"], 21);
         assert_eq!(value["scheduler"]["consecutive_failures"], 23);
+        assert_eq!(value["scheduler"]["auto_refresh_policy"], "allowed");
         assert_eq!(value["health"]["state"], "healthy");
         assert_eq!(value["promoting"], true);
 

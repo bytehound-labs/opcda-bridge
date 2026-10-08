@@ -6,7 +6,7 @@ applications should use the higher-level `opcda-bridge` client library instead.
 
 ```toml
 [dependencies]
-opcda-bridge-proto = "0.4"
+opcda-bridge-proto = "0.6"
 ```
 
 The protocol crate has its own independent release version. Client and gateway package versions
@@ -22,6 +22,10 @@ separate progressive streaming operation. Persistent indexed discovery uses unar
 `GetSearchIndexStatus`, `RefreshSearchIndex`, `ControlSearchIndex`, and `SearchIndex` operations.
 The first refresh validates and enrolls a registered ProgID. `ControlSearchIndex` also enables or
 disables per-server scheduled refresh and deletes an enrolled index.
+`SearchIndexStatus.configured` retains its historical name and reports only that server's saved
+auto-refresh preference. The optional `IndexSchedulerDiagnostics.auto_refresh_policy` field
+reports gateway configuration as allowed, disabled, or paused. Absence is unknown; it does not
+mean the administrative policy is disabled.
 Indexed matches contain exact ItemIDs and breadcrumb labels but never session-bound browse node
 keys.
 

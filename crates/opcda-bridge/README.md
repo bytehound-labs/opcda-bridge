@@ -81,5 +81,10 @@ preserve the server's exact identity and do not contain browse-session node keys
 `set_search_index_auto_refresh` to change scheduled-refresh eligibility without removing data,
 and `delete_search_index` to remove an enrolled index and its history.
 
+`status.scheduler.auto_refresh_policy` distinguishes `Allowed`, `Disabled`, and `Paused`
+gateway configuration from the saved server preference. `None` means the gateway has not
+reported that diagnostic. Enabling a server preference does not change gateway configuration;
+disabling it preserves the cached generation and does not cancel an active build.
+
 See the crate documentation for method signatures and the repository README for gateway setup and
 protocol details.

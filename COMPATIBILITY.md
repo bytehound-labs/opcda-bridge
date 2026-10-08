@@ -25,7 +25,7 @@ the reusable-library version implementing its protocol contract.
 | legacy | 0.1.0 - 0.3.1 | legacy | 1 | 1 | 0 | Original streaming browse contract. |
 | paged | 0.3.2 - 0.3.999 | supported | 1 | 2 | 0 | Capabilities, paged browse, browse sessions, and live search. |
 | indexed | 0.4.0 - 0.4.999 | supported | 1 | 2 | 1 | Adds persistent namespace indexing. |
-| indexed-on-demand | 0.5.0 - 0.999.999 | supported | 1 | 2 | 2 | Adds durable on-demand index enrollment and per-server scheduling controls. |
+| indexed-on-demand | 0.5.0 - 0.999.999 | supported | 1 | 2 | 2 | Adds durable on-demand index enrollment and per-server scheduling controls. Gateway scheduling-policy diagnostics are optional and wire-additive. |
 
 A pair whose required protocol ranges overlap is usable even when its
 exact package versions have not been exercised together. Such a pair is

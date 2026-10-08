@@ -47,7 +47,7 @@ It defines the supported ranges for:
 
 The generated [compatibility report](../COMPATIBILITY.md) and
 [machine-readable compatibility catalog](../compatibility.json) are derived from that source.
-Regenerate them with `python3 scripts/generate-compatibility-report.py`; do not hand-edit either
+Regenerate them with `python3 scripts/generate-compatibility-report.py --write`; do not hand-edit either
 generated output.
 
 The catalog's release lines are:
@@ -63,6 +63,12 @@ The 0.5 indexed-search boundary changes index lifecycle semantics to durable on-
 and per-server scheduling controls. Protobuf additions can be wire-compatible while introducing a
 new negotiated feature boundary. Older client/gateway pairs can continue using overlapping core
 and namespace operations without assuming that indexed-search lifecycle features exist.
+
+The 0.6 Rust API adds optional `IndexSchedulerDiagnostics.auto_refresh_policy` information.
+The additive Protobuf field preserves indexed-search protocol 2 and the existing `configured`
+field's per-server preference meaning. `allowed`, `disabled`, and `paused` describe gateway
+configuration, not an active build's pause state. An absent or unspecified value means that the
+gateway has not reported its policy; clients must not interpret absence as disabled.
 
 ## Browse and search contract
 

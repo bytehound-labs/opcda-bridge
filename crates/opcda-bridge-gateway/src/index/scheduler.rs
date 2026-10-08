@@ -1,6 +1,6 @@
 use super::{
-    HealthProbeState, IndexDb, IndexManager, IndexState, IndexStatus, QueryCache,
-    index_profile_is_compatible, parse_timestamp,
+    AutoRefreshPolicy, HealthProbeState, IndexDb, IndexManager, IndexState, IndexStatus,
+    QueryCache, index_profile_is_compatible, parse_timestamp,
 };
 use crate::config::ResolvedIndexConfig;
 use crate::controller::{InventoryLimits, default_host_metrics_provider};
@@ -750,7 +750,7 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub fn start_background_indexing(self: &Arc<Self>) {
-        if !self.settings.enabled || self.settings.paused {
+        if self.auto_refresh_policy() != AutoRefreshPolicy::Allowed {
             return;
         }
         if self.background_started.swap(true, Ordering::AcqRel) {

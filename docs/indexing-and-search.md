@@ -9,7 +9,7 @@ A fresh gateway has no enrolled servers. Start an index with `index-refresh` usi
 returned by `opcda-bridge-client servers`. The gateway validates that ProgID before persisting
 enrollment. A successful manual build creates a durable active generation; the gateway schedules
 that enrolled server for refresh according to its per-server auto-refresh setting and the global
-`index.enabled` policy. The default interval is seven days. Automatic indexing does not start a
+`index.enabled` and `index.paused` policies. The default interval is seven days. Automatic indexing does not start a
 first build on an un-enrolled server.
 
 Refreshes write to a staging generation. Promotion is an atomic metadata transition: the previous
@@ -112,6 +112,17 @@ The complete set of options and defaults is documented in the
 The gateway-wide `index.enabled` switch controls startup and scheduled work. Manual status, browse,
 search, refresh, and read operations remain available while it is disabled. Per-server scheduled
 refresh can be disabled without deleting the searchable generation.
+
+`index.enabled` defaults to `true` and `index.paused` defaults to `false`. Explicit configuration
+values take precedence. Both switches govern the background scheduler; neither is changed by a
+per-server enable/disable request. Disabling a server's preference does not cancel an active
+build; use the separate cancel control for that operation.
+
+The saved `auto_refresh_enabled` preference is not proof that scheduling is permitted.
+`scheduler.auto_refresh_policy` reports `allowed`, `disabled`, or `paused`, with disabled taking
+precedence when both administrative blockers apply. A blocked scheduler reports no next-refresh
+date. This configuration policy is separate from foreground, health, and operator pauses on an
+active build. A missing policy diagnostic from an older gateway means unknown, not disabled.
 
 ## Large-namespace acceptance runbook
 

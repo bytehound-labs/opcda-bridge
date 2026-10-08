@@ -14,11 +14,11 @@ pub use browse::{
     Capabilities, DEFAULT_PAGE_SIZE, NamespaceOrganization,
 };
 pub use index::{
-    DEFAULT_INDEX_SEARCH_MAX_RESULTS, IndexControllerState, IndexForegroundDiagnostics,
-    IndexHealthDiagnostics, IndexHealthState, IndexHostDiagnostics, IndexInventoryLimits,
-    IndexPauseReason, IndexSchedulerDiagnostics, IndexStorageDiagnostics, IndexedSearchMatch,
-    IndexedSearchProgress, SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse,
-    SearchIndexState, SearchIndexStatus,
+    DEFAULT_INDEX_SEARCH_MAX_RESULTS, IndexAutoRefreshPolicy, IndexControllerState,
+    IndexForegroundDiagnostics, IndexHealthDiagnostics, IndexHealthState, IndexHostDiagnostics,
+    IndexInventoryLimits, IndexPauseReason, IndexSchedulerDiagnostics, IndexStorageDiagnostics,
+    IndexedSearchMatch, IndexedSearchProgress, SearchIndexControlAction, SearchIndexRequest,
+    SearchIndexResponse, SearchIndexState, SearchIndexStatus,
 };
 pub use search::{
     DEFAULT_SEARCH_MAX_RESULTS, SearchCompleted, SearchEvent, SearchMatch, SearchMatchMode,

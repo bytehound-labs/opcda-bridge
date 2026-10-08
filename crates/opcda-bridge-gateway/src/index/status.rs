@@ -81,6 +81,7 @@ pub struct StorageDiagnostics {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchedulerDiagnostics {
+    pub auto_refresh_policy: AutoRefreshPolicy,
     pub next_refresh_at: Option<String>,
     pub last_attempt_at: Option<String>,
     pub last_success_at: Option<String>,
@@ -88,6 +89,14 @@ pub struct SchedulerDiagnostics {
     pub retry_after: Option<String>,
     pub consecutive_failures: u32,
     pub circuit_open: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoRefreshPolicy {
+    #[default]
+    Allowed,
+    Disabled,
+    Paused,
 }
 
 pub struct ForegroundGuard<C: OpcClient> {
@@ -442,6 +451,7 @@ impl<C: OpcClient> IndexManager<C> {
         let deletion_error = self.deletion_error(server)?;
         if is_deleting {
             let mut status = empty_status(server, false, IndexState::Deleting);
+            status.scheduler.auto_refresh_policy = self.auto_refresh_policy();
             status.sentinel_configured = self.settings.sentinel_tag.is_some();
             let storage = storage_diagnostics_for_path(&self.settings.database_path);
             status.database_bytes = storage
@@ -475,6 +485,7 @@ impl<C: OpcClient> IndexManager<C> {
         let sentinel_configured = self.settings.sentinel_tag.is_some();
         let Some(enrollment) = enrollment else {
             let mut status = empty_status(server, false, IndexState::NotIndexed);
+            status.scheduler.auto_refresh_policy = self.auto_refresh_policy();
             status.sentinel_configured = sentinel_configured;
             if let Some(error) = deletion_error {
                 status.state = IndexState::Failed;
@@ -514,12 +525,8 @@ impl<C: OpcClient> IndexManager<C> {
         status.host_metrics = self.host_metrics.latest();
         status.storage = storage;
         self.apply_runtime_status(&mut status, &runtime);
-        status.scheduler = self.scheduler_diagnostics(
-            server,
-            &rows,
-            &runtime,
-            enrollment.auto_refresh_enabled && self.settings.enabled,
-        );
+        status.scheduler =
+            self.scheduler_diagnostics(server, &rows, &runtime, enrollment.auto_refresh_enabled);
         Ok(status)
     }
 
@@ -765,19 +772,32 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
+    pub(super) fn auto_refresh_policy(&self) -> AutoRefreshPolicy {
+        if !self.settings.enabled {
+            AutoRefreshPolicy::Disabled
+        } else if self.settings.paused {
+            AutoRefreshPolicy::Paused
+        } else {
+            AutoRefreshPolicy::Allowed
+        }
+    }
+
     pub(super) fn scheduler_diagnostics(
         &self,
         server: &str,
         rows: &StatusRows,
         runtime: &RuntimeStatus,
-        scheduled: bool,
+        auto_refresh_enabled: bool,
     ) -> SchedulerDiagnostics {
         let last_success_at = rows
             .active
             .as_ref()
             .and_then(|row| row.completed_at.clone());
+        let auto_refresh_policy = self.auto_refresh_policy();
         let mut scheduler = SchedulerDiagnostics {
-            next_refresh_at: scheduled
+            auto_refresh_policy,
+            next_refresh_at: (auto_refresh_enabled
+                && auto_refresh_policy == AutoRefreshPolicy::Allowed)
                 .then(|| self.next_refresh_at(server, last_success_at.as_deref()))
                 .flatten(),
             last_attempt_at: runtime

@@ -3,10 +3,11 @@ use super::browse::{
     Capabilities, NamespaceOrganization,
 };
 use super::index::{
-    IndexControllerState, IndexForegroundDiagnostics, IndexHealthDiagnostics, IndexHealthState,
-    IndexHostDiagnostics, IndexInventoryLimits, IndexPauseReason, IndexSchedulerDiagnostics,
-    IndexStorageDiagnostics, IndexedSearchMatch, IndexedSearchProgress, SearchIndexControlAction,
-    SearchIndexRequest, SearchIndexResponse, SearchIndexState, SearchIndexStatus,
+    IndexAutoRefreshPolicy, IndexControllerState, IndexForegroundDiagnostics,
+    IndexHealthDiagnostics, IndexHealthState, IndexHostDiagnostics, IndexInventoryLimits,
+    IndexPauseReason, IndexSchedulerDiagnostics, IndexStorageDiagnostics, IndexedSearchMatch,
+    IndexedSearchProgress, SearchIndexControlAction, SearchIndexRequest, SearchIndexResponse,
+    SearchIndexState, SearchIndexStatus,
 };
 use super::search::{
     SearchCompleted, SearchEvent, SearchMatch, SearchMatchMode, SearchProgress, SearchRequest,
@@ -69,6 +70,17 @@ fn search_index_state(value: i32) -> Result<SearchIndexState> {
         proto::SearchIndexState::Promoting => Ok(SearchIndexState::Promoting),
         proto::SearchIndexState::Failed => Ok(SearchIndexState::Failed),
         proto::SearchIndexState::Deleting => Ok(SearchIndexState::Deleting),
+    }
+}
+
+fn index_auto_refresh_policy(value: i32) -> Result<Option<IndexAutoRefreshPolicy>> {
+    match proto::IndexAutoRefreshPolicy::try_from(value)
+        .map_err(|_| invalid_enum("index auto-refresh policy", value))?
+    {
+        proto::IndexAutoRefreshPolicy::Unspecified => Ok(None),
+        proto::IndexAutoRefreshPolicy::Allowed => Ok(Some(IndexAutoRefreshPolicy::Allowed)),
+        proto::IndexAutoRefreshPolicy::Disabled => Ok(Some(IndexAutoRefreshPolicy::Disabled)),
+        proto::IndexAutoRefreshPolicy::Paused => Ok(Some(IndexAutoRefreshPolicy::Paused)),
     }
 }
 
@@ -329,18 +341,26 @@ impl TryFrom<proto::SearchIndexStatus> for SearchIndexStatus {
                         last_commit_latency_ms: diagnostics.last_commit_latency_ms,
                     }
                 }),
-            scheduler: value.scheduler.map_or_else(
-                IndexSchedulerDiagnostics::default,
-                |diagnostics| IndexSchedulerDiagnostics {
-                    next_refresh_at: diagnostics.next_refresh_at,
-                    last_attempt_at: diagnostics.last_attempt_at,
-                    last_success_at: diagnostics.last_success_at,
-                    last_success_duration_ms: diagnostics.last_success_duration_ms,
-                    retry_after: diagnostics.retry_after,
-                    consecutive_failures: diagnostics.consecutive_failures,
-                    circuit_open: diagnostics.circuit_open,
-                },
-            ),
+            scheduler: value
+                .scheduler
+                .map(|diagnostics| -> Result<IndexSchedulerDiagnostics> {
+                    Ok(IndexSchedulerDiagnostics {
+                        auto_refresh_policy: diagnostics
+                            .auto_refresh_policy
+                            .map(index_auto_refresh_policy)
+                            .transpose()?
+                            .flatten(),
+                        next_refresh_at: diagnostics.next_refresh_at,
+                        last_attempt_at: diagnostics.last_attempt_at,
+                        last_success_at: diagnostics.last_success_at,
+                        last_success_duration_ms: diagnostics.last_success_duration_ms,
+                        retry_after: diagnostics.retry_after,
+                        consecutive_failures: diagnostics.consecutive_failures,
+                        circuit_open: diagnostics.circuit_open,
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default(),
             health: value
                 .health
                 .map(|diagnostics| -> Result<IndexHealthDiagnostics> {
@@ -919,6 +939,7 @@ mod tests {
                     last_commit_latency_ms: Some(21),
                 }),
                 scheduler: Some(proto::IndexSchedulerDiagnostics {
+                    auto_refresh_policy: Some(proto::IndexAutoRefreshPolicy::Allowed as i32),
                     next_refresh_at: Some("next".into()),
                     last_attempt_at: Some("attempt".into()),
                     last_success_at: Some("success".into()),
@@ -1006,6 +1027,7 @@ mod tests {
         assert_eq!(
             typed.status.scheduler,
             IndexSchedulerDiagnostics {
+                auto_refresh_policy: Some(IndexAutoRefreshPolicy::Allowed),
                 next_refresh_at: Some("next".into()),
                 last_attempt_at: Some("attempt".into()),
                 last_success_at: Some("success".into()),
@@ -1058,5 +1080,57 @@ mod tests {
             SearchIndexResponse::try_from(proto::SearchIndexResponse::default()),
             Err(Error::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn auto_refresh_policy_preserves_legacy_unknown_and_validates_wire_values() {
+        for (wire, expected) in [
+            (None, None),
+            (
+                Some(proto::IndexAutoRefreshPolicy::Unspecified as i32),
+                None,
+            ),
+            (
+                Some(proto::IndexAutoRefreshPolicy::Allowed as i32),
+                Some(IndexAutoRefreshPolicy::Allowed),
+            ),
+            (
+                Some(proto::IndexAutoRefreshPolicy::Disabled as i32),
+                Some(IndexAutoRefreshPolicy::Disabled),
+            ),
+            (
+                Some(proto::IndexAutoRefreshPolicy::Paused as i32),
+                Some(IndexAutoRefreshPolicy::Paused),
+            ),
+        ] {
+            let status = SearchIndexStatus::try_from(proto::SearchIndexStatus {
+                scheduler: Some(proto::IndexSchedulerDiagnostics {
+                    auto_refresh_policy: wire,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(status.scheduler.auto_refresh_policy, expected);
+        }
+        for (policy, label) in [
+            (IndexAutoRefreshPolicy::Allowed, "allowed"),
+            (IndexAutoRefreshPolicy::Disabled, "disabled"),
+            (IndexAutoRefreshPolicy::Paused, "paused"),
+        ] {
+            assert_eq!(policy.to_string(), label);
+        }
+        let error = SearchIndexStatus::try_from(proto::SearchIndexStatus {
+            scheduler: Some(proto::IndexSchedulerDiagnostics {
+                auto_refresh_policy: Some(99),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "protocol error: gateway returned unknown index auto-refresh policy value 99"
+        );
     }
 }

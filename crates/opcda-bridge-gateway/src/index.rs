@@ -27,8 +27,8 @@ pub use self::enrollment::IndexOperationError;
 pub(crate) use self::query::normalize_query;
 pub use self::query::{IndexedMatch, IndexedSearch, SearchMode};
 pub use self::status::{
-    ForegroundGuard, ForegroundMetrics, HealthProbeState, IndexState, IndexStatus,
-    SchedulerDiagnostics, StorageDiagnostics,
+    AutoRefreshPolicy, ForegroundGuard, ForegroundMetrics, HealthProbeState, IndexState,
+    IndexStatus, SchedulerDiagnostics, StorageDiagnostics,
 };
 
 mod enrollment;

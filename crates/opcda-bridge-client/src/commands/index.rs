@@ -134,6 +134,7 @@ impl From<IndexStorageDiagnostics> for IndexStorageOutput {
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct IndexSchedulerOutput {
+    auto_refresh_policy: Option<String>,
     next_refresh_at: Option<String>,
     last_attempt_at: Option<String>,
     last_success_at: Option<String>,
@@ -146,6 +147,7 @@ struct IndexSchedulerOutput {
 impl From<IndexSchedulerDiagnostics> for IndexSchedulerOutput {
     fn from(value: IndexSchedulerDiagnostics) -> Self {
         Self {
+            auto_refresh_policy: value.auto_refresh_policy.map(|policy| policy.to_string()),
             next_refresh_at: value.next_refresh_at,
             last_attempt_at: value.last_attempt_at,
             last_success_at: value.last_success_at,
@@ -250,8 +252,16 @@ fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
         ("State", status.state.clone()),
         ("Promoting", status.promoting.to_string()),
         (
-            "Auto refresh enabled",
+            "Server auto-refresh preference",
             status.auto_refresh_enabled.to_string(),
+        ),
+        (
+            "Gateway auto-refresh policy",
+            status
+                .scheduler
+                .auto_refresh_policy
+                .clone()
+                .unwrap_or_else(|| "unknown".into()),
         ),
         ("Active generation", status.active_generation.to_string()),
         ("Entries", status.entry_count.to_string()),

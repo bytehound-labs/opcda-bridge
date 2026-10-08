@@ -85,5 +85,8 @@ cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-
   values; do not infer hierarchy by splitting tag punctuation.
 - Treat protocol-feature versions and exact-pair test evidence as separate from crate versions.
   Update the compatibility catalog and generated report whenever a protocol boundary changes.
+- The saved server auto-refresh preference is separate from gateway policy. Scheduler startup and
+  next-refresh diagnostics share the enabled/unpaused gate; optional wire policy is unknown when
+  absent. Preference controls never change global configuration or cancel an active build.
 
 The detailed user-facing references are linked from the [README](README.md).

@@ -167,7 +167,9 @@ server value.
 Configure index-wide behavior in the gateway TOML file under `[index]`. SQLite owns enrolled
 servers and each server's auto-refresh setting; a fresh gateway has no enrolled servers and never
 starts an automatic first build. A successful manually enrolled index is refreshed weekly by
-default when its per-server auto-refresh setting and global `index.enabled` switch permit it.
+default when its per-server auto-refresh setting, global `index.enabled` switch, and
+`index.paused` startup policy permit it. Status reports the gateway policy separately from
+the saved preference and omits the next-refresh date while automatic scheduling is blocked.
 Disabling per-server auto-refresh preserves its searchable generation; deleting an index removes
 its enrollment, generations, entries, and retry state after coordinating any active build. Delete
 returns a temporary `deleting` status while cleanup runs, then reaches `not-indexed`. The gateway

@@ -263,6 +263,16 @@ message IndexSchedulerDiagnostics {
   optional string retry_after = 5;
   uint32 consecutive_failures = 6;
   bool circuit_open = 7;
+  // Gateway configuration policy, independent of the saved server preference.
+  // Absence means an older gateway does not report this diagnostic.
+  optional IndexAutoRefreshPolicy auto_refresh_policy = 8;
+}
+
+enum IndexAutoRefreshPolicy {
+  INDEX_AUTO_REFRESH_POLICY_UNSPECIFIED = 0;
+  INDEX_AUTO_REFRESH_POLICY_ALLOWED = 1;
+  INDEX_AUTO_REFRESH_POLICY_DISABLED = 2;
+  INDEX_AUTO_REFRESH_POLICY_PAUSED = 3;
 }
 
 message IndexHealthDiagnostics {

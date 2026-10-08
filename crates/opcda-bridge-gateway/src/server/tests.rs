@@ -178,6 +178,30 @@ fn maps_index_status_progress_matches_and_errors() {
         storage: crate::index::StorageDiagnostics::default(),
         scheduler: crate::index::SchedulerDiagnostics::default(),
     };
+    for (policy, expected) in [
+        (
+            crate::index::AutoRefreshPolicy::Allowed,
+            opcda_bridge_proto::bridge::IndexAutoRefreshPolicy::Allowed,
+        ),
+        (
+            crate::index::AutoRefreshPolicy::Disabled,
+            opcda_bridge_proto::bridge::IndexAutoRefreshPolicy::Disabled,
+        ),
+        (
+            crate::index::AutoRefreshPolicy::Paused,
+            opcda_bridge_proto::bridge::IndexAutoRefreshPolicy::Paused,
+        ),
+    ] {
+        let mut status = base.clone();
+        status.scheduler.auto_refresh_policy = policy;
+        assert_eq!(
+            map_index_status(status)
+                .scheduler
+                .unwrap()
+                .auto_refresh_policy,
+            Some(expected as i32)
+        );
+    }
     for (state, expected) in [
         (
             crate::controller::ControllerState::Ramping,
