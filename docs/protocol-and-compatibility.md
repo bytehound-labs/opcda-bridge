@@ -39,11 +39,11 @@ The canonical catalog is
 [`crates/opcda-bridge-proto/compatibility.toml`](../crates/opcda-bridge-proto/compatibility.toml).
 It defines the supported ranges for:
 
-| Feature        | Contract | Operations                                                                     |
-| -------------- | -------: | ------------------------------------------------------------------------------ |
-| Core           |        1 | Server discovery, reads, and writes                                            |
-| Namespace      |        2 | Capabilities, paged browse, browse sessions, and live search                   |
-| Indexed search |        2 | Durable on-demand index enrollment, search, and per-server scheduling controls |
+| Feature        | Contract | Operations                                                                                 |
+| -------------- | -------: | ------------------------------------------------------------------------------------------ |
+| Core           |        1 | Server discovery, reads, and writes                                                        |
+| Namespace      |        2 | Capabilities, paged browse, browse sessions, and live search                               |
+| Indexed search |        3 | Durable manual enrollment, always-participating usable indexes, search, and build controls |
 
 The generated [compatibility report](../COMPATIBILITY.md) and
 [machine-readable compatibility catalog](../compatibility.json) are derived from that source.
@@ -57,16 +57,21 @@ The catalog's release lines are:
 | `legacy`            | 0.1.0 through 0.3.1     | Core 1, original streaming browse     |
 | `paged`             | 0.3.2 through 0.3.999   | Core 1 and namespace 2                |
 | `indexed`           | 0.4.0 through 0.4.999   | Core 1, namespace 2, indexed search 1 |
-| `indexed-on-demand` | 0.5.0 through 0.999.999 | Core 1, namespace 2, indexed search 2 |
+| `indexed-on-demand` | 0.5.0 through 0.5.999   | Core 1, namespace 2, indexed search 2 |
+| `indexed-always-on` | 0.6.0 through 0.999.999 | Core 1, namespace 2, indexed search 3 |
 
 The 0.5 indexed-search boundary changes index lifecycle semantics to durable on-demand enrollment
 and per-server scheduling controls. Protobuf additions can be wire-compatible while introducing a
 new negotiated feature boundary. Older client/gateway pairs can continue using overlapping core
 and namespace operations without assuming that indexed-search lifecycle features exist.
 
-The 0.6 Rust API adds optional `IndexSchedulerDiagnostics.auto_refresh_policy` information.
-The additive Protobuf field preserves indexed-search protocol 2 and the existing `configured`
-field's per-server preference meaning. `allowed`, `disabled`, and `paused` describe gateway
+The 0.6 indexed-search boundary removes per-server opt-in/out. Status field 3 (`configured`)
+and control values 4/5 (enable/disable auto-refresh) are reserved, including their names; remaining
+RPCs and control numbers are preserved. Every usable enrolled index participates under gateway
+policy. Cancel defers automatic work until the next configured interval, and Delete removes
+enrollment until another manual refresh.
+
+Optional `IndexSchedulerDiagnostics.auto_refresh_policy` values `allowed`, `disabled`, and `paused` describe gateway
 configuration, not an active build's pause state. An absent or unspecified value means that the
 gateway has not reported its policy; clients must not interpret absence as disabled.
 
@@ -106,8 +111,9 @@ Protobuf packages, services, RPCs, fields, field numbers, and enum values. Do no
 contract solely to satisfy a linter.
 
 The gateway migrates older indexed-search SQLite databases transactionally through schema 2, 3,
-and 4. Existing generations and full-text data are preserved; only usable active generations are
-enabled for scheduled refresh automatically.
+4, and 5. Existing generations and full-text data are preserved; all usable active generations
+participate automatically. Schema 5 removes retired preference columns. Back up consistently
+before upgrading; older binaries require the pre-migration database for rollback.
 
 ## Related references
 

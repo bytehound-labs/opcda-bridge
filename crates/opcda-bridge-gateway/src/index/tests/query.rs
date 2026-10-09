@@ -885,7 +885,6 @@ fn cached_search(server: &str) -> IndexedSearch {
         status: IndexStatus {
             server: server.into(),
             state: IndexState::Ready,
-            auto_refresh_enabled: false,
             active_generation: 1,
             entry_count: 0,
             unique_item_count: 0,

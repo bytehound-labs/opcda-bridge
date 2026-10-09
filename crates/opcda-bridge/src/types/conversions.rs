@@ -253,8 +253,6 @@ impl From<SearchIndexControlAction> for proto::SearchIndexControlAction {
             SearchIndexControlAction::Pause => Self::Pause,
             SearchIndexControlAction::Resume => Self::Resume,
             SearchIndexControlAction::Cancel => Self::Cancel,
-            SearchIndexControlAction::EnableAutoRefresh => Self::EnableAutoRefresh,
-            SearchIndexControlAction::DisableAutoRefresh => Self::DisableAutoRefresh,
             SearchIndexControlAction::Delete => Self::Delete,
         }
     }
@@ -281,7 +279,6 @@ impl TryFrom<proto::SearchIndexStatus> for SearchIndexStatus {
         Ok(Self {
             server: value.server,
             state: search_index_state(value.state)?,
-            auto_refresh_enabled: value.configured,
             active_generation: value.active_generation,
             entry_count: value.entry_count,
             unique_item_count: value.unique_item_count,
@@ -594,14 +591,6 @@ mod tests {
                 proto::SearchIndexControlAction::Cancel,
             ),
             (
-                SearchIndexControlAction::EnableAutoRefresh,
-                proto::SearchIndexControlAction::EnableAutoRefresh,
-            ),
-            (
-                SearchIndexControlAction::DisableAutoRefresh,
-                proto::SearchIndexControlAction::DisableAutoRefresh,
-            ),
-            (
                 SearchIndexControlAction::Delete,
                 proto::SearchIndexControlAction::Delete,
             ),
@@ -881,7 +870,6 @@ mod tests {
             status: Some(proto::SearchIndexStatus {
                 server: "Yokogawa.CSHIS_OPC.1".into(),
                 state: proto::SearchIndexState::Refreshing as i32,
-                configured: true,
                 active_generation: 7,
                 entry_count: 100_001,
                 unique_item_count: 100_000,

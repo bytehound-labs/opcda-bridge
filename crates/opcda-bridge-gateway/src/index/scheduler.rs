@@ -36,6 +36,7 @@ pub(super) struct RuntimeBuild {
     pub(super) started_at: String,
     pub(super) foreground_users: usize,
     pub(super) operator_paused: bool,
+    pub(super) operator_cancelled_until: Option<SystemTime>,
     pub(super) quiet_until: Option<Instant>,
     pub(super) effective_limits: Option<InventoryLimits>,
     pub(super) controller_state: Option<crate::controller::ControllerState>,
@@ -929,7 +930,7 @@ impl<C: OpcClient> IndexManager<C> {
             status.state,
             IndexState::Stale | IndexState::Failed | IndexState::NotIndexed
         ) && self.automatic_refresh_allowed(status)
-            && let Err(error) = self.refresh(server, false).await
+            && let Err(error) = self.refresh_enrolled(server, false).await
         {
             tracing::warn!(target: "opcda_bridge_gateway::index",
                 server = %server,
@@ -947,22 +948,67 @@ impl<C: OpcClient> IndexManager<C> {
         if !self.automatic_refresh_allowed(status) {
             tracing::debug!(target: "opcda_bridge_gateway::index",
                 server = %server,
-                "automatic namespace index rebuild is waiting for a maintenance window"
+                "automatic namespace index rebuild is deferred by scheduler policy"
             );
             return;
         }
-        if let Err(error) = self.with_database_write(|db| db.clear_server(server)) {
-            tracing::warn!(target: "opcda_bridge_gateway::index",
-                server = %server,
-                error = %error,
-                "unable to invalidate namespace index after profile change"
-            );
-            return;
+        let ownership = match self.reserve_refresh_build(server, false) {
+            Ok(Some(ownership)) => ownership,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(target: "opcda_bridge_gateway::index", server, error = %error,
+                    "unable to reserve namespace index rebuild after profile change");
+                return;
+            }
+        };
+        let invalidated = self
+            .with_database_write(|db| {
+                let cancelled = self
+                    .pending_cancels
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("index pending-cancel lock poisoned"))?
+                    .contains(server);
+                if cancelled
+                    || !db.is_enrolled(server)?
+                    || !db.status_rows(server)?.iter().any(|row| {
+                        row.state == "active"
+                            && row.generation == status.active_generation
+                            && row.completed_at == status.scheduler.last_success_at
+                    })
+                {
+                    return Ok(false);
+                }
+                db.clear_server(server)?;
+                Ok(true)
+            })
+            .and_then(|invalidated| {
+                if invalidated {
+                    self.cache
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("index cache lock poisoned"))?
+                        .clear_server(server);
+                }
+                Ok(invalidated)
+            });
+        match invalidated {
+            Ok(true) => {}
+            Ok(false) => {
+                self.finish_build_owned(server, &ownership, None);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(target: "opcda_bridge_gateway::index", server, error = %error,
+                    "unable to invalidate namespace index after profile change");
+                if let Err(persistence_error) =
+                    self.record_start_failure(server, &ownership, &error.to_string())
+                {
+                    tracing::error!(target: "opcda_bridge_gateway::index", server, error = %persistence_error,
+                        "unable to persist namespace index invalidation failure");
+                }
+                return;
+            }
         }
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear_server(server);
-        }
-        if let Err(error) = self.refresh(server, true).await {
+        if let Err(error) = self.refresh_reserved(server, ownership).await {
             tracing::warn!(target: "opcda_bridge_gateway::index",
                 server = %server,
                 error = %error,
@@ -976,6 +1022,9 @@ impl<C: OpcClient> IndexManager<C> {
         server: &str,
         status: &IndexStatus,
     ) {
+        if !self.automatic_refresh_allowed(status) {
+            return;
+        }
         let profile_changed = match self.active_profile_changed(server).await {
             Ok(profile_changed) => profile_changed,
             Err(error) => {
@@ -987,10 +1036,24 @@ impl<C: OpcClient> IndexManager<C> {
                 return;
             }
         };
+        let latest = match self.status(server).await {
+            Ok(latest) => latest,
+            Err(error) => {
+                tracing::warn!(target: "opcda_bridge_gateway::index", server, error = %error,
+                    "unable to recheck namespace index before automatic refresh");
+                return;
+            }
+        };
+        if latest.active_generation != status.active_generation
+            || latest.scheduler.last_success_at != status.scheduler.last_success_at
+            || !self.automatic_refresh_allowed(&latest)
+        {
+            return;
+        }
         if profile_changed {
-            self.refresh_after_profile_change(server, status).await;
+            self.refresh_after_profile_change(server, &latest).await;
         } else {
-            self.refresh_active_generation_if_due(server, status).await;
+            self.refresh_active_generation_if_due(server, &latest).await;
         }
     }
 
@@ -1012,7 +1075,19 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub(super) fn automatic_refresh_allowed(&self, status: &IndexStatus) -> bool {
-        status.auto_refresh_enabled
+        self.auto_refresh_policy() == AutoRefreshPolicy::Allowed
+            && status.active_generation > 0
+            && status.scheduler.next_refresh_at.is_some()
+            && matches!(
+                status.state,
+                IndexState::Ready | IndexState::Stale | IndexState::Failed
+            )
+            && status
+                .scheduler
+                .retry_after
+                .as_deref()
+                .and_then(parse_timestamp)
+                .is_none_or(|deadline| SystemTime::now() >= deadline)
             && (self.settings.maintenance_windows.is_empty() || self.maintenance_window_is_open())
     }
 
@@ -1034,7 +1109,7 @@ impl<C: OpcClient> IndexManager<C> {
             .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
         let state = runtime.entry(server.to_string()).or_default();
         if state.build.is_none() {
-            state.retry_after = persisted.0;
+            state.retry_after = state.retry_after.max(persisted.0);
             state.consecutive_failures = persisted.1;
             state.circuit_open = persisted.2
                 && state
@@ -1056,10 +1131,11 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub(super) fn persist_retry_state(&self, server: &str) -> anyhow::Result<()> {
-        let (retry_after, failures, circuit_open) = self
+        let runtime = self
             .runtime
             .lock()
-            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
+        let (retry_after, failures, circuit_open) = runtime
             .get(server)
             .map(|state| {
                 (

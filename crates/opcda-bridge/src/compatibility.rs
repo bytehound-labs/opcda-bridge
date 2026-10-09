@@ -576,14 +576,14 @@ mod tests {
         );
         assert_eq!(
             profile.feature(CompatibilityFeature::IndexedSearch),
-            Some(ProtocolVersionRange::exact(2))
+            Some(ProtocolVersionRange::exact(3))
         );
         assert_eq!(profile.application_version.as_deref(), Some("0.5.0"));
 
         let relabeled = current_client_profile("application-build");
         assert_eq!(
             relabeled.feature(CompatibilityFeature::IndexedSearch),
-            Some(ProtocolVersionRange::exact(2))
+            Some(ProtocolVersionRange::exact(3))
         );
     }
 

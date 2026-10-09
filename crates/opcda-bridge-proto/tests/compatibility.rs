@@ -6,6 +6,13 @@ use opcda_bridge_proto::bridge::{
 use prost::Message;
 
 #[test]
+fn retired_auto_refresh_controls_are_not_valid_enum_values() {
+    for retired in [4, 5] {
+        assert!(opcda_bridge_proto::bridge::SearchIndexControlAction::try_from(retired).is_err());
+    }
+}
+
+#[test]
 fn round_trips_paged_browse_request_and_response() {
     let request = BrowseRequest {
         server: "S".into(),
@@ -119,7 +126,6 @@ fn round_trips_indexed_search_response_without_session_tokens() {
         status: Some(SearchIndexStatus {
             server: "Yokogawa.CSHIS_OPC.1".into(),
             state: SearchIndexState::Ready as i32,
-            configured: true,
             active_generation: 3,
             ..Default::default()
         }),

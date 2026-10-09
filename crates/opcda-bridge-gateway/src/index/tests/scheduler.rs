@@ -1614,6 +1614,11 @@ async fn build_loop_keeps_build_failure_when_shutdown_also_fails() {
 
 #[tokio::test]
 async fn automatic_refresh_logs_reachable_invalidation_and_refresh_failures() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
     let directory = tempdir().unwrap();
 
     let clear_client = Arc::new(MockOpcClient::default());
@@ -1654,6 +1659,24 @@ async fn automatic_refresh_logs_reachable_invalidation_and_refresh_failures() {
     assert_eq!(
         clear_client.inventory_start_count.load(Ordering::Relaxed),
         0
+    );
+    assert!(!clear_manager.active_builds.lock().unwrap().contains("S"));
+    clear_manager
+        .with_database(|db| {
+            db.set_retry_state("S", None, 0, false)?;
+            db.connection.execute_batch(
+                "CREATE TRIGGER fail_attempt BEFORE INSERT ON generations
+                 BEGIN SELECT RAISE(ABORT, 'failure audit rejected'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    clear_manager.runtime.lock().unwrap().clear();
+    clear_manager.refresh_if_due("S").await;
+    assert!(!clear_manager.active_builds.lock().unwrap().contains("S"));
+    assert_eq!(
+        clear_manager.status("S").await.unwrap().active_generation,
+        1
     );
 
     let rebuild_client = Arc::new(LifecycleClient::new(
@@ -1985,11 +2008,7 @@ async fn stale_and_adaptive_cancellation_scheduler_paths_are_covered() {
     let mut maintenance_config = settings(directory.path().join("invalid-maintenance.sqlite3"));
     maintenance_config.maintenance_windows = vec!["invalid".into()];
     let maintenance = IndexManager::new(Arc::new(MockOpcClient::default()), maintenance_config);
-    assert!(!maintenance.automatic_refresh_allowed(&empty_status(
-        "S",
-        true,
-        IndexState::NotIndexed
-    )));
+    assert!(!maintenance.automatic_refresh_allowed(&empty_status("S", IndexState::NotIndexed)));
 
     let mut adaptive_config = settings(directory.path().join("adaptive-cancel.sqlite3"));
     adaptive_config.adaptive = true;
@@ -2156,7 +2175,7 @@ async fn split_scheduler_shutdown_and_cleanup_short_circuits_are_safe() {
         Arc::new(MockOpcClient::default()),
         settings(directory.path().join("scheduler-split.sqlite3")),
     ));
-    let partial = empty_status("S", false, IndexState::Partial);
+    let partial = empty_status("S", IndexState::Partial);
     assert_eq!(
         manager.refresh_delay_for_status("S", &partial),
         Duration::from_secs(30)

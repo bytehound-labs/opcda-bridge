@@ -178,7 +178,6 @@ impl From<IndexHealthDiagnostics> for IndexHealthOutput {
 struct IndexStatusOutput {
     server: String,
     state: String,
-    auto_refresh_enabled: bool,
     active_generation: u64,
     entry_count: u64,
     unique_item_count: u64,
@@ -207,7 +206,6 @@ impl From<SearchIndexStatus> for IndexStatusOutput {
         Self {
             server: value.server,
             state: value.state.to_string(),
-            auto_refresh_enabled: value.auto_refresh_enabled,
             active_generation: value.active_generation,
             entry_count: value.entry_count,
             unique_item_count: value.unique_item_count,
@@ -251,10 +249,6 @@ fn index_status_rows(status: &IndexStatusOutput) -> Vec<IndexStatusRow> {
         ("Server", status.server.clone()),
         ("State", status.state.clone()),
         ("Promoting", status.promoting.to_string()),
-        (
-            "Server auto-refresh preference",
-            status.auto_refresh_enabled.to_string(),
-        ),
         (
             "Gateway auto-refresh policy",
             status
@@ -724,7 +718,6 @@ mod tests {
         let status = IndexStatusOutput {
             server: "S".into(),
             state: "ready".into(),
-            auto_refresh_enabled: true,
             active_generation: 1,
             entry_count: 1,
             unique_item_count: 1,

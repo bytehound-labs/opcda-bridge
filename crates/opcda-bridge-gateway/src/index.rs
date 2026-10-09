@@ -21,7 +21,7 @@ use self::scheduler::{
     wait_with_cancellation,
 };
 use self::status::{ForegroundMetricState, PauseOverlayState, percentile};
-use self::store::{DbStatus, Enrollment, IndexDb, StatusRows, index_profile_is_compatible};
+use self::store::{DbStatus, IndexDb, StatusRows, index_profile_is_compatible};
 
 pub use self::enrollment::IndexOperationError;
 pub(crate) use self::query::normalize_query;
@@ -99,8 +99,6 @@ pub enum IndexControlAction {
     Pause,
     Resume,
     Cancel,
-    EnableAutoRefresh,
-    DisableAutoRefresh,
     Delete,
 }
 

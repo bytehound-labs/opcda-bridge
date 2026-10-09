@@ -1,5 +1,61 @@
 use super::*;
 
+#[test]
+fn legacy_opted_out_indexes_migrate_to_always_participating_without_losing_data() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy-opted-out.sqlite3");
+    let mut db = IndexDb::open(&path).unwrap();
+    db.enroll("S", "1").unwrap();
+    let generation = db
+        .start_generation(
+            "S",
+            NamespaceOrganization::Hierarchical,
+            BrowseSource::Da2,
+            "1",
+        )
+        .unwrap();
+    db.insert_entries(
+        "S",
+        generation,
+        &[inventory_entry("Persisted", "Persisted.Tag")],
+    )
+    .unwrap();
+    db.promote("S", generation, "2", &completed_progress(1))
+        .unwrap();
+    db.connection
+        .execute_batch(
+            "ALTER TABLE enrolled_servers RENAME TO legacy_fixture_enrollment;
+             CREATE TABLE enrolled_servers (
+                 server TEXT PRIMARY KEY NOT NULL,
+                 auto_refresh_enabled INTEGER NOT NULL DEFAULT 1
+                   CHECK (auto_refresh_enabled IN (0, 1)),
+                 enrolled_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             INSERT INTO enrolled_servers
+               SELECT server, 0, enrolled_at, enrolled_at FROM legacy_fixture_enrollment;
+             DROP TABLE legacy_fixture_enrollment;
+             UPDATE index_meta SET value = '4' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    drop(db);
+
+    let db = IndexDb::open(&path).unwrap();
+    assert_eq!(db.scheduled_servers().unwrap(), vec!["S"]);
+    let obsolete_columns: u32 = db
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('enrolled_servers')
+             WHERE name IN ('auto_refresh_enabled', 'updated_at')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(obsolete_columns, 0);
+    assert_eq!(db.status_rows("S").unwrap()[0].generation, generation);
+    assert_eq!(db.status_rows("S").unwrap()[0].entry_count, 1);
+}
+
 #[tokio::test]
 async fn generation_start_failure_is_recorded_and_reported() {
     let directory = tempdir().unwrap();
@@ -11,7 +67,7 @@ async fn generation_start_failure_is_recorded_and_reported() {
         Arc::clone(&client),
         settings(directory.path().join("generation-lock-poisoned.sqlite3")),
     ));
-    manager.with_database(|_| Ok(())).unwrap();
+    manager.with_database(|db| db.enroll("S", "0")).unwrap();
     let ownership = manager
         .reserve_refresh_build("S", true)
         .unwrap()
@@ -94,29 +150,23 @@ fn failed_attempt_and_enrollment_state_persist_through_index_db() {
     assert_eq!(failed[0].state, "failed");
     assert_eq!(failed[0].last_error.as_deref(), Some("inventory failed"));
 
-    assert!(db.enrollment("S").unwrap().is_none());
+    assert!(!db.is_enrolled("S").unwrap());
     db.enroll("S", "1").unwrap();
-    assert!(
-        db.enrollment("S")
-            .unwrap()
-            .expect("enrollment should exist")
-            .auto_refresh_enabled
-    );
-    assert!(!db.set_auto_refresh("missing", false).unwrap());
-    assert!(db.set_auto_refresh("S", false).unwrap());
-    assert!(
-        !db.enrollment("S")
-            .unwrap()
-            .expect("enrollment should remain")
-            .auto_refresh_enabled
-    );
+    assert!(db.is_enrolled("S").unwrap());
+    assert!(!db.is_enrolled("missing").unwrap());
     db.enroll("S", "2").unwrap();
-    assert!(
-        !db.enrollment("S")
-            .unwrap()
-            .expect("enrollment should remain")
-            .auto_refresh_enabled
+    assert!(db.is_enrolled("S").unwrap());
+    assert_eq!(
+        db.connection
+            .query_row(
+                "SELECT enrolled_at FROM enrolled_servers WHERE server = 'S'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "1"
     );
+    assert!(db.scheduled_servers().unwrap().is_empty());
 }
 
 #[test]
@@ -407,20 +457,8 @@ fn sqlite_open_quarantines_invalid_schema_and_recovers_interrupted_builds() {
             .unwrap(),
         1
     );
-    assert!(
-        migrated
-            .enrollment("S")
-            .unwrap()
-            .expect("active server should be enrolled")
-            .auto_refresh_enabled
-    );
-    assert!(
-        !migrated
-            .enrollment("Failed")
-            .unwrap()
-            .expect("failed server should be enrolled")
-            .auto_refresh_enabled
-    );
+    assert!(migrated.is_enrolled("S").unwrap());
+    assert!(migrated.is_enrolled("Failed").unwrap());
     assert_eq!(migrated.scheduled_servers().unwrap(), vec!["S"]);
     assert_eq!(
         migrated
@@ -749,22 +787,10 @@ fn sqlite_migrates_schema_3_and_preserves_indexed_data() {
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),
-        "4"
+        "5"
     );
-    assert!(
-        migrated
-            .enrollment("Active")
-            .unwrap()
-            .expect("active server should be enrolled")
-            .auto_refresh_enabled
-    );
-    assert!(
-        !migrated
-            .enrollment("Failed")
-            .unwrap()
-            .expect("failed server should be enrolled")
-            .auto_refresh_enabled
-    );
+    assert!(migrated.is_enrolled("Active").unwrap());
+    assert!(migrated.is_enrolled("Failed").unwrap());
     assert_eq!(migrated.scheduled_servers().unwrap(), vec!["Active"]);
     assert_eq!(
         migrated
@@ -1974,10 +2000,9 @@ async fn delete_index_removes_enrollment_generations_and_retry_metadata() {
     .unwrap();
     let status = manager.status("S").await.unwrap();
     assert_eq!(status.state, IndexState::NotIndexed);
-    assert!(!status.auto_refresh_enabled);
     manager
         .with_database(|db| {
-            assert!(db.enrollment("S")?.is_none());
+            assert!(!db.is_enrolled("S")?);
             assert!(db.status_rows("S")?.is_empty());
             assert_eq!(db.retry_state("S")?, (None, 0, false));
             Ok(())

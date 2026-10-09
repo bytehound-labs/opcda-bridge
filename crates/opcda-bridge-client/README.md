@@ -75,9 +75,11 @@ opcda-bridge-client index-cancel --server Kepware.KepServerEX.V5
 Its JSON output is one object containing `matches`, `has_more`, and `status`; indexed matches
 contain exact ItemIDs and breadcrumb labels, never browse-session node keys.
 
-`index-status` distinguishes the saved server auto-refresh preference from the gateway-wide
-policy. Its JSON `scheduler.auto_refresh_policy` is `allowed`, `disabled`, `paused`, or `null`
-when an older gateway does not report it. Per-server controls cannot override gateway configuration.
+`index-status` reports gateway-wide policy. Its JSON `scheduler.auto_refresh_policy` is
+`allowed`, `disabled`, `paused`, or `null` when an older gateway does not report it. Every
+usable enrolled index participates when gateway policy permits. `index-cancel` preserves the
+cache and defers automatic work until the next configured interval; `index-refresh --force`
+overrides that delay. Neither command changes gateway configuration.
 
 Use `opcda-bridge-client --help` for all commands. Prebuilt platform binaries are available from
 the repository releases page.

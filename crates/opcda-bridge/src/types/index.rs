@@ -132,7 +132,7 @@ pub struct IndexStorageDiagnostics {
     pub last_commit_latency_ms: Option<u64>,
 }
 
-/// Gateway configuration policy for automatic refresh, independent of server preference.
+/// Gateway configuration policy for automatic refresh of usable indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexAutoRefreshPolicy {
     Allowed,
@@ -207,8 +207,6 @@ pub enum SearchIndexControlAction {
     Pause,
     Resume,
     Cancel,
-    EnableAutoRefresh,
-    DisableAutoRefresh,
     Delete,
 }
 /// Parameters for one persistent-index query.
@@ -252,8 +250,6 @@ pub struct IndexedSearchProgress {
 pub struct SearchIndexStatus {
     pub server: String,
     pub state: SearchIndexState,
-    /// Whether this enrolled server is eligible for scheduled refreshes.
-    pub auto_refresh_enabled: bool,
     pub active_generation: u64,
     pub entry_count: u64,
     pub unique_item_count: u64,

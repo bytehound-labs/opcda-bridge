@@ -210,8 +210,8 @@ mod tests {
                     },
                     ProtocolFeature {
                         kind: ProtocolFeatureKind::IndexedSearch as i32,
-                        min_version: 2,
-                        max_version: 2,
+                        min_version: 3,
+                        max_version: 3,
                     },
                 ],
             },
@@ -614,7 +614,6 @@ mod tests {
         SearchIndexStatus {
             server: "S".into(),
             state: state as i32,
-            configured: true,
             active_generation: 3,
             entry_count: 101,
             unique_item_count: 100,
@@ -992,7 +991,6 @@ mod tests {
         let status = opcda_bridge::SearchIndexStatus {
             server: "S".into(),
             state: SearchIndexState::Ready,
-            auto_refresh_enabled: true,
             active_generation: 2,
             entry_count: 1,
             unique_item_count: 1,

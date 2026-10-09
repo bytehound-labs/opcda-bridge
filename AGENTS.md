@@ -85,8 +85,14 @@ cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-
   values; do not infer hierarchy by splitting tag punctuation.
 - Treat protocol-feature versions and exact-pair test evidence as separate from crate versions.
   Update the compatibility catalog and generated report whenever a protocol boundary changes.
-- The saved server auto-refresh preference is separate from gateway policy. Scheduler startup and
-  next-refresh diagnostics share the enabled/unpaused gate; optional wire policy is unknown when
-  absent. Preference controls never change global configuration or cancel an active build.
+- All usable enrolled indexes participate under gateway `index.enabled` / `index.paused` policy;
+  there is no per-server opt-in/out. First builds and recreation after deletion stay manual.
+  Operator Cancel persists a next-interval scheduling deadline without counting cancellation as
+  an OPC failure; forced manual refresh overrides it. Automatic work never enrolls a deleted
+  server, and profile invalidation runs under owned build locking. Scheduler startup and
+  next-refresh diagnostics share the enabled/unpaused gate; absent policy remains unknown.
+- Indexed-search protocol 3 reserves retired status field 3 and control values 4/5. Schema 5
+  removes preference columns while preserving enrollment, generations, entries, and FTS. Back up
+  before migration; old binaries require the pre-migration database for rollback.
 
 The detailed user-facing references are linked from the [README](README.md).

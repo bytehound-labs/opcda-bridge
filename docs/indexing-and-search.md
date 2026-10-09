@@ -8,8 +8,9 @@ tag values. Live browse and live search remain available independently of the in
 A fresh gateway has no enrolled servers. Start an index with `index-refresh` using the exact ProgID
 returned by `opcda-bridge-client servers`. The gateway validates that ProgID before persisting
 enrollment. A successful manual build creates a durable active generation; the gateway schedules
-that enrolled server for refresh according to its per-server auto-refresh setting and the global
-`index.enabled` and `index.paused` policies. The default interval is seven days. Automatic indexing does not start a
+that enrolled server for refresh under the global `index.enabled` and `index.paused` policies.
+Every usable enrolled index participates; there is no per-server opt-in/out setting. The default
+interval is seven days. Automatic indexing does not start a
 first build on an un-enrolled server.
 
 Refreshes write to a staging generation. Promotion is an atomic metadata transition: the previous
@@ -48,7 +49,13 @@ opcda-bridge-client --host 192.168.1.50:7600 index-refresh \
 
 `index-status --watch 5` polls status every five seconds. Refresh runs asynchronously. The client
 also exposes `index-pause`, `index-resume`, and `index-cancel` for an active build. The Rust library
-and protocol include additional per-server index controls.
+and protocol also support index deletion.
+
+`index-cancel` stops the owned build, preserves a previous complete generation, and persists a
+not-before deadline one configured interval plus schedule jitter after cancellation. Restart
+preserves that deadline, and cancellation does not count as an OPC failure. `index-refresh --force`
+can start earlier. Deletion removes both the cache and enrollment; only manual refresh can
+recreate it. A stale scheduler probe cannot re-enroll a deleted server.
 
 Indexed queries return exact ItemIDs and breadcrumb labels, not browse-session node keys. Matching
 is case-insensitive and ranks exact, prefix, and contains matches. `has_more` indicates that
@@ -75,10 +82,13 @@ read-only connection and bounded candidate sets so broad search work does not bl
 discovery, reads, writes, or lazy browse. Database and build-lock identities use canonical file
 paths where available, preventing relative-path and symlink aliases from bypassing coordination.
 
-Startup migrates older index schemas transactionally through the schema 2-to-3-to-4 sequence.
+Startup migrates older index schemas transactionally through the schema 2-to-3-to-4-to-5 sequence.
 Existing generations and full-text data are preserved. Servers with a usable active generation
-are enabled for scheduled refresh; failed-only histories require a manual retry before automatic
-refresh is enabled.
+participate in scheduled refresh, including caches previously opted out. Failed-only histories
+require a manual retry before automatic refresh can run. Schema 5 removes only preference
+columns from the enrollment table; it does not rebuild namespace entries or FTS. Preserve a
+consistent database backup before upgrading. An older binary cannot open schema 5, so rollback
+requires restoring the pre-migration database, not just the old executable.
 
 ## Pacing and safety controls
 
@@ -110,19 +120,19 @@ otherwise the gateway uses one full-root inventory.
 The complete set of options and defaults is documented in the
 [gateway example configuration](../crates/opcda-bridge-gateway/opcda-bridge-gateway.example.toml).
 The gateway-wide `index.enabled` switch controls startup and scheduled work. Manual status, browse,
-search, refresh, and read operations remain available while it is disabled. Per-server scheduled
-refresh can be disabled without deleting the searchable generation.
+search, refresh, and read operations remain available while it is disabled.
 
 `index.enabled` defaults to `true` and `index.paused` defaults to `false`. Explicit configuration
-values take precedence. Both switches govern the background scheduler; neither is changed by a
-per-server enable/disable request. Disabling a server's preference does not cancel an active
-build; use the separate cancel control for that operation.
+values take precedence. Both switches govern the background scheduler; index-management requests
+do not change either switch. Use cancel to stop an active build and defer automatic work without
+deleting the cached generation.
 
-The saved `auto_refresh_enabled` preference is not proof that scheduling is permitted.
 `scheduler.auto_refresh_policy` reports `allowed`, `disabled`, or `paused`, with disabled taking
 precedence when both administrative blockers apply. A blocked scheduler reports no next-refresh
 date. This configuration policy is separate from foreground, health, and operator pauses on an
 active build. A missing policy diagnostic from an older gateway means unknown, not disabled.
+Always-participating scheduling requires indexed-search protocol 3; clients do not silently
+change preferences on older gateways.
 
 ## Large-namespace acceptance runbook
 

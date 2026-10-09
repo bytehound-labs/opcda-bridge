@@ -221,7 +221,6 @@ pub(super) fn map_index_status(status: IndexStatus) -> SearchIndexStatus {
     SearchIndexStatus {
         server: status.server,
         state: map_index_state(status.state) as i32,
-        configured: status.auto_refresh_enabled,
         active_generation: status.active_generation,
         entry_count: status.entry_count,
         unique_item_count: status.unique_item_count,

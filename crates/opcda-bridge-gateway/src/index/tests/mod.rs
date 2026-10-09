@@ -517,6 +517,7 @@ fn insert_runtime_build<C: OpcClient>(
                 started_at: "1".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,

@@ -191,9 +191,8 @@ message SearchIndexRequest {
 message SearchIndexStatus {
   string server = 1;
   SearchIndexState state = 2;
-  // Field 3 retains its historical wire name for protobuf compatibility.
-  // In the 0.5 lifecycle contract it reports automatic-refresh eligibility.
-  bool configured = 3;
+  reserved 3;
+  reserved "configured";
   uint64 active_generation = 4;
   uint64 entry_count = 5;
   uint64 unique_item_count = 6;
@@ -263,7 +262,7 @@ message IndexSchedulerDiagnostics {
   optional string retry_after = 5;
   uint32 consecutive_failures = 6;
   bool circuit_open = 7;
-  // Gateway configuration policy, independent of the saved server preference.
+  // Gateway configuration policy for all usable indexed servers.
   // Absence means an older gateway does not report this diagnostic.
   optional IndexAutoRefreshPolicy auto_refresh_policy = 8;
 }
@@ -322,8 +321,8 @@ enum SearchIndexControlAction {
   SEARCH_INDEX_CONTROL_ACTION_PAUSE = 1;
   SEARCH_INDEX_CONTROL_ACTION_RESUME = 2;
   SEARCH_INDEX_CONTROL_ACTION_CANCEL = 3;
-  SEARCH_INDEX_CONTROL_ACTION_ENABLE_AUTO_REFRESH = 4;
-  SEARCH_INDEX_CONTROL_ACTION_DISABLE_AUTO_REFRESH = 5;
+  reserved 4, 5;
+  reserved "SEARCH_INDEX_CONTROL_ACTION_ENABLE_AUTO_REFRESH", "SEARCH_INDEX_CONTROL_ACTION_DISABLE_AUTO_REFRESH";
   SEARCH_INDEX_CONTROL_ACTION_DELETE = 6;
 }
 

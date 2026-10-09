@@ -48,10 +48,14 @@ depending on optional operations:
 opcda-bridge-client --host 192.168.1.50:7600 compatibility
 ```
 
-Automatic index refresh has a per-server preference and a gateway-wide administrative policy.
-`index-status` reports them separately: `index.enabled = false` or `index.paused = true` blocks
+Every enrolled server with a usable index participates in automatic refresh. There is no
+per-server opt-in/out setting. `index-status` reports gateway-wide administrative policy:
+`index.enabled = false` or `index.paused = true` blocks
 automatic scheduling without removing the cached index or disabling manual browse, search, and
-refresh. A per-server enable action cannot override that gateway configuration.
+refresh. The first build is manual. Cancelling a build keeps the old cache and defers automatic
+work until the next configured interval; manual forced refresh can start earlier. Deleting an
+index removes its enrollment, so it is not recreated until another manual refresh. This lifecycle
+requires indexed-search protocol 3.
 
 ## Documentation
 

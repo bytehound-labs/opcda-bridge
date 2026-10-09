@@ -13,18 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub(super) const SCHEMA_VERSION: i64 = 4;
+pub(super) const SCHEMA_VERSION: i64 = 5;
 
 pub(super) struct IndexDb {
     pub(super) path: PathBuf,
     pub(super) connection: Connection,
     #[cfg(test)]
     pub(super) reject_next_prefix_query_map: AtomicBool,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct Enrollment {
-    pub(super) auto_refresh_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -285,8 +280,13 @@ impl IndexDb {
                 2 => {
                     migrate_schema_2_to_3(&mut connection)?;
                     migrate_schema_3_to_4(&mut connection)?;
+                    migrate_schema_4_to_5(&mut connection)?;
                 }
-                3 => migrate_schema_3_to_4(&mut connection)?,
+                3 => {
+                    migrate_schema_3_to_4(&mut connection)?;
+                    migrate_schema_4_to_5(&mut connection)?;
+                }
+                4 => migrate_schema_4_to_5(&mut connection)?,
                 SCHEMA_VERSION => {}
                 _ => anyhow::bail!("unsupported namespace index schema version {version}"),
             }
@@ -294,10 +294,7 @@ impl IndexDb {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS enrolled_servers (
                  server TEXT PRIMARY KEY NOT NULL,
-                 auto_refresh_enabled INTEGER NOT NULL DEFAULT 1
-                   CHECK (auto_refresh_enabled IN (0, 1)),
-                 enrolled_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL
+                 enrolled_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS generations (
                  server TEXT NOT NULL,
@@ -445,8 +442,18 @@ impl IndexDb {
                 .optional()?)
         };
         let retry_after = get(format!("retry_after:{server}"))?
-            .and_then(|value| value.parse::<u64>().ok())
-            .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)));
+            .filter(|value| !value.is_empty())
+            .map(|value| -> anyhow::Result<SystemTime> {
+                let millis = value.parse::<u64>().map_err(|error| {
+                    anyhow::anyhow!("invalid persisted index retry deadline for {server}: {error}")
+                })?;
+                UNIX_EPOCH
+                    .checked_add(Duration::from_millis(millis))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("persisted index retry deadline overflow for {server}")
+                    })
+            })
+            .transpose()?;
         let failures = get(format!("failures:{server}"))?
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
@@ -813,46 +820,31 @@ impl IndexDb {
         Ok(())
     }
 
-    pub(super) fn enrollment(&self, server: &str) -> anyhow::Result<Option<Enrollment>> {
+    pub(super) fn is_enrolled(&self, server: &str) -> anyhow::Result<bool> {
         self.connection
             .query_row(
-                "SELECT auto_refresh_enabled FROM enrolled_servers WHERE server = ?1",
+                "SELECT EXISTS(SELECT 1 FROM enrolled_servers WHERE server = ?1)",
                 [server],
-                |row| {
-                    Ok(Enrollment {
-                        auto_refresh_enabled: row.get::<_, bool>(0)?,
-                    })
-                },
+                |row| row.get(0),
             )
-            .optional()
             .map_err(Into::into)
     }
 
     pub(super) fn enroll(&self, server: &str, timestamp: &str) -> anyhow::Result<()> {
         self.connection.execute(
             "INSERT OR IGNORE INTO enrolled_servers
-             (server, auto_refresh_enabled, enrolled_at, updated_at)
-             VALUES (?1, 1, ?2, ?2)",
+             (server, enrolled_at)
+             VALUES (?1, ?2)",
             params![server, timestamp],
         )?;
         Ok(())
-    }
-
-    pub(super) fn set_auto_refresh(&self, server: &str, enabled: bool) -> anyhow::Result<bool> {
-        Ok(self.connection.execute(
-            "UPDATE enrolled_servers
-             SET auto_refresh_enabled = ?1, updated_at = ?2
-             WHERE server = ?3",
-            params![enabled, timestamp_now(), server],
-        )? == 1)
     }
 
     pub(super) fn scheduled_servers(&self) -> anyhow::Result<Vec<String>> {
         let mut statement = self.connection.prepare(
             "SELECT enrolled.server
              FROM enrolled_servers AS enrolled
-             WHERE enrolled.auto_refresh_enabled = 1
-               AND EXISTS (
+             WHERE EXISTS (
                    SELECT 1 FROM generations AS generation
                    WHERE generation.server = enrolled.server
                      AND generation.state = 'active'
@@ -986,8 +978,19 @@ pub(super) fn migrate_schema_3_to_4(connection: &mut Connection) -> anyhow::Resu
     }
     transaction.execute(
         "INSERT OR REPLACE INTO index_meta(key, value)
-         VALUES ('schema_version', ?1)",
-        [SCHEMA_VERSION.to_string()],
+         VALUES ('schema_version', '4')",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(super) fn migrate_schema_4_to_5(connection: &mut Connection) -> anyhow::Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE enrolled_servers DROP COLUMN auto_refresh_enabled;
+         ALTER TABLE enrolled_servers DROP COLUMN updated_at;
+         UPDATE index_meta SET value = '5' WHERE key = 'schema_version';",
     )?;
     transaction.commit()?;
     Ok(())
