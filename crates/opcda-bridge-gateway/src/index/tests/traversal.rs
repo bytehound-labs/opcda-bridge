@@ -2196,6 +2196,7 @@ async fn maintenance_duty_cycle_and_rate_limit_honor_pause_and_cancellation() {
                 started_at: "1".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -2318,6 +2319,7 @@ async fn unhealthy_probe_backs_off_and_stops_when_cancelled() {
                 started_at: "1".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -3685,7 +3687,7 @@ fn split_store_propagates_database_errors() {
     let mut enrollment = IndexDb::open(Path::new(":memory:")).unwrap();
     drop_table(&mut enrollment, "enrolled_servers");
     assert!(enrollment.enroll("S", "1").is_err());
-    assert!(enrollment.set_auto_refresh("S", false).is_err());
+    assert!(enrollment.is_enrolled("S").is_err());
 
     let mut connection = Connection::open_in_memory().unwrap();
     connection
@@ -3724,6 +3726,7 @@ fn split_traversal_handles_paused_state_and_missing_runtime() {
         started_at: "1".into(),
         foreground_users: 0,
         operator_paused: false,
+        operator_cancelled_until: None,
         quiet_until: None,
         effective_limits: None,
         controller_state: Some(crate::controller::ControllerState::Paused(
@@ -3801,6 +3804,7 @@ fn reconcile_pause_state_handles_a_build_without_a_control() {
                 started_at: "1".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,

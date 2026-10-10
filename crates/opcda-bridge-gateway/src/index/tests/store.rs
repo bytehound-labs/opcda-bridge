@@ -11,9 +11,9 @@ async fn generation_start_failure_is_recorded_and_reported() {
         Arc::clone(&client),
         settings(directory.path().join("generation-lock-poisoned.sqlite3")),
     ));
-    manager.with_database(|_| Ok(())).unwrap();
+    manager.with_database(|db| db.enroll("S", "1")).unwrap();
     let ownership = manager
-        .reserve_refresh_build("S", true)
+        .reserve_refresh_build("S", true, false)
         .unwrap()
         .expect("build reservation should succeed");
     let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
@@ -97,12 +97,17 @@ fn failed_attempt_and_enrollment_state_persist_through_index_db() {
     assert!(db.enrollment("S").unwrap().is_none());
     db.enroll("S", "1").unwrap();
     assert!(
-        db.enrollment("S")
+        !db.enrollment("S")
             .unwrap()
             .expect("enrollment should exist")
             .auto_refresh_enabled
     );
     assert!(!db.set_auto_refresh("missing", false).unwrap());
+    assert!(db.set_auto_refresh("S", true).unwrap());
+    assert!(db.enrollment("S").unwrap().unwrap().auto_refresh_enabled);
+    drop(db);
+    let db = IndexDb::open(&path).unwrap();
+    assert!(db.enrollment("S").unwrap().unwrap().auto_refresh_enabled);
     assert!(db.set_auto_refresh("S", false).unwrap());
     assert!(
         !db.enrollment("S")
@@ -117,6 +122,68 @@ fn failed_attempt_and_enrollment_state_persist_through_index_db() {
             .expect("enrollment should remain")
             .auto_refresh_enabled
     );
+    drop(db);
+    let db = IndexDb::open(&path).unwrap();
+    assert!(!db.enrollment("S").unwrap().unwrap().auto_refresh_enabled);
+    db.connection
+        .execute_batch(
+            "CREATE TRIGGER reject_auto_refresh_update
+             BEFORE UPDATE ON enrolled_servers
+             BEGIN SELECT RAISE(ABORT, 'preference update rejected'); END;",
+        )
+        .unwrap();
+    let error = db.set_auto_refresh("S", true).unwrap_err();
+    assert!(error.to_string().contains("preference update rejected"));
+    assert!(!db.enrollment("S").unwrap().unwrap().auto_refresh_enabled);
+}
+
+#[test]
+fn existing_schema_four_defaults_do_not_opt_in_new_servers() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("legacy-default.sqlite3");
+    let db = IndexDb::open(&path).unwrap();
+    db.connection.execute(
+        "INSERT INTO enrolled_servers (server, enrolled_at, updated_at) VALUES ('Default', '1', '1')",
+        []
+    ).unwrap();
+    assert!(
+        !db.enrollment("Default")
+            .unwrap()
+            .unwrap()
+            .auto_refresh_enabled
+    );
+    db.connection
+        .execute_batch(
+            "DROP TABLE enrolled_servers;
+         CREATE TABLE enrolled_servers (
+             server TEXT PRIMARY KEY NOT NULL,
+             auto_refresh_enabled INTEGER NOT NULL DEFAULT 1 CHECK(auto_refresh_enabled IN (0,1)),
+             enrolled_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         INSERT INTO enrolled_servers VALUES ('Saved', 1, '1', '2');",
+        )
+        .unwrap();
+    drop(db);
+
+    let db = IndexDb::open(&path).unwrap();
+    db.enroll("New", "3").unwrap();
+    assert!(
+        db.enrollment("Saved")
+            .unwrap()
+            .unwrap()
+            .auto_refresh_enabled
+    );
+    assert!(!db.enrollment("New").unwrap().unwrap().auto_refresh_enabled);
+    let saved_times: (String, String) = db
+        .connection
+        .query_row(
+            "SELECT enrolled_at, updated_at FROM enrolled_servers WHERE server = 'Saved'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(saved_times, ("1".into(), "2".into()));
 }
 
 #[test]
@@ -1787,6 +1854,7 @@ async fn active_profile_check_handles_missing_invalid_and_unavailable_data() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        true,
     );
     let error = unavailable
         .active_profile_changed("S")
@@ -1813,6 +1881,7 @@ async fn active_profile_check_handles_missing_invalid_and_unavailable_data() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        true,
     );
     maintenance.refresh_if_due("S").await;
 
@@ -1847,6 +1916,7 @@ async fn active_profile_check_times_out_a_stalled_capability_probe() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        false,
     );
 
     let error = manager
@@ -1878,6 +1948,7 @@ async fn negotiated_da2_profile_does_not_trigger_profile_invalidation() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da3,
         &timestamp_now(),
+        true,
     );
     manager
         .with_database(|db| {
@@ -1929,6 +2000,7 @@ async fn genuine_da2_profile_triggers_da3_invalidation() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        true,
     );
 
     manager.refresh_if_due("S").await;
@@ -1946,6 +2018,7 @@ async fn delete_index_removes_enrollment_generations_and_retry_metadata() {
     ));
     manager.refresh("S", true).await.unwrap();
     wait_for_build(&manager, IndexState::Ready).await;
+    manager.change_auto_refresh("S", true).unwrap();
     manager
         .with_database(|db| {
             db.set_retry_state(
@@ -1983,6 +2056,25 @@ async fn delete_index_removes_enrollment_generations_and_retry_metadata() {
             Ok(())
         })
         .unwrap();
+    manager.client.inventory_events.lock().unwrap().extend([
+        Ok(InventoryEvent::Entry(inventory_entry(
+            "Recreated",
+            "New.Tag",
+        ))),
+        Ok(InventoryEvent::Completed(InventoryCompleted {
+            complete: true,
+            cancelled: false,
+            truncated: false,
+            warning: None,
+            organization: NamespaceOrganization::Hierarchical,
+            source: BrowseSource::Da2,
+        })),
+    ]);
+    manager.refresh("S", true).await.unwrap();
+    wait_for_build(&manager, IndexState::Ready).await;
+    let recreated = manager.status("S").await.unwrap();
+    assert!(!recreated.auto_refresh_enabled);
+    assert!(recreated.scheduler.next_refresh_at.is_none());
 }
 
 #[tokio::test]

@@ -85,5 +85,11 @@ cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-
   values; do not infer hierarchy by splitting tag punctuation.
 - Treat protocol-feature versions and exact-pair test evidence as separate from crate versions.
   Update the compatibility catalog and generated report whenever a protocol boundary changes.
+- New index enrollment explicitly stores auto-refresh off, including manual retries and
+  recreation after Delete. Existing schema-4 choices survive restart. Only opted-in usable
+  indexes schedule; recheck opt-out after asynchronous probes and before profile invalidation.
+  Disable preserves cached search and an active build. `index.enabled` and `index.paused` are
+  rejected retired keys, not scheduling gates. Keep startup grace, maintenance, health,
+  pacing, storage, ownership, and retry protections.
 
 The detailed user-facing references are linked from the [README](README.md).

@@ -249,7 +249,6 @@ async fn start_current_gateway() -> (String, oneshot::Sender<()>, TempDir) {
                     .to_string_lossy()
                     .into_owned(),
             ),
-            enabled: Some(false),
             ..Default::default()
         },
         ..Default::default()

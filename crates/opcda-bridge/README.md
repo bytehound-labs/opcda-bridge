@@ -78,8 +78,11 @@ Indexed search never falls back to live namespace traversal. Each response inclu
 readiness state, per-server `auto_refresh_enabled` setting, and `has_more`; returned ItemIDs
 preserve the server's exact identity and do not contain browse-session node keys. The first
 `refresh_search_index` validates and enrolls the exact registered ProgID. Use
-`set_search_index_auto_refresh` to change scheduled-refresh eligibility without removing data,
-and `delete_search_index` to remove an enrolled index and its history.
+`set_search_index_auto_refresh(server, true)` to opt into scheduled refresh explicitly; manual
+builds and retries leave the existing choice unchanged, and new enrollment defaults to off.
+The choice survives gateway restart. Disabling it preserves the cached generation and does
+not cancel an active build. `delete_search_index` removes enrollment and its history;
+recreating that index requires a fresh opt-in.
 
 See the crate documentation for method signatures and the repository README for gateway setup and
 protocol details.

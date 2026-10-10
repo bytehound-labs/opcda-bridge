@@ -1051,7 +1051,6 @@ async fn indexed_search_handlers_validate_map_and_execute_requests() {
                     .to_string_lossy()
                     .into_owned(),
             ),
-            enabled: Some(false),
             ..IndexConfig::default()
         },
         ..GatewayConfig::default()

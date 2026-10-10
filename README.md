@@ -48,6 +48,15 @@ depending on optional operations:
 opcda-bridge-client --host 192.168.1.50:7600 compatibility
 ```
 
+Automatic index refresh is an explicit per-server opt-in. New and recreated indexes start off;
+manual refresh and retry never change the saved choice. Enable it through BHTune's
+**Enable Auto-refresh** button or the Rust
+client's `set_search_index_auto_refresh` method. The saved choice survives gateway restarts.
+Disabling it stops future scheduling without cancelling an active build or removing cached tags.
+The gateway has no `index.enabled` or `index.paused` override. Pacing, maintenance windows,
+health protection, and retry backoff still govern automatic work. An active build does not
+start a second scheduled build.
+
 ## Documentation
 
 | Topic                                                      | Guide                                                            |

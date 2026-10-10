@@ -503,6 +503,7 @@ async fn indexed_search_during_promotion_does_not_wait_for_database_mutex() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         "2",
+        false,
     );
     insert_runtime_build(&manager, Arc::new(RecordingInventoryControl::default()));
     manager.mark_promoting("S").unwrap();
@@ -671,6 +672,7 @@ async fn profile_change_invalidates_persisted_generation_and_cached_search() {
     ));
     manager.refresh("S", true).await.unwrap();
     wait_for_build(&manager, IndexState::Ready).await;
+    manager.change_auto_refresh("S", true).unwrap();
     assert_eq!(
         manager
             .search("S", "mock", 3, 10)
@@ -809,6 +811,7 @@ async fn stale_maintenance_delay_and_promotion_search_are_bounded() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         "0",
+        false,
     );
     assert_eq!(
         manager.background_refresh_delay("S").await,

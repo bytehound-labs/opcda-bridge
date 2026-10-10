@@ -154,7 +154,7 @@ jobs:
         # Windows jobs compile the current workspace sources; this job checks
         # that Cargo can assemble every publishable archive. Patch the local
         # sources only for this pre-publication check so Cargo can resolve the
-        # new 0.5 package line before those versions exist on crates.io; the
+        # unpublished package versions before they exist on crates.io; the
         # packaged manifests still retain their real version requirements.
         run: |
           cargo package --workspace --locked --no-verify \

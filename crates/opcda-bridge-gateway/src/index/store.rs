@@ -294,7 +294,7 @@ impl IndexDb {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS enrolled_servers (
                  server TEXT PRIMARY KEY NOT NULL,
-                 auto_refresh_enabled INTEGER NOT NULL DEFAULT 1
+                 auto_refresh_enabled INTEGER NOT NULL DEFAULT 0
                    CHECK (auto_refresh_enabled IN (0, 1)),
                  enrolled_at TEXT NOT NULL,
                  updated_at TEXT NOT NULL
@@ -445,8 +445,18 @@ impl IndexDb {
                 .optional()?)
         };
         let retry_after = get(format!("retry_after:{server}"))?
-            .and_then(|value| value.parse::<u64>().ok())
-            .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)));
+            .filter(|value| !value.is_empty())
+            .map(|value| -> anyhow::Result<SystemTime> {
+                let millis = value.parse::<u64>().map_err(|error| {
+                    anyhow::anyhow!("invalid persisted index retry deadline for {server}: {error}")
+                })?;
+                UNIX_EPOCH
+                    .checked_add(Duration::from_millis(millis))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("persisted index retry deadline overflow for {server}")
+                    })
+            })
+            .transpose()?;
         let failures = get(format!("failures:{server}"))?
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
@@ -828,11 +838,15 @@ impl IndexDb {
             .map_err(Into::into)
     }
 
+    pub(super) fn is_enrolled(&self, server: &str) -> anyhow::Result<bool> {
+        Ok(self.enrollment(server)?.is_some())
+    }
+
     pub(super) fn enroll(&self, server: &str, timestamp: &str) -> anyhow::Result<()> {
         self.connection.execute(
             "INSERT OR IGNORE INTO enrolled_servers
              (server, auto_refresh_enabled, enrolled_at, updated_at)
-             VALUES (?1, 1, ?2, ?2)",
+             VALUES (?1, 0, ?2, ?2)",
             params![server, timestamp],
         )?;
         Ok(())
