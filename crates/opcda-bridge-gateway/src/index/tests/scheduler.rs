@@ -2166,11 +2166,15 @@ async fn split_scheduler_shutdown_and_cleanup_short_circuits_are_safe() {
         Arc::new(MockOpcClient::default()),
         settings(directory.path().join("scheduler-split.sqlite3")),
     ));
-    let partial = empty_status("S", IndexState::Partial);
+    let mut partial = empty_status("S", IndexState::Partial);
     assert_eq!(
         manager.refresh_delay_for_status("S", &partial),
         Duration::from_secs(30)
     );
+    partial.active_generation = 1;
+    partial.auto_refresh_enabled = true;
+    partial.scheduler.next_refresh_at = Some("0".into());
+    assert!(!manager.automatic_refresh_allowed(&partial));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
     manager.run_background_indexing(shutdown_rx).await;
