@@ -94,8 +94,6 @@ pub struct IndexConfig {
     /// Service-writable SQLite path. If omitted, the platform data directory
     /// is used.
     pub database_path: Option<String>,
-    /// Set false to disable automatic indexing while retaining manual APIs.
-    pub enabled: Option<bool>,
     pub refresh_interval_seconds: Option<u64>,
     /// Delay after gateway startup before automatic indexing is considered.
     pub startup_grace_period_seconds: Option<u64>,
@@ -157,7 +155,6 @@ pub struct IndexConfig {
     /// different servers.
     pub worker_count: Option<u32>,
     pub query_cache_capacity: Option<usize>,
-    pub paused: Option<bool>,
     pub max_results: Option<u32>,
 }
 
@@ -165,7 +162,6 @@ pub struct IndexConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedIndexConfig {
     pub database_path: PathBuf,
-    pub enabled: bool,
     pub refresh_interval_seconds: u64,
     pub startup_grace_period_seconds: u64,
     pub schedule_jitter_seconds: u64,
@@ -203,7 +199,6 @@ pub struct ResolvedIndexConfig {
     pub concurrency: u32,
     pub worker_count: u32,
     pub query_cache_capacity: usize,
-    pub paused: bool,
     pub max_results: u32,
 }
 
@@ -293,7 +288,6 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
 
     ResolvedIndexConfig {
         database_path,
-        enabled: config.enabled.unwrap_or(true),
         refresh_interval_seconds: config
             .refresh_interval_seconds
             .unwrap_or(DEFAULT_INDEX_REFRESH_INTERVAL_SECONDS),
@@ -411,7 +405,6 @@ pub fn resolve_index_config(config: &IndexConfig) -> ResolvedIndexConfig {
             .query_cache_capacity
             .unwrap_or(DEFAULT_INDEX_QUERY_CACHE_CAPACITY)
             .max(1),
-        paused: config.paused.unwrap_or(false),
         max_results: config
             .max_results
             .unwrap_or(DEFAULT_INDEX_MAX_RESULTS)
@@ -437,8 +430,27 @@ pub fn config_path_from_exe(exe_path: &Path) -> PathBuf {
 /// always a hard error — a config typo should never be silently ignored.
 pub fn load_config_file(path: &Path, missing_is_error: bool) -> anyhow::Result<GatewayConfig> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => toml::from_str(&contents)
-            .map_err(|e| anyhow::anyhow!("failed to parse config file {}: {e}", path.display())),
+        Ok(contents) => {
+            let value: toml::Value = toml::from_str(&contents).map_err(|error| {
+                anyhow::anyhow!("failed to parse config file {}: {error}", path.display())
+            })?;
+            for key in ["enabled", "paused"] {
+                if value
+                    .get("index")
+                    .and_then(|index| index.get(key))
+                    .is_some()
+                {
+                    anyhow::bail!(
+                        "config file {} uses retired index.{key}; remove this key and use \
+                         per-server Enable/Disable Auto-refresh",
+                        path.display()
+                    );
+                }
+            }
+            value.try_into().map_err(|error| {
+                anyhow::anyhow!("failed to parse config file {}: {error}", path.display())
+            })
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !missing_is_error => {
             Ok(GatewayConfig::default())
         }
@@ -518,11 +530,40 @@ mod tests {
     }
 
     #[test]
-    fn test_load_config_file_malformed() {
+    fn test_retired_index_switches_are_rejected() {
+        for key in ["enabled", "paused"] {
+            for value in ["true", "false"] {
+                let mut file = tempfile::NamedTempFile::new().unwrap();
+                writeln!(file, "[index]\n{key} = {value}").unwrap();
+                let error = load_config_file(file.path(), true).unwrap_err();
+                assert!(error.to_string().contains(&format!("index.{key}")));
+                assert!(error.to_string().contains("remove"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unrelated_unknown_config_keys_remain_ignored() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(file, "port = \"not a number\"").unwrap();
-        let err = load_config_file(file.path(), true).unwrap_err();
-        assert!(err.to_string().contains("failed to parse config file"));
+        writeln!(
+            file,
+            "future_option = 42\n[index]\nfuture_index_option = true"
+        )
+        .unwrap();
+        assert_eq!(
+            load_config_file(file.path(), true).unwrap(),
+            GatewayConfig::default()
+        );
+    }
+
+    #[test]
+    fn test_load_config_file_malformed() {
+        for contents in ["port = \"not a number\"", "[index"] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "{contents}").unwrap();
+            let err = load_config_file(file.path(), true).unwrap_err();
+            assert!(err.to_string().contains("failed to parse config file"));
+        }
     }
 
     #[test]
@@ -637,7 +678,6 @@ mod tests {
     fn test_resolve_index_config_applies_defaults_and_safe_bounds() {
         let config = IndexConfig {
             database_path: Some("custom.sqlite3".into()),
-            enabled: Some(false),
             refresh_interval_seconds: Some(12),
             startup_grace_period_seconds: Some(9),
             schedule_jitter_seconds: Some(8),
@@ -675,12 +715,10 @@ mod tests {
             maintenance_windows: vec!["22:00-06:00".into()],
             concurrency: Some(0),
             query_cache_capacity: Some(0),
-            paused: Some(true),
             max_results: Some(0),
         };
         let resolved = resolve_index_config(&config);
         assert_eq!(resolved.database_path, PathBuf::from("custom.sqlite3"));
-        assert!(!resolved.enabled);
         assert_eq!(resolved.refresh_interval_seconds, 12);
         assert_eq!(resolved.startup_grace_period_seconds, 9);
         assert_eq!(resolved.schedule_jitter_seconds, 8);
@@ -718,7 +756,6 @@ mod tests {
         assert_eq!(resolved.maintenance_windows, vec!["22:00-06:00"]);
         assert_eq!(resolved.concurrency, 1);
         assert_eq!(resolved.query_cache_capacity, 1);
-        assert!(resolved.paused);
         assert_eq!(resolved.max_results, 1);
     }
 
@@ -802,7 +839,6 @@ mod tests {
     fn test_index_config_toml_round_trip() {
         let original = IndexConfig {
             database_path: Some("index.sqlite3".into()),
-            enabled: Some(true),
             refresh_interval_seconds: Some(60),
             startup_grace_period_seconds: Some(45),
             schedule_jitter_seconds: Some(120),
@@ -840,7 +876,6 @@ mod tests {
             maintenance_windows: vec!["00:00-06:00".into()],
             concurrency: Some(1),
             query_cache_capacity: Some(10),
-            paused: Some(false),
             max_results: Some(25),
         };
         let decoded: IndexConfig = toml::from_str(&toml::to_string(&original).unwrap()).unwrap();

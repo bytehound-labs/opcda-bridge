@@ -1,6 +1,6 @@
 use super::{
-    DbStatus, IndexDb, IndexManager, RuntimeBuild, RuntimeState, StatusRows, instant_timestamp,
-    parse_timestamp, scheduler, system_time_timestamp,
+    DbStatus, Enrollment, IndexDb, IndexManager, RuntimeBuild, RuntimeState, StatusRows,
+    instant_timestamp, parse_timestamp, scheduler, system_time_timestamp,
 };
 use crate::controller::{HostMetrics, HostMetricsProvider, InventoryLimits};
 use crate::opc::{BrowseSource, InventoryProgress, NamespaceOrganization, OpcClient};
@@ -26,6 +26,7 @@ pub enum IndexState {
 pub struct IndexStatus {
     pub server: String,
     pub state: IndexState,
+    pub auto_refresh_enabled: bool,
     pub active_generation: u64,
     pub entry_count: u64,
     pub unique_item_count: u64,
@@ -80,7 +81,6 @@ pub struct StorageDiagnostics {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchedulerDiagnostics {
-    pub auto_refresh_policy: AutoRefreshPolicy,
     pub next_refresh_at: Option<String>,
     pub last_attempt_at: Option<String>,
     pub last_success_at: Option<String>,
@@ -88,14 +88,6 @@ pub struct SchedulerDiagnostics {
     pub retry_after: Option<String>,
     pub consecutive_failures: u32,
     pub circuit_open: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum AutoRefreshPolicy {
-    #[default]
-    Allowed,
-    Disabled,
-    Paused,
 }
 
 pub struct ForegroundGuard<C: OpcClient> {
@@ -451,7 +443,6 @@ impl<C: OpcClient> IndexManager<C> {
         let deletion_failed = deletion_error.is_some();
         if is_deleting {
             let mut status = empty_status(server, IndexState::Deleting);
-            status.scheduler.auto_refresh_policy = self.auto_refresh_policy();
             status.sentinel_configured = self.settings.sentinel_tag.is_some();
             let storage = storage_diagnostics_for_path(&self.settings.database_path);
             status.database_bytes = storage
@@ -465,28 +456,32 @@ impl<C: OpcClient> IndexManager<C> {
             .lock()
             .ok()
             .is_some_and(|servers| servers.contains(server));
-        let (enrolled, enrollment_error) = if is_promoting
+        let (enrollment, enrollment_error) = if is_promoting
             && self.settings.database_path != Path::new(":memory:")
         {
             Ok(
                 match IndexDb::open_read_only(&self.settings.database_path)
-                    .and_then(|db| db.is_enrolled(server))
+                    .and_then(|db| db.enrollment(server))
                 {
-                    Ok(enrolled) => (enrolled, None),
+                    Ok(enrollment) => (enrollment, None),
                     Err(error) => {
                         tracing::warn!(target: "opcda_bridge_gateway::index", server, error = %error, "unable to read namespace index enrollment during promotion");
-                        (true, Some(error.to_string()))
+                        (
+                            Some(Enrollment {
+                                auto_refresh_enabled: false,
+                            }),
+                            Some(error.to_string()),
+                        )
                     }
                 },
             )
         } else {
-            self.with_database_read(|db| db.is_enrolled(server))
-                .map(|enrolled| (enrolled, None))
+            self.with_database_read(|db| db.enrollment(server))
+                .map(|enrollment| (enrollment, None))
         }?;
         let sentinel_configured = self.settings.sentinel_tag.is_some();
-        if !enrolled {
+        let Some(enrollment) = enrollment else {
             let mut status = empty_status(server, IndexState::NotIndexed);
-            status.scheduler.auto_refresh_policy = self.auto_refresh_policy();
             status.sentinel_configured = sentinel_configured;
             if let Some(error) = deletion_error {
                 status.state = IndexState::Failed;
@@ -515,6 +510,7 @@ impl<C: OpcClient> IndexManager<C> {
             sentinel_configured,
         );
         status.sentinel_configured = sentinel_configured;
+        status.auto_refresh_enabled = enrollment.auto_refresh_enabled;
         self.apply_status_errors(
             &mut status,
             runtime.build.is_some(),
@@ -533,7 +529,10 @@ impl<C: OpcClient> IndexManager<C> {
             server,
             &rows,
             &runtime,
-            status.active_generation > 0 && promotion_read_error.is_none() && !deletion_failed,
+            enrollment.auto_refresh_enabled
+                && status.active_generation > 0
+                && promotion_read_error.is_none()
+                && !deletion_failed,
         );
         Ok(status)
     }
@@ -779,16 +778,6 @@ impl<C: OpcClient> IndexManager<C> {
         }
     }
 
-    pub(super) fn auto_refresh_policy(&self) -> AutoRefreshPolicy {
-        if !self.settings.enabled {
-            AutoRefreshPolicy::Disabled
-        } else if self.settings.paused {
-            AutoRefreshPolicy::Paused
-        } else {
-            AutoRefreshPolicy::Allowed
-        }
-    }
-
     pub(super) fn scheduler_diagnostics(
         &self,
         server: &str,
@@ -800,10 +789,8 @@ impl<C: OpcClient> IndexManager<C> {
             .active
             .as_ref()
             .and_then(|row| row.completed_at.clone());
-        let auto_refresh_policy = self.auto_refresh_policy();
         let mut scheduler = SchedulerDiagnostics {
-            auto_refresh_policy,
-            next_refresh_at: (usable_index && auto_refresh_policy == AutoRefreshPolicy::Allowed)
+            next_refresh_at: usable_index
                 .then(|| {
                     self.next_refresh_at(server, last_success_at.as_deref())
                         .and_then(|next| parse_timestamp(&next))
@@ -879,6 +866,7 @@ pub(super) fn status_from_row(
     IndexStatus {
         server: server.to_string(),
         state,
+        auto_refresh_enabled: false,
         active_generation: if row.state == "active" {
             row.generation
         } else {
@@ -921,6 +909,7 @@ pub(super) fn empty_status(server: &str, state: IndexState) -> IndexStatus {
     IndexStatus {
         server: server.to_string(),
         state,
+        auto_refresh_enabled: false,
         active_generation: 0,
         entry_count: 0,
         unique_item_count: 0,

@@ -238,6 +238,24 @@ impl Client {
             .try_into()
     }
 
+    /// Enable or disable completion-time-based scheduled refreshes for an
+    /// enrolled namespace index. Disabling preserves searchable data.
+    pub async fn set_search_index_auto_refresh(
+        &mut self,
+        server: impl Into<String>,
+        enabled: bool,
+    ) -> Result<SearchIndexStatus> {
+        self.control_search_index(
+            server,
+            if enabled {
+                SearchIndexControlAction::EnableAutoRefresh
+            } else {
+                SearchIndexControlAction::DisableAutoRefresh
+            },
+        )
+        .await
+    }
+
     /// Cancel any active build and permanently remove an enrolled namespace
     /// index, including its generations and scheduler metadata.
     pub async fn delete_search_index(
@@ -484,8 +502,8 @@ mod tests {
                     },
                     ProtocolFeature {
                         kind: ProtocolFeatureKind::IndexedSearch as i32,
-                        min_version: 3,
-                        max_version: 3,
+                        min_version: 2,
+                        max_version: 2,
                     },
                 ],
             },
@@ -524,8 +542,8 @@ mod tests {
                     },
                     ProtocolFeature {
                         kind: ProtocolFeatureKind::IndexedSearch as i32,
-                        min_version: 3,
-                        max_version: 3,
+                        min_version: 2,
+                        max_version: 2,
                     },
                 ],
             },
@@ -825,6 +843,7 @@ mod tests {
         SearchIndexStatus {
             server: "S".into(),
             state: state as i32,
+            configured: true,
             active_generation: 4,
             entry_count: 100,
             unique_item_count: 99,
@@ -888,6 +907,14 @@ mod tests {
                 .state,
             SearchIndexState::Partial
         );
+        client
+            .set_search_index_auto_refresh("S", false)
+            .await
+            .unwrap();
+        client
+            .set_search_index_auto_refresh("S", true)
+            .await
+            .unwrap();
         client.delete_search_index("S").await.unwrap();
         let mut request = SearchIndexRequest::new("S", "PV", SearchMatchMode::Contains);
         request.max_results = 25;
@@ -903,6 +930,14 @@ mod tests {
         );
         assert_eq!(
             control_requests.lock().unwrap()[1].action,
+            opcda_bridge_proto::bridge::SearchIndexControlAction::DisableAutoRefresh as i32
+        );
+        assert_eq!(
+            control_requests.lock().unwrap()[2].action,
+            opcda_bridge_proto::bridge::SearchIndexControlAction::EnableAutoRefresh as i32
+        );
+        assert_eq!(
+            control_requests.lock().unwrap()[3].action,
             opcda_bridge_proto::bridge::SearchIndexControlAction::Delete as i32
         );
         assert_eq!(search_requests.lock().unwrap()[0].max_results, 25);
@@ -966,7 +1001,7 @@ mod tests {
         let mut client = Client::connect(&host).await.unwrap();
         assert!(matches!(
             client
-                .control_search_index("Known.Server", SearchIndexControlAction::Pause)
+                .set_search_index_auto_refresh("Known.Server", false)
                 .await,
             Err(Error::IndexNotEnrolled { server }) if server == "Known.Server"
         ));

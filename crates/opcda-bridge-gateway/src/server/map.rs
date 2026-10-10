@@ -1,5 +1,5 @@
 use crate::browse::MAX_PAGE_SIZE;
-use crate::index::{AutoRefreshPolicy, IndexOperationError, IndexState, IndexStatus};
+use crate::index::{IndexOperationError, IndexState, IndexStatus};
 use crate::opc::{
     BrowseCapabilities, BrowseNode, BrowseNodeKind, BrowsePage, BrowseSource, InventoryProgress,
     NamespaceOrganization, OpcValue, TagValue, WriteResult,
@@ -7,12 +7,12 @@ use crate::opc::{
 use opcda_bridge_proto::bridge::{
     BrowseNode as ProtoBrowseNode, BrowsePage as ProtoBrowsePage,
     BrowseSource as ProtoBrowseSource, GetCapabilitiesResponse, GetGatewayInfoResponse,
-    IndexAutoRefreshPolicy, IndexControllerState, IndexForegroundDiagnostics,
-    IndexHealthDiagnostics, IndexHealthState, IndexHostDiagnostics, IndexInventoryLimits,
-    IndexPauseReason, IndexSchedulerDiagnostics, IndexStorageDiagnostics, IndexedSearchMatch,
-    IndexedSearchProgress, NamespaceOrganization as ProtoNamespaceOrganization, ProtocolFeature,
-    ProtocolFeatureKind, SearchIndexState, SearchIndexStatus, TagValue as ProtoTagValue,
-    WriteResponse, write_request::TypedValue as ProtoTypedValue,
+    IndexControllerState, IndexForegroundDiagnostics, IndexHealthDiagnostics, IndexHealthState,
+    IndexHostDiagnostics, IndexInventoryLimits, IndexPauseReason, IndexSchedulerDiagnostics,
+    IndexStorageDiagnostics, IndexedSearchMatch, IndexedSearchProgress,
+    NamespaceOrganization as ProtoNamespaceOrganization, ProtocolFeature, ProtocolFeatureKind,
+    SearchIndexState, SearchIndexStatus, TagValue as ProtoTagValue, WriteResponse,
+    write_request::TypedValue as ProtoTypedValue,
 };
 use tonic::Status;
 
@@ -221,6 +221,7 @@ pub(super) fn map_index_status(status: IndexStatus) -> SearchIndexStatus {
     SearchIndexStatus {
         server: status.server,
         state: map_index_state(status.state) as i32,
+        configured: status.auto_refresh_enabled,
         active_generation: status.active_generation,
         entry_count: status.entry_count,
         unique_item_count: status.unique_item_count,
@@ -270,11 +271,6 @@ pub(super) fn map_index_status(status: IndexStatus) -> SearchIndexStatus {
             last_commit_latency_ms: status.storage.last_commit_latency_ms,
         }),
         scheduler: Some(IndexSchedulerDiagnostics {
-            auto_refresh_policy: Some(match status.scheduler.auto_refresh_policy {
-                AutoRefreshPolicy::Allowed => IndexAutoRefreshPolicy::Allowed,
-                AutoRefreshPolicy::Disabled => IndexAutoRefreshPolicy::Disabled,
-                AutoRefreshPolicy::Paused => IndexAutoRefreshPolicy::Paused,
-            } as i32),
             next_refresh_at: status.scheduler.next_refresh_at,
             last_attempt_at: status.scheduler.last_attempt_at,
             last_success_at: status.scheduler.last_success_at,

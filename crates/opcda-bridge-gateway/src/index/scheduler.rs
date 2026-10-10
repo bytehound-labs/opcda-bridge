@@ -1,6 +1,6 @@
 use super::{
-    AutoRefreshPolicy, HealthProbeState, IndexDb, IndexManager, IndexState, IndexStatus,
-    QueryCache, index_profile_is_compatible, parse_timestamp,
+    HealthProbeState, IndexDb, IndexManager, IndexState, IndexStatus, QueryCache,
+    index_profile_is_compatible, parse_timestamp,
 };
 use crate::config::ResolvedIndexConfig;
 use crate::controller::{InventoryLimits, default_host_metrics_provider};
@@ -672,7 +672,6 @@ impl<C: OpcClient> IndexManager<C> {
         tracing::debug!(target: "opcda_bridge_gateway::index",
             process_id = std::process::id(),
             database = %settings.database_path.display(),
-            enabled = settings.enabled,
             concurrency = settings.concurrency,
             "created namespace index manager"
         );
@@ -751,9 +750,6 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub fn start_background_indexing(self: &Arc<Self>) {
-        if self.auto_refresh_policy() != AutoRefreshPolicy::Allowed {
-            return;
-        }
         if self.background_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -930,7 +926,7 @@ impl<C: OpcClient> IndexManager<C> {
             status.state,
             IndexState::Stale | IndexState::Failed | IndexState::NotIndexed
         ) && self.automatic_refresh_allowed(status)
-            && let Err(error) = self.refresh_enrolled(server, false).await
+            && let Err(error) = self.refresh_enrolled(server, false, true).await
         {
             tracing::warn!(target: "opcda_bridge_gateway::index",
                 server = %server,
@@ -952,7 +948,7 @@ impl<C: OpcClient> IndexManager<C> {
             );
             return;
         }
-        let ownership = match self.reserve_refresh_build(server, false) {
+        let ownership = match self.reserve_refresh_build(server, false, true) {
             Ok(Some(ownership)) => ownership,
             Ok(None) => return,
             Err(error) => {
@@ -969,7 +965,9 @@ impl<C: OpcClient> IndexManager<C> {
                     .map_err(|_| anyhow::anyhow!("index pending-cancel lock poisoned"))?
                     .contains(server);
                 if cancelled
-                    || !db.is_enrolled(server)?
+                    || !db
+                        .enrollment(server)?
+                        .is_some_and(|enrollment| enrollment.auto_refresh_enabled)
                     || !db.status_rows(server)?.iter().any(|row| {
                         row.state == "active"
                             && row.generation == status.active_generation
@@ -1075,7 +1073,7 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub(super) fn automatic_refresh_allowed(&self, status: &IndexStatus) -> bool {
-        self.auto_refresh_policy() == AutoRefreshPolicy::Allowed
+        status.auto_refresh_enabled
             && status.active_generation > 0
             && status.scheduler.next_refresh_at.is_some()
             && matches!(

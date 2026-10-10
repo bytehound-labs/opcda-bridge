@@ -48,14 +48,13 @@ depending on optional operations:
 opcda-bridge-client --host 192.168.1.50:7600 compatibility
 ```
 
-Every enrolled server with a usable index participates in automatic refresh. There is no
-per-server opt-in/out setting. `index-status` reports gateway-wide administrative policy:
-`index.enabled = false` or `index.paused = true` blocks
-automatic scheduling without removing the cached index or disabling manual browse, search, and
-refresh. The first build is manual. Cancelling a build keeps the old cache and defers automatic
-work until the next configured interval; manual forced refresh can start earlier. Deleting an
-index removes its enrollment, so it is not recreated until another manual refresh. This lifecycle
-requires indexed-search protocol 3.
+Automatic index refresh is an explicit per-server opt-in. New and recreated indexes start off;
+manual refresh and retry never change the saved choice. Enable it through BHTune's
+**Enable Auto-refresh** button or the Rust
+client's `set_search_index_auto_refresh` method. The saved choice survives gateway restarts.
+Disabling it stops future scheduling without cancelling an active build or removing cached tags.
+The gateway has no `index.enabled` or `index.paused` override. Pacing, maintenance windows,
+health protection, and retry backoff still govern automatic work.
 
 ## Documentation
 

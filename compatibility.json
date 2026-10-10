@@ -34,23 +34,11 @@
       "gateway_line": "indexed-on-demand",
       "notes": "The current client and gateway exercise durable on-demand namespace indexing together.",
       "status": "contract-boundary-tested"
-    },
-    {
-      "client_line": "indexed-always-on",
-      "gateway_line": "indexed-always-on",
-      "notes": "The current client and gateway exercise always-participating indexed search, retained administrative policy, and cancellation/deletion lifecycle behavior.",
-      "status": "contract-boundary-tested"
-    },
-    {
-      "client_line": "indexed-on-demand",
-      "gateway_line": "indexed-always-on",
-      "notes": "Core and paged namespace operations remain compatible; indexed-search lifecycle versions do not overlap and retired opt-in/out actions are rejected.",
-      "status": "contract-boundary-tested"
     }
   ],
   "protocol": {
     "core": 1,
-    "indexed_search": 3,
+    "indexed_search": 2,
     "namespace": 2
   },
   "release_lines": [
@@ -87,21 +75,11 @@
     {
       "core_protocol": 1,
       "indexed_search_protocol": 2,
-      "max_version": "0.5.999",
+      "max_version": "0.999.999",
       "min_version": "0.5.0",
       "name": "indexed-on-demand",
       "namespace_protocol": 2,
       "notes": "Adds durable on-demand index enrollment and per-server scheduling controls.",
-      "status": "supported"
-    },
-    {
-      "core_protocol": 1,
-      "indexed_search_protocol": 3,
-      "max_version": "0.999.999",
-      "min_version": "0.6.0",
-      "name": "indexed-always-on",
-      "namespace_protocol": 2,
-      "notes": "Usable enrolled indexes always participate under gateway policy. Per-server opt-in/out is removed; operator cancellation defers the next automatic attempt.",
       "status": "supported"
     }
   ],

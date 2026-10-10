@@ -69,7 +69,7 @@ impl<C: OpcClient> IndexManager<C> {
             self.with_database_write(|db| db.enroll(server, &timestamp_now()))
                 .map_err(IndexOperationError::Internal)?;
         }
-        self.refresh_enrolled(server, force)
+        self.refresh_enrolled(server, force, false)
             .await
             .map_err(IndexOperationError::Internal)
     }
@@ -98,11 +98,12 @@ impl<C: OpcClient> IndexManager<C> {
         self: &Arc<Self>,
         server: &str,
         force: bool,
+        automatic: bool,
     ) -> anyhow::Result<IndexStatus> {
         if self.background_tasks.is_shutting_down() {
             return self.status(server).await;
         }
-        let build_ownership = self.reserve_refresh_build(server, force)?;
+        let build_ownership = self.reserve_refresh_build(server, force, automatic)?;
         let Some(build_ownership) = build_ownership else {
             return self.status(server).await;
         };
@@ -165,6 +166,7 @@ impl<C: OpcClient> IndexManager<C> {
         &self,
         server: &str,
         force: bool,
+        automatic: bool,
     ) -> anyhow::Result<Option<Arc<()>>> {
         if self.background_tasks.is_shutting_down() {
             return Ok(None);
@@ -173,7 +175,11 @@ impl<C: OpcClient> IndexManager<C> {
             .deleting
             .lock()
             .map_err(|_| anyhow::anyhow!("index deletion lock poisoned"))?;
-        if deleting.contains(server) || !self.with_database_read(|db| db.is_enrolled(server))? {
+        let enrollment = self.with_database_read(|db| db.enrollment(server))?;
+        if deleting.contains(server)
+            || enrollment.is_none()
+            || (automatic && enrollment.is_some_and(|enrollment| !enrollment.auto_refresh_enabled))
+        {
             return Ok(None);
         }
         let storage = self.with_database_read(|db| Ok(db.storage_diagnostics()))?;
@@ -434,6 +440,12 @@ impl<C: OpcClient> IndexManager<C> {
         action: IndexControlAction,
     ) -> Result<IndexStatus, IndexOperationError> {
         match action {
+            IndexControlAction::EnableAutoRefresh => {
+                self.change_auto_refresh(server, true)?;
+            }
+            IndexControlAction::DisableAutoRefresh => {
+                self.change_auto_refresh(server, false)?;
+            }
             IndexControlAction::Delete => {
                 self.delete_index(server).await?;
             }
@@ -458,6 +470,24 @@ impl<C: OpcClient> IndexManager<C> {
             .with_database_read(|db| db.is_enrolled(server))
             .map_err(IndexOperationError::Internal)?
         {
+            Ok(())
+        } else {
+            Err(IndexOperationError::NotEnrolled {
+                server: server.to_string(),
+            })
+        }
+    }
+
+    pub(super) fn change_auto_refresh(
+        &self,
+        server: &str,
+        enabled: bool,
+    ) -> Result<(), IndexOperationError> {
+        self.reject_if_deleting(server)?;
+        let changed = self
+            .with_database_write(|db| db.set_auto_refresh(server, enabled))
+            .map_err(IndexOperationError::Internal)?;
+        if changed {
             Ok(())
         } else {
             Err(IndexOperationError::NotEnrolled {
@@ -663,7 +693,9 @@ impl<C: OpcClient> IndexManager<C> {
                     )
                 })?;
             }
-            IndexControlAction::Delete => {}
+            IndexControlAction::EnableAutoRefresh
+            | IndexControlAction::DisableAutoRefresh
+            | IndexControlAction::Delete => {}
         }
         Ok(())
     }

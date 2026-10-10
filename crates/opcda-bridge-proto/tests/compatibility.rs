@@ -1,16 +1,9 @@
 use opcda_bridge_proto::bridge::{
     BrowseNode, BrowseNodeKind, BrowsePage, BrowseRequest, BrowseSource, GetCapabilitiesResponse,
-    IndexAutoRefreshPolicy, IndexSchedulerDiagnostics, IndexedSearchMatch, NamespaceOrganization,
-    ReadRequest, SearchIndexResponse, SearchIndexState, SearchIndexStatus, WriteResponse,
+    IndexedSearchMatch, NamespaceOrganization, ReadRequest, SearchIndexResponse, SearchIndexState,
+    SearchIndexStatus, WriteResponse,
 };
 use prost::Message;
-
-#[test]
-fn retired_auto_refresh_controls_are_not_valid_enum_values() {
-    for retired in [4, 5] {
-        assert!(opcda_bridge_proto::bridge::SearchIndexControlAction::try_from(retired).is_err());
-    }
-}
 
 #[test]
 fn round_trips_paged_browse_request_and_response() {
@@ -61,32 +54,6 @@ fn decodes_unchanged_read_request_payload() {
 }
 
 #[test]
-fn scheduler_policy_is_additive_and_preserves_legacy_absence() {
-    let old_payload = [0x0a, 0x04, b'n', b'e', b'x', b't', 0x30, 0x02, 0x38, 0x01];
-    let old = IndexSchedulerDiagnostics::decode(old_payload.as_slice()).unwrap();
-    assert_eq!(old.auto_refresh_policy, None);
-    assert_eq!(old.next_refresh_at.as_deref(), Some("next"));
-    assert_eq!(old.consecutive_failures, 2);
-    assert!(old.circuit_open);
-
-    for policy in [
-        IndexAutoRefreshPolicy::Allowed,
-        IndexAutoRefreshPolicy::Disabled,
-        IndexAutoRefreshPolicy::Paused,
-    ] {
-        let diagnostics = IndexSchedulerDiagnostics {
-            auto_refresh_policy: Some(policy as i32),
-            ..old.clone()
-        };
-        let encoded = diagnostics.encode_to_vec();
-        assert_eq!(
-            IndexSchedulerDiagnostics::decode(encoded.as_slice()).unwrap(),
-            diagnostics
-        );
-    }
-}
-
-#[test]
 fn decodes_unchanged_write_response_payload() {
     let payload = [0x0a, 0x01, b'T', 0x10, 0x01];
     let response = WriteResponse::decode(payload.as_slice()).unwrap();
@@ -126,6 +93,7 @@ fn round_trips_indexed_search_response_without_session_tokens() {
         status: Some(SearchIndexStatus {
             server: "Yokogawa.CSHIS_OPC.1".into(),
             state: SearchIndexState::Ready as i32,
+            configured: true,
             active_generation: 3,
             ..Default::default()
         }),

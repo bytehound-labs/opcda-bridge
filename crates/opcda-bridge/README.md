@@ -75,18 +75,14 @@ client.close_browse_session(root.session_id).await?;
 ```
 
 Indexed search never falls back to live namespace traversal. Each response includes the index
-readiness state, scheduling diagnostics, and `has_more`; returned ItemIDs
+readiness state, per-server `auto_refresh_enabled` setting, and `has_more`; returned ItemIDs
 preserve the server's exact identity and do not contain browse-session node keys. The first
-`refresh_search_index` validates and enrolls the exact registered ProgID. All usable enrolled
-indexes participate in automatic refresh. `control_search_index(..., SearchIndexControlAction::Cancel)`
-keeps the cached generation and defers automatic work until the next configured interval.
-`refresh_search_index(server, true)` overrides that delay; `delete_search_index` removes enrollment
-and data until another manual refresh.
-
-`status.scheduler.auto_refresh_policy` distinguishes `Allowed`, `Disabled`, and `Paused`
-gateway configuration. `None` means the gateway has not reported that diagnostic. These
-administrative settings are independent of an active build's pause state. Always-participating
-index scheduling requires a gateway supporting indexed-search protocol 3.
+`refresh_search_index` validates and enrolls the exact registered ProgID. Use
+`set_search_index_auto_refresh(server, true)` to opt into scheduled refresh explicitly; manual
+builds and retries leave the existing choice unchanged, and new enrollment defaults to off.
+The choice survives gateway restart. Disabling it preserves the cached generation and does
+not cancel an active build. `delete_search_index` removes enrollment and its history;
+recreating that index requires a fresh opt-in.
 
 See the crate documentation for method signatures and the repository README for gateway setup and
 protocol details.

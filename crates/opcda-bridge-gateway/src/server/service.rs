@@ -194,6 +194,8 @@ impl<C: OpcClient> Bridge for BridgeService<C> {
             SearchIndexControlAction::Pause => IndexControlAction::Pause,
             SearchIndexControlAction::Resume => IndexControlAction::Resume,
             SearchIndexControlAction::Cancel => IndexControlAction::Cancel,
+            SearchIndexControlAction::EnableAutoRefresh => IndexControlAction::EnableAutoRefresh,
+            SearchIndexControlAction::DisableAutoRefresh => IndexControlAction::DisableAutoRefresh,
             SearchIndexControlAction::Delete => IndexControlAction::Delete,
             SearchIndexControlAction::Unspecified => {
                 return Err(Status::invalid_argument("index control action is required"));

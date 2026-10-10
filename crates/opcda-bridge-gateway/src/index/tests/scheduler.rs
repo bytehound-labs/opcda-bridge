@@ -1077,26 +1077,8 @@ async fn background_refresh_delay_uses_persisted_state() {
 }
 
 #[tokio::test]
-async fn background_indexing_respects_disabled_paused_and_idempotent_start() {
+async fn background_indexing_starts_idempotently() {
     let directory = tempdir().unwrap();
-    let mut disabled = settings(directory.path().join("disabled.sqlite3"));
-    disabled.enabled = false;
-    let disabled = Arc::new(IndexManager::new(
-        Arc::new(MockOpcClient::default()),
-        disabled,
-    ));
-    disabled.start_background_indexing();
-    assert!(!disabled.background_started.load(Ordering::Acquire));
-
-    let mut paused = settings(directory.path().join("paused.sqlite3"));
-    paused.paused = true;
-    let paused = Arc::new(IndexManager::new(
-        Arc::new(MockOpcClient::default()),
-        paused,
-    ));
-    paused.start_background_indexing();
-    assert!(!paused.background_started.load(Ordering::Acquire));
-
     let enabled = settings(directory.path().join("enabled.sqlite3"));
     let enabled = Arc::new(IndexManager::new(
         Arc::new(MockOpcClient::default()),
@@ -1159,6 +1141,7 @@ async fn background_indexing_wakes_for_the_next_refresh_check() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &future,
+        true,
     );
 
     manager.start_background_indexing();
@@ -1185,6 +1168,8 @@ async fn refresh_start_failure_backs_off_until_forced_retry() {
     let failed = manager.status("S").await.unwrap();
     assert_eq!(failed.state, IndexState::Failed);
     assert_eq!(failed.last_error.as_deref(), Some("start failed"));
+    assert!(!failed.auto_refresh_enabled);
+    assert!(failed.scheduler.next_refresh_at.is_none());
 
     let backed_off = manager.refresh("S", false).await.unwrap();
     assert_eq!(backed_off.state, IndexState::Failed);
@@ -1193,6 +1178,7 @@ async fn refresh_start_failure_backs_off_until_forced_retry() {
     manager.refresh("S", true).await.unwrap();
     wait_for_state(&manager, "S", IndexState::Ready).await;
     assert_eq!(client.inventory_start_count.load(Ordering::Relaxed), 2);
+    assert!(!manager.status("S").await.unwrap().auto_refresh_enabled);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1638,6 +1624,7 @@ async fn automatic_refresh_logs_reachable_invalidation_and_refresh_failures() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        true,
     );
     clear_manager
         .with_database(|db| {
@@ -1698,6 +1685,7 @@ async fn automatic_refresh_logs_reachable_invalidation_and_refresh_failures() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        true,
     );
     rebuild_manager.refresh_if_due("S").await;
     assert_eq!(
@@ -1727,6 +1715,7 @@ async fn automatic_refresh_logs_reachable_invalidation_and_refresh_failures() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         "0",
+        true,
     );
     stale_manager.refresh_if_due("S").await;
     assert_eq!(
@@ -1815,6 +1804,7 @@ async fn background_refresh_rebuilds_a_stale_persisted_generation() {
             db.promote("S", generation, "0", &zero_progress())
         })
         .unwrap();
+    manager.change_auto_refresh("S", true).unwrap();
 
     manager.refresh_if_due("S").await;
     wait_for_build(&manager, IndexState::Ready).await;
@@ -1999,6 +1989,7 @@ async fn stale_and_adaptive_cancellation_scheduler_paths_are_covered() {
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         "0",
+        true,
     );
     assert_eq!(
         stale.background_refresh_delay("S").await,
@@ -2188,6 +2179,7 @@ async fn split_scheduler_shutdown_and_cleanup_short_circuits_are_safe() {
     manager
         .with_database_write(|db| {
             db.enroll("S", &timestamp_now())?;
+            db.set_auto_refresh("S", true)?;
             let generation =
                 db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "0")?;
             db.promote("S", generation, "1", &completed_progress(0))

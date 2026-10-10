@@ -61,7 +61,10 @@ fn reserving_a_new_build_clears_previous_commit_latency_timestamp() {
         .unwrap()
         .insert("S".into(), Instant::now());
 
-    let ownership = manager.reserve_refresh_build("S", true).unwrap().unwrap();
+    let ownership = manager
+        .reserve_refresh_build("S", true, false)
+        .unwrap()
+        .unwrap();
     assert!(
         !manager
             .commit_latency_recorded_at
@@ -263,6 +266,7 @@ async fn background_delay_and_refresh_handle_partial_status_errors_and_unconfigu
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        false,
     );
     manager.runtime.lock().unwrap().insert(
         "S".into(),
@@ -922,6 +926,7 @@ async fn read_only_status_and_search_remain_responsive_while_writer_gate_is_held
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        false,
     );
     let (locked, locked_rx) = std::sync::mpsc::sync_channel(0);
     let (release, release_rx) = std::sync::mpsc::sync_channel(0);

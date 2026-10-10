@@ -77,6 +77,7 @@ fn maps_index_status_progress_matches_and_errors() {
     let mapped = map_index_status(IndexStatus {
         server: "S".into(),
         state: IndexState::Promoting,
+        auto_refresh_enabled: true,
         active_generation: 3,
         entry_count: 5,
         unique_item_count: 4,
@@ -155,6 +156,7 @@ fn maps_index_status_progress_matches_and_errors() {
     let base = IndexStatus {
         server: "S".into(),
         state: IndexState::Ready,
+        auto_refresh_enabled: true,
         active_generation: 1,
         entry_count: 0,
         unique_item_count: 0,
@@ -176,30 +178,6 @@ fn maps_index_status_progress_matches_and_errors() {
         storage: crate::index::StorageDiagnostics::default(),
         scheduler: crate::index::SchedulerDiagnostics::default(),
     };
-    for (policy, expected) in [
-        (
-            crate::index::AutoRefreshPolicy::Allowed,
-            opcda_bridge_proto::bridge::IndexAutoRefreshPolicy::Allowed,
-        ),
-        (
-            crate::index::AutoRefreshPolicy::Disabled,
-            opcda_bridge_proto::bridge::IndexAutoRefreshPolicy::Disabled,
-        ),
-        (
-            crate::index::AutoRefreshPolicy::Paused,
-            opcda_bridge_proto::bridge::IndexAutoRefreshPolicy::Paused,
-        ),
-    ] {
-        let mut status = base.clone();
-        status.scheduler.auto_refresh_policy = policy;
-        assert_eq!(
-            map_index_status(status)
-                .scheduler
-                .unwrap()
-                .auto_refresh_policy,
-            Some(expected as i32)
-        );
-    }
     for (state, expected) in [
         (
             crate::controller::ControllerState::Ramping,
@@ -1073,7 +1051,6 @@ async fn indexed_search_handlers_validate_map_and_execute_requests() {
                     .to_string_lossy()
                     .into_owned(),
             ),
-            enabled: Some(false),
             ..IndexConfig::default()
         },
         ..GatewayConfig::default()
@@ -1182,16 +1159,15 @@ async fn indexed_search_handlers_validate_map_and_execute_requests() {
         .unwrap()
         .into_inner();
     assert_eq!(controlled.state, SearchIndexState::Ready as i32);
-    for action in [4, 5] {
-        let error = service
-            .control_search_index(Request::new(ControlSearchIndexRequest {
-                server: "S".into(),
-                action,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    }
+    let disabled = service
+        .control_search_index(Request::new(ControlSearchIndexRequest {
+            server: "S".into(),
+            action: SearchIndexControlAction::DisableAutoRefresh as i32,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!disabled.configured);
     let deleted = service
         .control_search_index(Request::new(ControlSearchIndexRequest {
             server: "S".into(),
@@ -1201,6 +1177,7 @@ async fn indexed_search_handlers_validate_map_and_execute_requests() {
         .unwrap()
         .into_inner();
     assert_eq!(deleted.state, SearchIndexState::Deleting as i32);
+    assert!(!deleted.configured);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let status = service
@@ -1418,6 +1395,7 @@ fn map_capabilities_clamps_page_size() {
     let status = IndexStatus {
         server: "S".into(),
         state: IndexState::NotIndexed,
+        auto_refresh_enabled: false,
         active_generation: 0,
         entry_count: 0,
         unique_item_count: 0,

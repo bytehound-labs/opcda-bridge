@@ -21,14 +21,14 @@ use self::scheduler::{
     wait_with_cancellation,
 };
 use self::status::{ForegroundMetricState, PauseOverlayState, percentile};
-use self::store::{DbStatus, IndexDb, StatusRows, index_profile_is_compatible};
+use self::store::{DbStatus, Enrollment, IndexDb, StatusRows, index_profile_is_compatible};
 
 pub use self::enrollment::IndexOperationError;
 pub(crate) use self::query::normalize_query;
 pub use self::query::{IndexedMatch, IndexedSearch, SearchMode};
 pub use self::status::{
-    AutoRefreshPolicy, ForegroundGuard, ForegroundMetrics, HealthProbeState, IndexState,
-    IndexStatus, SchedulerDiagnostics, StorageDiagnostics,
+    ForegroundGuard, ForegroundMetrics, HealthProbeState, IndexState, IndexStatus,
+    SchedulerDiagnostics, StorageDiagnostics,
 };
 
 mod enrollment;
@@ -99,6 +99,8 @@ pub enum IndexControlAction {
     Pause,
     Resume,
     Cancel,
+    EnableAutoRefresh,
+    DisableAutoRefresh,
     Delete,
 }
 

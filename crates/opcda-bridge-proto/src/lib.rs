@@ -257,6 +257,7 @@ mod tests {
         let status = SearchIndexStatus {
             server: "S".into(),
             state: SearchIndexState::Refreshing as i32,
+            configured: true,
             active_generation: 2,
             entry_count: 100,
             unique_item_count: 99,

@@ -210,8 +210,8 @@ mod tests {
                     },
                     ProtocolFeature {
                         kind: ProtocolFeatureKind::IndexedSearch as i32,
-                        min_version: 3,
-                        max_version: 3,
+                        min_version: 2,
+                        max_version: 2,
                     },
                 ],
             },
@@ -614,6 +614,7 @@ mod tests {
         SearchIndexStatus {
             server: "S".into(),
             state: state as i32,
+            configured: true,
             active_generation: 3,
             entry_count: 101,
             unique_item_count: 100,
@@ -662,9 +663,6 @@ mod tests {
                 last_commit_latency_ms: Some(21),
             }),
             scheduler: Some(opcda_bridge_proto::bridge::IndexSchedulerDiagnostics {
-                auto_refresh_policy: Some(
-                    opcda_bridge_proto::bridge::IndexAutoRefreshPolicy::Allowed as i32,
-                ),
                 next_refresh_at: Some("next".into()),
                 last_attempt_at: Some("attempt".into()),
                 last_success_at: Some("success".into()),
@@ -785,7 +783,6 @@ mod tests {
         assert_eq!(value["host"]["disk_free_bytes"], 16);
         assert_eq!(value["storage"]["last_commit_latency_ms"], 21);
         assert_eq!(value["scheduler"]["consecutive_failures"], 23);
-        assert_eq!(value["scheduler"]["auto_refresh_policy"], "allowed");
         assert_eq!(value["health"]["state"], "healthy");
         assert_eq!(value["promoting"], true);
 
@@ -991,6 +988,7 @@ mod tests {
         let status = opcda_bridge::SearchIndexStatus {
             server: "S".into(),
             state: SearchIndexState::Ready,
+            auto_refresh_enabled: true,
             active_generation: 2,
             entry_count: 1,
             unique_item_count: 1,
