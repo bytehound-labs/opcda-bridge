@@ -2641,6 +2641,10 @@ impl<C: OpcClient> IndexManager<C> {
             return;
         };
         state.last_error = error.map(str::to_owned);
+        let cancellation_deadline = state
+            .build
+            .as_ref()
+            .and_then(|build| build.operator_cancelled_until);
         if error.is_some() {
             state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             state.circuit_open =
@@ -2654,6 +2658,11 @@ impl<C: OpcClient> IndexManager<C> {
                         self.settings.circuit_open_seconds,
                     ),
             );
+            if let Some(deadline) = cancellation_deadline {
+                state.retry_after = state.retry_after.map(|retry| retry.max(deadline));
+            }
+        } else if let Some(deadline) = cancellation_deadline {
+            state.retry_after = Some(deadline);
         } else {
             state.retry_after = None;
             state.consecutive_failures = 0;
@@ -2662,7 +2671,17 @@ impl<C: OpcClient> IndexManager<C> {
     }
 
     pub(super) fn finalize_owned_build(&self, server: &str, ownership: Option<&Arc<()>>) {
-        let _ = self.persist_retry_state(server);
+        if let Err(error) = self.persist_retry_state(server) {
+            tracing::error!(target: "opcda_bridge_gateway::index", server, error = %error,
+                "unable to persist namespace index scheduling deadline");
+            if let Ok(mut runtime) = self.runtime.lock()
+                && let Some(state) = runtime.get_mut(server)
+            {
+                state.last_error = Some(format!(
+                    "unable to persist index scheduling deadline: {error}"
+                ));
+            }
+        }
         self.clear_pause_overlays(server);
         self.remove_build_owner(server, ownership);
         self.clear_active_build(server);

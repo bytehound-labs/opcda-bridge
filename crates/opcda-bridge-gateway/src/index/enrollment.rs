@@ -62,14 +62,14 @@ impl<C: OpcClient> IndexManager<C> {
             });
         }
         let enrolled = self
-            .with_database_read(|db| db.enrollment(server))
+            .with_database_read(|db| db.is_enrolled(server))
             .map_err(IndexOperationError::Internal)?;
-        if enrolled.is_none() {
+        if !enrolled {
             self.validate_server_for_enrollment(server).await?;
             self.with_database_write(|db| db.enroll(server, &timestamp_now()))
                 .map_err(IndexOperationError::Internal)?;
         }
-        self.refresh_enrolled(server, force)
+        self.refresh_enrolled(server, force, false)
             .await
             .map_err(IndexOperationError::Internal)
     }
@@ -98,31 +98,23 @@ impl<C: OpcClient> IndexManager<C> {
         self: &Arc<Self>,
         server: &str,
         force: bool,
+        automatic: bool,
     ) -> anyhow::Result<IndexStatus> {
         if self.background_tasks.is_shutting_down() {
             return self.status(server).await;
         }
-        let storage = self.with_database_read(|db| Ok(db.storage_diagnostics()))?;
-        if storage.free_bytes.is_some_and(|free| {
-            free < self
-                .settings
-                .minimum_free_space_bytes
-                .saturating_add(self.settings.storage_headroom_bytes)
-        }) {
-            anyhow::bail!(
-                "insufficient free space for namespace index ({} bytes available, {} required)",
-                storage.free_bytes.unwrap_or_default(),
-                self.settings
-                    .minimum_free_space_bytes
-                    .saturating_add(self.settings.storage_headroom_bytes)
-            );
-        }
-        self.load_persisted_retry_state(server)?;
-        let build_ownership = self.reserve_refresh_build(server, force)?;
+        let build_ownership = self.reserve_refresh_build(server, force, automatic)?;
         let Some(build_ownership) = build_ownership else {
             return self.status(server).await;
         };
+        self.refresh_reserved(server, build_ownership).await
+    }
 
+    pub(super) async fn refresh_reserved(
+        self: &Arc<Self>,
+        server: &str,
+        build_ownership: Arc<()>,
+    ) -> anyhow::Result<IndexStatus> {
         let initial_limits = self.initial_inventory_limits();
         let Some(handle) = self
             .start_refresh_inventory(server, &build_ownership, initial_limits)
@@ -174,7 +166,38 @@ impl<C: OpcClient> IndexManager<C> {
         &self,
         server: &str,
         force: bool,
+        automatic: bool,
     ) -> anyhow::Result<Option<Arc<()>>> {
+        if self.background_tasks.is_shutting_down() {
+            return Ok(None);
+        }
+        let deleting = self
+            .deleting
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index deletion lock poisoned"))?;
+        let enrollment = self.with_database_read(|db| db.enrollment(server))?;
+        if deleting.contains(server)
+            || enrollment.is_none()
+            || (automatic && enrollment.is_some_and(|enrollment| !enrollment.auto_refresh_enabled))
+        {
+            return Ok(None);
+        }
+        let storage = self.with_database_read(|db| Ok(db.storage_diagnostics()))?;
+        if storage.free_bytes.is_some_and(|free| {
+            free < self
+                .settings
+                .minimum_free_space_bytes
+                .saturating_add(self.settings.storage_headroom_bytes)
+        }) {
+            anyhow::bail!(
+                "insufficient free space for namespace index ({} bytes available, {} required)",
+                storage.free_bytes.unwrap_or_default(),
+                self.settings
+                    .minimum_free_space_bytes
+                    .saturating_add(self.settings.storage_headroom_bytes)
+            );
+        }
+        self.load_persisted_retry_state(server)?;
         let foreground_users = self
             .foreground_users
             .lock()
@@ -242,6 +265,7 @@ impl<C: OpcClient> IndexManager<C> {
             started_at: timestamp_now(),
             foreground_users,
             operator_paused: false,
+            operator_cancelled_until: None,
             quiet_until: None,
             effective_limits: None,
             controller_state: None,
@@ -417,11 +441,9 @@ impl<C: OpcClient> IndexManager<C> {
     ) -> Result<IndexStatus, IndexOperationError> {
         match action {
             IndexControlAction::EnableAutoRefresh => {
-                self.reject_if_deleting(server)?;
                 self.change_auto_refresh(server, true)?;
             }
             IndexControlAction::DisableAutoRefresh => {
-                self.reject_if_deleting(server)?;
                 self.change_auto_refresh(server, false)?;
             }
             IndexControlAction::Delete => {
@@ -445,9 +467,8 @@ impl<C: OpcClient> IndexManager<C> {
     pub(super) fn require_enrollment(&self, server: &str) -> Result<(), IndexOperationError> {
         self.reject_if_deleting(server)?;
         if self
-            .with_database_read(|db| db.enrollment(server))
+            .with_database_read(|db| db.is_enrolled(server))
             .map_err(IndexOperationError::Internal)?
-            .is_some()
         {
             Ok(())
         } else {
@@ -520,7 +541,7 @@ impl<C: OpcClient> IndexManager<C> {
     ) -> Result<(), IndexOperationError> {
         self.reject_if_deleting(server)?;
         let enrolled = self
-            .with_database_write(|db| db.set_auto_refresh(server, false))
+            .with_database_read(|db| db.is_enrolled(server))
             .map_err(IndexOperationError::Internal)?;
         if !enrolled {
             return Ok(());
@@ -632,16 +653,46 @@ impl<C: OpcClient> IndexManager<C> {
             .runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
-        let Some(build) = runtime
-            .get_mut(server)
-            .and_then(|state| state.build.as_mut())
-        else {
+        let Some(state) = runtime.get_mut(server) else {
+            return Ok(());
+        };
+        let Some(build) = state.build.as_mut() else {
             return Ok(());
         };
         match action {
             IndexControlAction::Pause => build.operator_paused = true,
             IndexControlAction::Resume => Self::resume_build(build),
-            IndexControlAction::Cancel => self.cancel_build(server, build)?,
+            IndexControlAction::Cancel => {
+                let deadline = match build.operator_cancelled_until {
+                    Some(deadline) => deadline,
+                    None => SystemTime::now()
+                        .checked_add(
+                            Duration::from_secs(self.settings.refresh_interval_seconds.max(1))
+                                .saturating_add(super::scheduler::deterministic_jitter(
+                                    server,
+                                    self.settings.schedule_jitter_seconds,
+                                )),
+                        )
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("operator cancellation deadline overflow")
+                        })?,
+                };
+                self.cancel_build(server, build)?;
+                build.operator_cancelled_until = Some(deadline);
+                state.retry_after = Some(
+                    state
+                        .retry_after
+                        .map_or(deadline, |retry| retry.max(deadline)),
+                );
+                self.with_database_write(|db| {
+                    db.set_retry_state(
+                        server,
+                        state.retry_after,
+                        state.consecutive_failures,
+                        state.circuit_open,
+                    )
+                })?;
+            }
             IndexControlAction::EnableAutoRefresh
             | IndexControlAction::DisableAutoRefresh
             | IndexControlAction::Delete => {}

@@ -62,9 +62,11 @@ namespace was indexed.
 
 Indexing is opt-in by server. Run `index-refresh` with the exact ProgID returned by server
 discovery to enroll it and start its first build. Automatic indexing does not perform a first
-build. Check `index-status` and the gateway's `[index]` configuration, including `enabled`,
-`paused`, maintenance windows, and per-server automatic-refresh state. A configured `paused = true`
-prevents inventory from starting until indexing is resumed.
+build or opt a server into future refreshes. Enable Auto-refresh explicitly through BHTune or
+the Rust client after a usable index exists. Check the saved choice, next-refresh time,
+maintenance windows, retry backoff, foreground/health protection, and disk headroom.
+Use `index-resume` for an operator-paused active build. Remove retired `index.enabled` and
+`index.paused` keys; they are startup errors, not administrative scheduling controls.
 
 ## An index build fails or SQLite reports a lock
 

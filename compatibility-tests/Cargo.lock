@@ -783,9 +783,9 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
- "opcda-bridge-proto 0.5.0",
+ "opcda-bridge-proto 0.6.0",
  "serde",
  "thiserror",
  "tonic",
@@ -800,12 +800,12 @@ dependencies = [
  "async-trait",
  "opcda-bridge 0.3.2",
  "opcda-bridge 0.4.3",
- "opcda-bridge 0.5.1",
+ "opcda-bridge 0.6.0",
  "opcda-bridge-gateway 0.3.2",
- "opcda-bridge-gateway 0.5.12",
+ "opcda-bridge-gateway 0.6.0",
  "opcda-bridge-proto 0.3.2",
  "opcda-bridge-proto 0.4.3",
- "opcda-bridge-proto 0.5.0",
+ "opcda-bridge-proto 0.6.0",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.5.12"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -846,7 +846,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
- "opcda-bridge-proto 0.5.0",
+ "opcda-bridge-proto 0.6.0",
  "rusqlite",
  "serde",
  "serde_json",
@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "prost",
  "toml",

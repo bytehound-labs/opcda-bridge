@@ -47,7 +47,7 @@ It defines the supported ranges for:
 
 The generated [compatibility report](../COMPATIBILITY.md) and
 [machine-readable compatibility catalog](../compatibility.json) are derived from that source.
-Regenerate them with `python3 scripts/generate-compatibility-report.py`; do not hand-edit either
+Regenerate them with `python3 scripts/generate-compatibility-report.py --write`; do not hand-edit either
 generated output.
 
 The catalog's release lines are:
@@ -63,6 +63,11 @@ The 0.5 indexed-search boundary changes index lifecycle semantics to durable on-
 and per-server scheduling controls. Protobuf additions can be wire-compatible while introducing a
 new negotiated feature boundary. Older client/gateway pairs can continue using overlapping core
 and namespace operations without assuming that indexed-search lifecycle features exist.
+
+Indexed-search protocol 2 retains `SearchIndexStatus.configured = 3` as the saved per-server
+auto-refresh preference and Enable/Disable action numbers 4/5. New enrollment defaults off;
+manual refresh does not change a saved choice. The preference is independent of an active
+build's foreground, health, maintenance, or operator pause.
 
 ## Browse and search contract
 

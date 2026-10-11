@@ -43,7 +43,6 @@ use tokio::sync::Notify;
 fn settings(path: PathBuf) -> ResolvedIndexConfig {
     ResolvedIndexConfig {
         database_path: path,
-        enabled: true,
         refresh_interval_seconds: 604_800,
         startup_grace_period_seconds: 0,
         schedule_jitter_seconds: 0,
@@ -81,7 +80,6 @@ fn settings(path: PathBuf) -> ResolvedIndexConfig {
         concurrency: 1,
         worker_count: 1,
         query_cache_capacity: 256,
-        paused: false,
         max_results: 50,
     }
 }
@@ -517,6 +515,7 @@ fn insert_runtime_build<C: OpcClient>(
                 started_at: "1".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -540,10 +539,12 @@ fn seed_active_generation<C: OpcClient>(
     organization: NamespaceOrganization,
     source: BrowseSource,
     completed_at: &str,
+    auto_refresh_enabled: bool,
 ) {
     manager
         .with_database(|db| {
             let generation = db.start_generation("S", organization, source, &timestamp_now())?;
+            db.set_auto_refresh("S", auto_refresh_enabled)?;
             db.insert_entries(
                 "S",
                 generation,

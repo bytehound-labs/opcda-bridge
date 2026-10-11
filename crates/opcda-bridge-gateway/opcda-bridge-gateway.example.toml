@@ -49,10 +49,9 @@ rotation = "daily"
 # File existence alone does not indicate an active build; the OS advisory lock does.
 # database_path = "C:\\ProgramData\\opcda-bridge\\index.sqlite3"
 
-# Automatic indexing is enabled by default. It only schedules enrolled servers
-# that have completed a successful manual build. Set false to stop startup and
-# scheduled work without affecting manual index operations.
-enabled = true
+# Automatic refresh requires per-server opt-in after a successful manual build.
+# Enable or disable it from BHTune or the Rust client; the choice persists in SQLite.
+# There is no gateway-wide enabled/paused override.
 
 # A successful generation is refreshed once per week by default.
 refresh_interval_seconds = 604800
@@ -145,9 +144,6 @@ concurrency = 1
 # safe root partitioning; unsupported servers fall back to one full-root worker.
 worker_count = 1
 query_cache_capacity = 256
-
-# Set true to keep automatic indexing paused after gateway startup.
-paused = false
 
 # Maximum indexed results returned by one query.
 max_results = 50

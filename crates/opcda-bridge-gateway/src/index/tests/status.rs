@@ -18,6 +18,7 @@ fn controller_observation_expires_stale_commit_latency() {
                 started_at: "test".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -53,13 +54,17 @@ fn reserving_a_new_build_clears_previous_commit_latency_timestamp() {
         Arc::new(MockOpcClient::default()),
         settings(directory.path().join("index.sqlite3")),
     );
+    manager.with_database(|db| db.enroll("S", "0")).unwrap();
     manager
         .commit_latency_recorded_at
         .lock()
         .unwrap()
         .insert("S".into(), Instant::now());
 
-    let ownership = manager.reserve_refresh_build("S", true).unwrap().unwrap();
+    let ownership = manager
+        .reserve_refresh_build("S", true, false)
+        .unwrap()
+        .unwrap();
     assert!(
         !manager
             .commit_latency_recorded_at
@@ -233,6 +238,7 @@ async fn background_delay_and_refresh_handle_partial_status_errors_and_unconfigu
                 started_at: "1".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -260,6 +266,7 @@ async fn background_delay_and_refresh_handle_partial_status_errors_and_unconfigu
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        false,
     );
     manager.runtime.lock().unwrap().insert(
         "S".into(),
@@ -270,6 +277,7 @@ async fn background_delay_and_refresh_handle_partial_status_errors_and_unconfigu
                 started_at: "2".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -368,6 +376,7 @@ async fn manager_status_covers_partial_stale_refreshing_and_runtime_errors() {
                 started_at: "runtime-start".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -427,6 +436,7 @@ async fn manager_status_covers_partial_stale_refreshing_and_runtime_errors() {
             started_at: "runtime-only".into(),
             foreground_users: 0,
             operator_paused: false,
+            operator_cancelled_until: None,
             quiet_until: None,
             effective_limits: None,
             controller_state: None,
@@ -461,6 +471,7 @@ async fn manager_status_covers_partial_stale_refreshing_and_runtime_errors() {
                 started_at: "failed-runtime".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -515,6 +526,7 @@ async fn status_during_promotion_does_not_wait_for_database_mutex() {
                 started_at: "runtime-start".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -822,6 +834,7 @@ fn foreground_guard_resumes_synchronously_without_a_tokio_runtime() {
                 started_at: "1".into(),
                 foreground_users: 0,
                 operator_paused: false,
+                operator_cancelled_until: None,
                 quiet_until: None,
                 effective_limits: None,
                 controller_state: None,
@@ -913,6 +926,7 @@ async fn read_only_status_and_search_remain_responsive_while_writer_gate_is_held
         NamespaceOrganization::Hierarchical,
         BrowseSource::Da2,
         &timestamp_now(),
+        false,
     );
     let (locked, locked_rx) = std::sync::mpsc::sync_channel(0);
     let (release, release_rx) = std::sync::mpsc::sync_channel(0);
@@ -969,7 +983,7 @@ async fn failed_background_delete_is_recorded_in_status() {
     manager.background_tasks.wait_for_idle().await;
     let status = manager.status("S").await.unwrap();
     assert_eq!(status.state, IndexState::Failed);
-    assert!(!status.auto_refresh_enabled);
+    assert!(status.scheduler.next_refresh_at.is_none());
     assert!(
         status
             .last_error

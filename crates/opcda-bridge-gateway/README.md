@@ -166,8 +166,12 @@ server value.
 
 Configure index-wide behavior in the gateway TOML file under `[index]`. SQLite owns enrolled
 servers and each server's auto-refresh setting; a fresh gateway has no enrolled servers and never
-starts an automatic first build. A successful manually enrolled index is refreshed weekly by
-default when its per-server auto-refresh setting and global `index.enabled` switch permit it.
+starts an automatic first build. Manual enrollment, refresh, retry, and recreation after Delete
+do not opt a server into automatic refresh. Explicitly enable it through BHTune or the Rust
+client after a usable index exists; the saved choice survives restart. Opted-in indexes use a
+weekly interval by default, subject to maintenance, health, pacing, and retry protections.
+`index.enabled` and `index.paused` are rejected retired keys. An opted-out index reports no
+next-refresh date.
 Disabling per-server auto-refresh preserves its searchable generation; deleting an index removes
 its enrollment, generations, entries, and retry state after coordinating any active build. Delete
 returns a temporary `deleting` status while cleanup runs, then reaches `not-indexed`. The gateway

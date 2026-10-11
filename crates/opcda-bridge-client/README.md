@@ -75,5 +75,10 @@ opcda-bridge-client index-cancel --server Kepware.KepServerEX.V5
 Its JSON output is one object containing `matches`, `has_more`, and `status`; indexed matches
 contain exact ItemIDs and breadcrumb labels, never browse-session node keys.
 
+`index-status` reports the saved `auto_refresh_enabled` choice and the actual next-refresh
+time. New enrollment defaults to off; enable scheduled refresh through BHTune or the Rust
+client. Manual refresh never changes that choice. Disabling it preserves the cached index
+and does not cancel an active build.
+
 Use `opcda-bridge-client --help` for all commands. Prebuilt platform binaries are available from
 the repository releases page.

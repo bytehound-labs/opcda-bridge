@@ -7,10 +7,11 @@ tag values. Live browse and live search remain available independently of the in
 
 A fresh gateway has no enrolled servers. Start an index with `index-refresh` using the exact ProgID
 returned by `opcda-bridge-client servers`. The gateway validates that ProgID before persisting
-enrollment. A successful manual build creates a durable active generation; the gateway schedules
-that enrolled server for refresh according to its per-server auto-refresh setting and the global
-`index.enabled` policy. The default interval is seven days. Automatic indexing does not start a
-first build on an un-enrolled server.
+enrollment with automatic refresh off. A successful manual build creates a durable active
+generation but does not opt the server into scheduling. Use BHTune's **Enable Auto-refresh**
+button or the Rust client's `set_search_index_auto_refresh` method to opt in explicitly.
+The default interval is seven days. Manual refresh, retry, and recreation after Delete do not
+enable automatic refresh. Automatic indexing never enrolls a server or starts its first build.
 
 Refreshes write to a staging generation. Promotion is an atomic metadata transition: the previous
 complete generation remains searchable during a refresh, and a failed or cancelled refresh does
@@ -76,9 +77,10 @@ discovery, reads, writes, or lazy browse. Database and build-lock identities use
 paths where available, preventing relative-path and symlink aliases from bypassing coordination.
 
 Startup migrates older index schemas transactionally through the schema 2-to-3-to-4 sequence.
-Existing generations and full-text data are preserved. Servers with a usable active generation
-are enabled for scheduled refresh; failed-only histories require a manual retry before automatic
-refresh is enabled.
+Existing generations and full-text data are preserved. Schema-4 databases retain saved
+auto-refresh choices across restarts; new enrollment explicitly writes off even when an older
+database has an on-by-default SQL column. A usable active generation and an explicit opt-in
+are required for scheduled refresh.
 
 ## Pacing and safety controls
 
@@ -109,9 +111,18 @@ otherwise the gateway uses one full-root inventory.
 
 The complete set of options and defaults is documented in the
 [gateway example configuration](../crates/opcda-bridge-gateway/opcda-bridge-gateway.example.toml).
-The gateway-wide `index.enabled` switch controls startup and scheduled work. Manual status, browse,
-search, refresh, and read operations remain available while it is disabled. Per-server scheduled
-refresh can be disabled without deleting the searchable generation.
+The persisted `auto_refresh_enabled` choice controls per-server scheduling. **Disable
+Auto-refresh** stops future automatic work without deleting the searchable generation or
+cancelling an active build; use the separate cancel control to stop that build. Opt-out is
+rechecked after asynchronous probes, so an earlier scheduler snapshot cannot override it.
+An opted-out index reports no next-refresh date. An opted-in usable index reports its actual
+schedule, including retry backoff.
+
+The gateway has no administrative `index.enabled` or `index.paused` override. Remove those
+retired keys from configuration files; their presence is an actionable startup error.
+Startup grace, maintenance windows, foreground/health protection, disk headroom, operation
+timeouts, concurrency, pacing, and failure backoff remain in effect. Pause/Resume controls
+affect an active build, not the saved auto-refresh choice.
 
 ## Large-namespace acceptance runbook
 
@@ -124,8 +135,8 @@ Use this sequence before a full refresh on a large or production namespace:
    replacing a diagnostic sidecar, preserve its executable, configuration, database, `-wal` and
    `-shm` files, logs, and build-lock owner metadata. Verify the backup manifest and hashes.
 3. Confirm the sidecar's exact process command line, listener ownership, database path, gateway
-   status, server discovery, a known read, and indexed search. Set `paused = false` before asking
-   it to build.
+   status, server discovery, a known read, and indexed search. Keep automatic refresh off while
+   preparing a bounded manual canary.
 4. Run a short canary. Confirm status and foreground reads remain responsive, the previous active
    generation remains searchable, progress writes and commit batches advance, cleanup does not
    block progress, and cancelling the canary preserves the previous active generation.
