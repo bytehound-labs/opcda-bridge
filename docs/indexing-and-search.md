@@ -70,9 +70,11 @@ release removes `.build.owner`; forced termination may leave it for the next acq
 overwrite. Do not delete either file while a gateway may be running.
 
 All writes to an index database share a database-wide writer gate, including build progress,
-failure updates, and cleanup batches. Cleanup uses a separate SQLite WAL connection, defers while
-builds are active, yields between bounded batches, and retries transient failures. Search uses a
-read-only connection and bounded candidate sets so broad search work does not block status,
+failure updates, and cleanup batches. Cleanup uses a separate SQLite WAL connection and discovers
+full-text row candidates by rowid before acquiring the writer gate, then revalidates them during
+bounded deletion. This keeps full-text scans out of the write critical section. Cleanup defers
+while builds are active, yields between bounded batches, and retries transient failures. Search
+uses a read-only connection and bounded candidate sets so broad search work does not block status,
 discovery, reads, writes, or lazy browse. Database and build-lock identities use canonical file
 paths where available, preventing relative-path and symlink aliases from bypassing coordination.
 

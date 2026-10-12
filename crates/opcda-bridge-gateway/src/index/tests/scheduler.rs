@@ -299,6 +299,154 @@ fn cleanup_stops_when_obsolete_data_disappears_before_batch_delete() {
     background_tasks.wait_for_cleanup_batch_hook();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_refresh_control_remains_available_during_cleanup_candidate_discovery() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("post-cancel-cleanup.sqlite3");
+    let manager = Arc::new(IndexManager::new(
+        Arc::new(MockOpcClient::default()),
+        settings(path),
+    ));
+    let retry_after = SystemTime::now() + Duration::from_secs(3_600);
+    let (active, failed) = manager
+        .with_database(|db| {
+            db.connection.execute(
+                "INSERT INTO entries_fts(rowid, server, generation, item_id, display_name, breadcrumbs)
+                 VALUES (9000, 'Other', 1, 'Other.Keep', 'Keep', 'Other')",
+                [],
+            )?;
+            let active =
+                db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "1")?;
+            db.insert_entries("S", active, &[inventory_entry("Keep", "S.Keep")])?;
+            db.promote("S", active, "2", &completed_progress(1))?;
+            let failed =
+                db.start_generation("S", NamespaceOrganization::Flat, BrowseSource::Flat, "3")?;
+            db.insert_entries("S", failed, &[inventory_entry("Cancelled", "S.Cancelled")])?;
+            db.fail_generation("S", failed, "namespace index build cancelled")?;
+            db.set_retry_state("S", Some(retry_after), 1, false)?;
+            Ok((active, failed))
+        })
+        .unwrap();
+    manager.runtime.lock().unwrap().insert(
+        "S".into(),
+        RuntimeState {
+            build: None,
+            retry_after: Some(retry_after),
+            last_error: Some("namespace index build cancelled".into()),
+            consecutive_failures: 1,
+            circuit_open: false,
+            health: HealthProbeState::Unavailable,
+            sentinel_checked_at: None,
+        },
+    );
+
+    let (cleanup_started, cleanup_release) =
+        manager.background_tasks.install_cleanup_candidate_hook();
+    manager.schedule_cleanup("S");
+    tokio::task::spawn_blocking(move || cleanup_started.recv_timeout(Duration::from_secs(5)))
+        .await
+        .expect("cleanup candidate waiter panicked")
+        .expect("cleanup candidate discovery did not start");
+
+    let writer_gate_available = manager.coordination.writer_gate.try_lock().is_ok();
+    let control_status = if writer_gate_available {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.control("S", IndexControlAction::EnableAutoRefresh),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    cleanup_release.send(()).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.background_tasks.wait_for_idle(),
+    )
+    .await
+    .expect("post-cancel cleanup did not finish");
+    manager.shutdown_background_indexing().await;
+
+    assert!(
+        writer_gate_available,
+        "cleanup candidate discovery held the shared writer gate"
+    );
+    let status = control_status
+        .expect("auto-refresh control was not attempted")
+        .expect("auto-refresh control did not complete within five seconds")
+        .unwrap();
+    assert!(status.auto_refresh_enabled);
+    assert_eq!(status.active_generation, active);
+    assert_eq!(
+        manager
+            .search("S", "Keep", 3, 10)
+            .await
+            .unwrap()
+            .matches
+            .iter()
+            .map(|entry| entry.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["S.Keep"]
+    );
+    let persisted_retry_after = manager
+        .with_database(|db| db.retry_state("S"))
+        .unwrap()
+        .0
+        .unwrap();
+    assert!(retry_after.duration_since(persisted_retry_after).unwrap() < Duration::from_millis(1));
+    assert_eq!(
+        manager
+            .runtime
+            .lock()
+            .unwrap()
+            .get("S")
+            .unwrap()
+            .retry_after,
+        Some(retry_after)
+    );
+    assert_eq!(
+        manager
+            .runtime
+            .lock()
+            .unwrap()
+            .get("S")
+            .and_then(|state| state.last_error.as_deref()),
+        Some("namespace index build cancelled")
+    );
+    assert_eq!(
+        manager
+            .with_database(|db| {
+                db.connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM generations
+                     WHERE server = 'S' AND generation = ?1",
+                        [failed as i64],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        manager
+            .with_database(|db| {
+                db.connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries_fts
+                     WHERE rowid = 9000 AND server = 'Other'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap(),
+        1
+    );
+}
+
 #[test]
 fn cleanup_checkpoint_defers_for_builds_and_tolerates_poisoned_locks() {
     let directory = tempdir().unwrap();
@@ -1486,13 +1634,14 @@ fn cleanup_deferral_log_fields_are_evaluated_when_enabled() {
         .with_writer(CapturedLogWriter(Arc::clone(&output)))
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
+    let mut fts_after_rowid = 0_i64;
 
     let result = tracing::dispatcher::with_default(&dispatch, || {
         cleanup_one_batch(
             &database,
             &mut connection,
-            &database_path,
             "S",
+            &mut fts_after_rowid,
             &background_tasks,
             &writer_gate,
             &active_builds,

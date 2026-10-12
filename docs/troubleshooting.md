@@ -75,12 +75,13 @@ database path, server, generation, operation, and terminal build outcome. Verify
 gateway process has its intended database path and that no two processes are indexing the same
 SQLite file.
 
-Build progress, failure updates, and cleanup share a database-wide writer gate. Cleanup defers
-while builds are active and runs in bounded batches. If lock errors recur, preserve the active
-database and its `-wal`/`-shm` sidecars, record the exact process command lines and database paths,
-and stop additional refresh attempts until the contention is understood. Do not remove
-`.build.lock` or `.build.owner` while any gateway process may still be running. The advisory lock,
-not the presence of the owner sidecar, determines whether a build is active.
+Build progress, failure updates, and cleanup writes share a database-wide writer gate. Cleanup
+discovers full-text candidates before acquiring the gate, revalidates them during bounded deletion,
+and defers while builds are active. If lock errors recur, preserve the active database and its
+`-wal`/`-shm` sidecars, record the exact process command lines and database paths, and stop
+additional refresh attempts until the contention is understood. Do not remove `.build.lock` or
+`.build.owner` while any gateway process may still be running. The advisory lock, not the presence
+of the owner sidecar, determines whether a build is active.
 
 A failed or cancelled refresh does not replace a complete active generation. Continue using that
 generation for indexed search while the failure is investigated.
