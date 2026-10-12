@@ -65,6 +65,8 @@ pub(super) struct BackgroundTasks {
     #[cfg(test)]
     pub(super) cleanup_batch_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
     #[cfg(test)]
+    pub(super) cleanup_candidate_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
+    #[cfg(test)]
     pub(super) cleanup_writer_gate_hook: Mutex<Option<Arc<CleanupBatchHook>>>,
     #[cfg(test)]
     pub(super) cleanup_notification_hook: Mutex<Option<Arc<CleanupNotificationHook>>>,
@@ -165,6 +167,12 @@ pub(super) struct CleanupBatch {
     pub(super) generations: u64,
 }
 
+#[derive(Clone, Copy)]
+struct CleanupCandidate {
+    rowid: i64,
+    generation: i64,
+}
+
 pub(super) enum CleanupBatchResult {
     Shutdown,
     Deferred,
@@ -197,6 +205,8 @@ impl BackgroundTasks {
             panic_next_cleanup_worker: AtomicBool::new(false),
             #[cfg(test)]
             cleanup_batch_hook: Mutex::new(None),
+            #[cfg(test)]
+            cleanup_candidate_hook: Mutex::new(None),
             #[cfg(test)]
             cleanup_writer_gate_hook: Mutex::new(None),
             #[cfg(test)]
@@ -290,6 +300,41 @@ impl BackgroundTasks {
     pub(super) fn wait_for_cleanup_batch_hook(&self) {
         let hook = self
             .cleanup_batch_hook
+            .lock()
+            .ok()
+            .and_then(|hook| hook.clone());
+        let Some(hook) = hook else {
+            return;
+        };
+        if !hook.fired.swap(true, Ordering::AcqRel) {
+            let _ = hook.started.send(());
+            if let Ok(release) = hook.release.lock() {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_cleanup_candidate_hook(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (started, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.cleanup_candidate_hook.lock().unwrap() = Some(Arc::new(CleanupBatchHook {
+            started,
+            release: Mutex::new(release_rx),
+            fired: AtomicBool::new(false),
+        }));
+        (started_rx, release)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_cleanup_candidate_hook(&self) {
+        let hook = self
+            .cleanup_candidate_hook
             .lock()
             .ok()
             .and_then(|hook| hook.clone());
@@ -1290,27 +1335,37 @@ pub(super) fn cleanup_build_is_active(active_builds: &Mutex<HashSet<String>>) ->
         .unwrap_or(true)
 }
 
-pub(super) fn delete_cleanup_batch(
+fn delete_cleanup_batch(
     transaction: &rusqlite::Transaction<'_>,
     server: &str,
+    fts_candidates: &[CleanupCandidate],
+    generation_candidates: &[CleanupCandidate],
 ) -> rusqlite::Result<CleanupBatch> {
-    let fts_entries = transaction.execute(
-        "DELETE FROM entries_fts
-         WHERE rowid IN (
-             SELECT f.rowid
-             FROM entries_fts f
-             INNER JOIN generations g
-               ON g.server = f.server AND g.generation = f.generation
-             WHERE g.server = ?1
-               AND (g.state = 'superseded'
-                    OR (g.state = 'failed' AND EXISTS (
-                        SELECT 1 FROM generations AS active
-                        WHERE active.server = g.server AND active.state = 'active'
-                    )))
-             LIMIT ?2
-         )",
-        params![server, CLEANUP_BATCH_SIZE as i64],
-    )?;
+    let fts_entries = {
+        let mut statement = transaction.prepare_cached(
+            "DELETE FROM entries_fts
+             WHERE rowid = ?1
+               AND server = ?2
+               AND generation = ?3
+               AND EXISTS (
+                   SELECT 1 FROM generations AS g
+                   WHERE g.server = entries_fts.server
+                     AND g.generation = entries_fts.generation
+                     AND (g.state = 'superseded'
+                          OR (g.state = 'failed' AND EXISTS (
+                              SELECT 1 FROM generations AS active
+                              WHERE active.server = g.server AND active.state = 'active'
+                          )))
+               )",
+        )?;
+        fts_candidates
+            .iter()
+            .try_fold(0_u64, |deleted, candidate| {
+                statement
+                    .execute(params![candidate.rowid, server, candidate.generation])
+                    .map(|count| deleted.saturating_add(count as u64))
+            })?
+    };
     let entries = transaction.execute(
         "DELETE FROM entries
          WHERE rowid IN (
@@ -1328,45 +1383,115 @@ pub(super) fn delete_cleanup_batch(
          )",
         params![server, CLEANUP_BATCH_SIZE as i64],
     )?;
-    let generations = transaction.execute(
-        "DELETE FROM generations
-         WHERE rowid IN (
-             SELECT g.rowid
-             FROM generations g
-             WHERE g.server = ?1
-               AND (g.state = 'superseded'
-                    OR (g.state = 'failed' AND EXISTS (
+    // FTS emptiness is checked off-gate; builds only add rows to staging generations.
+    let generations = {
+        let mut statement = transaction.prepare_cached(
+            "DELETE FROM generations
+             WHERE rowid = ?1
+               AND server = ?2
+               AND generation = ?3
+               AND (state = 'superseded'
+                    OR (state = 'failed' AND EXISTS (
                         SELECT 1 FROM generations AS active
-                        WHERE active.server = g.server AND active.state = 'active'
+                        WHERE active.server = generations.server AND active.state = 'active'
                     )))
                AND NOT EXISTS (
                    SELECT 1 FROM entries e
-                   WHERE e.server = g.server AND e.generation = g.generation
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM entries_fts f
-                   WHERE f.server = g.server AND f.generation = g.generation
-               )
-             LIMIT ?2
-         )",
-        params![server, CLEANUP_BATCH_SIZE as i64],
-    )?;
+                   WHERE e.server = generations.server
+                     AND e.generation = generations.generation
+               )",
+        )?;
+        generation_candidates
+            .iter()
+            .try_fold(0_u64, |deleted, candidate| {
+                statement
+                    .execute(params![candidate.rowid, server, candidate.generation])
+                    .map(|count| deleted.saturating_add(count as u64))
+            })?
+    };
     Ok(CleanupBatch {
         entries: entries as u64,
-        fts_entries: fts_entries as u64,
-        generations: generations as u64,
+        fts_entries,
+        generations,
     })
+}
+
+fn cleanup_candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanupCandidate> {
+    Ok(CleanupCandidate {
+        rowid: row.get(0)?,
+        generation: row.get(1)?,
+    })
+}
+
+fn cleanup_fts_candidates(
+    read_only: &IndexDb,
+    server: &str,
+    after_rowid: i64,
+) -> rusqlite::Result<Vec<CleanupCandidate>> {
+    let query = "
+        SELECT f.rowid, f.generation
+        FROM entries_fts AS f
+        WHERE f.rowid > ?1
+          AND f.server = ?2
+          AND EXISTS (
+              SELECT 1 FROM generations AS g
+              WHERE g.server = f.server
+                AND g.generation = f.generation
+                AND (g.state = 'superseded'
+                     OR (g.state = 'failed' AND EXISTS (
+                         SELECT 1 FROM generations AS active
+                         WHERE active.server = g.server AND active.state = 'active'
+                     )))
+          )
+        ORDER BY f.rowid
+        LIMIT ?3
+    ";
+    let mut statement = read_only.connection.prepare(query)?;
+    let parameters = params![after_rowid, server, CLEANUP_BATCH_SIZE as i64];
+    let rows = statement.query_map(parameters, cleanup_candidate_from_row)?;
+    rows.collect()
+}
+
+fn cleanup_generation_candidates(
+    read_only: &IndexDb,
+    server: &str,
+) -> rusqlite::Result<Vec<CleanupCandidate>> {
+    let query = "
+        SELECT g.rowid, g.generation
+        FROM generations AS g
+        WHERE g.server = ?1
+          AND (g.state = 'superseded'
+               OR (g.state = 'failed' AND EXISTS (
+                   SELECT 1 FROM generations AS active
+                   WHERE active.server = g.server AND active.state = 'active'
+               )))
+          AND NOT EXISTS (
+              SELECT 1 FROM entries AS e
+              WHERE e.server = g.server AND e.generation = g.generation
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM entries_fts AS f
+              WHERE f.server = g.server AND f.generation = g.generation
+          )
+        ORDER BY g.rowid
+        LIMIT ?2
+    ";
+    let mut statement = read_only.connection.prepare(query)?;
+    let parameters = params![server, CLEANUP_BATCH_SIZE as i64];
+    let rows = statement.query_map(parameters, cleanup_candidate_from_row)?;
+    rows.collect()
 }
 
 pub(super) fn cleanup_one_batch(
     read_only: &IndexDb,
     connection: &mut Option<Connection>,
-    path: &Path,
     server: &str,
+    fts_after_rowid: &mut i64,
     background_tasks: &BackgroundTasks,
     writer_gate: &Mutex<()>,
     active_builds: &Mutex<HashSet<String>>,
 ) -> anyhow::Result<CleanupBatchResult> {
+    let path = read_only.path.as_path();
     if background_tasks.is_shutting_down() {
         return Ok(CleanupBatchResult::Shutdown);
     }
@@ -1382,6 +1507,14 @@ pub(super) fn cleanup_one_batch(
     if !read_only.has_obsolete_generations(server)? {
         return Ok(CleanupBatchResult::NoObsoleteGenerations);
     }
+    #[cfg(test)]
+    background_tasks.wait_for_cleanup_candidate_hook();
+    let fts_candidates = cleanup_fts_candidates(read_only, server, *fts_after_rowid)?;
+    let generation_candidates = if fts_candidates.is_empty() {
+        cleanup_generation_candidates(read_only, server)?
+    } else {
+        Vec::new()
+    };
     #[cfg(test)]
     background_tasks.wait_for_cleanup_writer_gate_hook();
     let writer_guard = writer_gate
@@ -1414,8 +1547,17 @@ pub(super) fn cleanup_one_batch(
         .as_mut()
         .expect("cleanup connection initialized")
         .transaction()?;
-    let batch = delete_cleanup_batch(&transaction, server)?;
+    let last_fts_rowid = fts_candidates.last().map(|candidate| candidate.rowid);
+    let batch = delete_cleanup_batch(
+        &transaction,
+        server,
+        &fts_candidates,
+        &generation_candidates,
+    )?;
     transaction.commit()?;
+    if let Some(rowid) = last_fts_rowid {
+        *fts_after_rowid = rowid;
+    }
     drop(writer_guard);
     Ok(CleanupBatchResult::Deleted(batch))
 }
@@ -1440,12 +1582,13 @@ pub(super) fn cleanup_obsolete_generations_coordinated(
     }
     let mut connection = None;
     let mut stats = CleanupStats::default();
+    let mut fts_after_rowid = 0_i64;
     loop {
         match cleanup_one_batch(
             &read_only,
             &mut connection,
-            path,
             server,
+            &mut fts_after_rowid,
             background_tasks,
             writer_gate.as_ref(),
             active_builds.as_ref(),
