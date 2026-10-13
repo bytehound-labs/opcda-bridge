@@ -102,6 +102,17 @@ jobs:
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.sha256 }}
 
+  aur-publish:
+    needs: release-client
+    if: startsWith(github.ref_name, 'opcda-bridge-client-v')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/aur-publish.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    secrets:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
   release-integrity:
     needs: [release-gateway, release-client]
     if: always() && github.event_name == 'push' && (startsWith(github.ref_name, 'opcda-bridge-gateway-v') || startsWith(github.ref_name, 'opcda-bridge-client-v'))

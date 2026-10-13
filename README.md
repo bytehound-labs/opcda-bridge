@@ -34,8 +34,8 @@ listener or installing the Windows service.
 
 ### Client
 
-Install `opcda-bridge-client` from a platform archive or crates.io. For example, list OPC DA
-servers registered on the gateway:
+Install `opcda-bridge-client` from a platform archive, crates.io, or the Arch User Repository.
+For example, list OPC DA servers registered on the gateway:
 
 ```sh
 opcda-bridge-client --host 192.168.1.50:7600 servers

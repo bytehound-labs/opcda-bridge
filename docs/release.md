@@ -6,7 +6,7 @@ The workspace contains four independently versioned crates:
 | ---------------------- | ------------------------------------------------- |
 | `opcda-bridge-proto`   | crates.io                                         |
 | `opcda-bridge`         | crates.io                                         |
-| `opcda-bridge-client`  | crates.io and platform release archives           |
+| `opcda-bridge-client`  | crates.io, platform release archives, and AUR     |
 | `opcda-bridge-gateway` | crates.io and the Windows gateway release archive |
 
 Client and gateway package versions do not need to match. Runtime compatibility comes from the
@@ -21,7 +21,8 @@ the client and gateway tags; protocol and reusable-library releases do not produ
 Do not publish directly with `cargo publish` or create test tags for intermediate builds.
 
 The gateway release archive is always the 32-bit `i686-pc-windows-msvc` build. Client archives are
-produced for Linux x86_64, macOS arm64, and Windows x86_64.
+produced for Linux x86_64, macOS arm64, and Windows x86_64. The client release workflow also
+publishes the client binary to the AUR.
 
 A manual dispatch of the **Release** workflow builds dry-run packages and uploads them as
 workflow artifacts without creating a GitHub Release. This is a packaging check, not a release or
@@ -75,7 +76,8 @@ package, integrity, and platform checks required by the release workflows.
   client/gateway pair.
 - [GitHub Releases](https://github.com/bytehound-labs/opcda-bridge/releases) contains the
   prebuilt client and gateway archives.
-- The client can also be installed with `cargo install opcda-bridge-client`.
+- The client can also be installed with `cargo install opcda-bridge-client` or from the
+  `opcda-bridge-client-bin` AUR package.
 - The gateway can be installed with Cargo on Windows using the explicit 32-bit target documented
   in the gateway deployment guide.
 
