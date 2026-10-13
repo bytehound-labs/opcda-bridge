@@ -55,8 +55,11 @@ client's `set_search_index_auto_refresh` method. The saved choice survives gatew
 Disabling it stops future scheduling without cancelling an active build or removing cached tags.
 The gateway has no `index.enabled` or `index.paused` override. Pacing, maintenance windows,
 health protection, and retry backoff still govern automatic work. An active build does not
-start a second scheduled build. Cleanup after a cancelled or superseded refresh runs in bounded
-batches, preserving the last complete searchable generation and keeping index controls responsive.
+start a second scheduled build. An operator cancellation does not count as a failure, and a
+graceful gateway shutdown records an interruption without changing retry or circuit state.
+Unexpected stream termination is a counted failure. Cleanup after a cancelled or superseded refresh
+runs in bounded batches, preserving the last complete searchable generation and keeping index
+controls responsive.
 
 ## Documentation
 

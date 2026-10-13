@@ -14,10 +14,14 @@ The default interval is seven days. Manual refresh, retry, and recreation after 
 enable automatic refresh. Automatic indexing never enrolls a server or starts its first build.
 
 Refreshes write to a staging generation. Promotion is an atomic metadata transition: the previous
-complete generation remains searchable during a refresh, and a failed or cancelled refresh does
-not replace it. A failed initial build remains visible as failed because there is no complete
-generation to preserve. A successful inventory may carry a non-fatal warning for skipped
-malformed branches; the generation remains ready and the warning remains visible in status.
+complete generation remains searchable during a refresh, and a failed, cancelled, or interrupted
+refresh does not replace it. An operator cancellation does not count as a failure. A graceful
+gateway shutdown records the build as interrupted without changing existing retry or circuit
+state; startup recovery also marks builds left active by a gateway restart as interrupted. An
+unexpected stream end remains a counted failure. A failed initial build remains visible as failed
+because there is no complete generation to preserve. A successful inventory may carry a non-fatal
+warning for skipped malformed branches; the generation remains ready and the warning remains
+visible in status.
 
 Status distinguishes `not-indexed`, `partial`, `ready`, `stale`, `refreshing`, `failed`, and
 `deleting`. A `deleting` status is temporary while the gateway removes the enrollment and index

@@ -120,6 +120,7 @@ pub(super) enum BuildEventOutcome {
 
 pub(super) enum BuildLoopOutcome {
     Finished,
+    InterruptedByShutdown,
     Failed(String),
 }
 
@@ -1456,6 +1457,20 @@ impl<C: OpcClient> IndexManager<C> {
                 }
             }
         }
+        let gateway_shutting_down = self.background_tasks.is_shutting_down();
+        let operator_cancelled = if !state.terminal && state.failed.is_none() {
+            match self.operator_cancelled_build(server, &handle.control) {
+                Ok(cancelled) => cancelled,
+                Err(error) => {
+                    state.failed = Some(format!(
+                        "unable to classify inventory stream termination: {error}"
+                    ));
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if let Err(error) = handle.stream.shutdown().await {
             if state.failed.is_none() {
                 state.failed = Some(format!("inventory worker shutdown failed: {error}"));
@@ -1468,10 +1483,22 @@ impl<C: OpcClient> IndexManager<C> {
                 );
             }
         }
+        let mut interrupted_by_shutdown = false;
         if !state.terminal && state.failed.is_none() {
-            state.failed = Some("inventory stream ended before completion".to_string());
+            if operator_cancelled {
+                state.cancelled = true;
+            } else if gateway_shutting_down {
+                interrupted_by_shutdown = true;
+            } else {
+                state.failed =
+                    Some("inventory stream ended unexpectedly before completion".to_string());
+            }
         }
-        if !state.pending.is_empty() && state.failed.is_none() {
+        if !state.pending.is_empty()
+            && state.failed.is_none()
+            && !state.cancelled
+            && !interrupted_by_shutdown
+        {
             match self.commit_pending_entries_with_telemetry(server, generation, state) {
                 Ok(inserted) => {
                     state.persisted_item_count =
@@ -1483,10 +1510,35 @@ impl<C: OpcClient> IndexManager<C> {
                 }
             }
         }
-        state
-            .failed
-            .take()
-            .map_or(BuildLoopOutcome::Finished, BuildLoopOutcome::Failed)
+        if interrupted_by_shutdown {
+            BuildLoopOutcome::InterruptedByShutdown
+        } else {
+            state
+                .failed
+                .take()
+                .map_or(BuildLoopOutcome::Finished, BuildLoopOutcome::Failed)
+        }
+    }
+
+    pub(super) fn operator_cancelled_build(
+        &self,
+        server: &str,
+        control: &Arc<dyn InventoryControl>,
+    ) -> anyhow::Result<bool> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index runtime lock poisoned"))?;
+        Ok(runtime
+            .get(server)
+            .and_then(|state| state.build.as_ref())
+            .is_some_and(|build| {
+                build.operator_cancelled_until.is_some()
+                    && build
+                        .control
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, control))
+            }))
     }
 
     pub(super) async fn wait_for_build_readiness(
@@ -1754,11 +1806,15 @@ impl<C: OpcClient> IndexManager<C> {
             state.completed && !state.cancelled && !context.control_was_cancelled_before_cleanup;
         let outcome_label = match &outcome {
             BuildLoopOutcome::Failed(_) => "failed",
+            BuildLoopOutcome::InterruptedByShutdown => "interrupted",
             BuildLoopOutcome::Finished if completed => "completed",
             BuildLoopOutcome::Finished => "cancelled",
         };
         let error = match &outcome {
             BuildLoopOutcome::Failed(error) => Some(error.as_str()),
+            BuildLoopOutcome::InterruptedByShutdown => {
+                Some("namespace index build interrupted by gateway shutdown")
+            }
             BuildLoopOutcome::Finished => None,
         };
         self.log_build_telemetry(
@@ -1778,6 +1834,15 @@ impl<C: OpcClient> IndexManager<C> {
                     context.ownership,
                     context.build_started,
                     error,
+                );
+            }
+            BuildLoopOutcome::InterruptedByShutdown => {
+                self.finish_interrupted_build(
+                    context.server,
+                    context.generation,
+                    context.control,
+                    context.ownership,
+                    context.build_started,
                 );
             }
             BuildLoopOutcome::Finished if completed => {
@@ -1984,6 +2049,28 @@ impl<C: OpcClient> IndexManager<C> {
             );
         }
         self.finish_build_for_control_owned(server, control, ownership, None);
+    }
+
+    pub(super) fn finish_interrupted_build(
+        &self,
+        server: &str,
+        generation: u64,
+        control: &Arc<dyn InventoryControl>,
+        ownership: &Arc<()>,
+        build_started: Instant,
+    ) {
+        const ERROR: &str = "namespace index build interrupted by gateway shutdown";
+        self.fail_generation_and_schedule_cleanup(server, generation, ERROR);
+        tracing::warn!(target: "opcda_bridge_gateway::index",
+            process_id = std::process::id(),
+            database = %self.settings.database_path.display(),
+            server = %server,
+            generation,
+            duration_ms = build_started.elapsed().as_millis() as u64,
+            error = ERROR,
+            "namespace index build interrupted by gateway shutdown"
+        );
+        self.finish_build_for_control_owned_interrupted(server, control, ownership, ERROR);
     }
 
     pub(super) fn finish_promotion_failure(
@@ -2542,12 +2629,39 @@ impl<C: OpcClient> IndexManager<C> {
         self.finish_build_inner(server, Some(control), Some(ownership), error);
     }
 
+    pub(super) fn finish_build_for_control_owned_interrupted(
+        &self,
+        server: &str,
+        control: &Arc<dyn InventoryControl>,
+        ownership: &Arc<()>,
+        error: &str,
+    ) {
+        self.finish_build_inner_with_retry_policy(
+            server,
+            Some(control),
+            Some(ownership),
+            Some(error.to_string()),
+            true,
+        );
+    }
+
     pub(super) fn finish_build_inner(
         &self,
         server: &str,
         control: Option<&Arc<dyn InventoryControl>>,
         ownership: Option<&Arc<()>>,
         error: Option<String>,
+    ) {
+        self.finish_build_inner_with_retry_policy(server, control, ownership, error, false);
+    }
+
+    fn finish_build_inner_with_retry_policy(
+        &self,
+        server: &str,
+        control: Option<&Arc<dyn InventoryControl>>,
+        ownership: Option<&Arc<()>>,
+        error: Option<String>,
+        preserve_retry_state: bool,
     ) {
         let owns_build = match self.runtime.lock() {
             Ok(mut runtime) => {
@@ -2557,7 +2671,13 @@ impl<C: OpcClient> IndexManager<C> {
                     return;
                 };
                 if is_owner {
-                    self.update_runtime_after_build(&mut runtime, server, error.as_deref());
+                    if preserve_retry_state {
+                        if let Some(state) = runtime.get_mut(server) {
+                            state.last_error = error.clone();
+                        }
+                    } else {
+                        self.update_runtime_after_build(&mut runtime, server, error.as_deref());
+                    }
                 }
                 is_owner
             }

@@ -1,5 +1,37 @@
 use super::*;
 
+struct OperatorCancelEofStream {
+    manager: Arc<IndexManager<MockOpcClient>>,
+}
+
+#[async_trait::async_trait]
+impl InventoryStream for OperatorCancelEofStream {
+    async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+        self.manager
+            .control("S", IndexControlAction::Cancel)
+            .await
+            .unwrap();
+        None
+    }
+}
+
+struct PoisonRuntimeOnEofStream {
+    manager: Arc<IndexManager<MockOpcClient>>,
+}
+
+#[async_trait::async_trait]
+impl InventoryStream for PoisonRuntimeOnEofStream {
+    async fn next(&mut self) -> Option<anyhow::Result<InventoryEvent>> {
+        let runtime = Arc::clone(&self.manager.runtime);
+        let _ = std::thread::spawn(move || {
+            let _guard = runtime.lock().unwrap();
+            panic!("poison runtime while classifying stream termination");
+        })
+        .join();
+        None
+    }
+}
+
 fn root_node(display_name: &str, kind: BrowseNodeKind, item_id: Option<&str>) -> BrowseNode {
     BrowseNode {
         node_key: display_name.into(),
@@ -1487,7 +1519,7 @@ async fn terminal_counts_reconcile_entries_drained_before_stream_termination() {
     assert!(matches!(
         outcome,
         BuildLoopOutcome::Failed(error)
-            if error == "inventory stream ended before completion"
+            if error == "inventory stream ended unexpectedly before completion"
     ));
     let counts = state.terminal_counts();
     assert_eq!(counts.drained_events, 3);
@@ -1504,6 +1536,188 @@ async fn terminal_counts_reconcile_entries_drained_before_stream_termination() {
         "unspecified"
     );
     assert_eq!(namespace_string(NamespaceOrganization::Flat), "flat");
+}
+
+#[tokio::test]
+async fn operator_cancelled_stream_eof_preserves_search_without_counting_failure() {
+    let manager = Arc::new(IndexManager::new(
+        Arc::new(MockOpcClient::default()),
+        settings(PathBuf::from(":memory:")),
+    ));
+    seed_active_generation(
+        &manager,
+        NamespaceOrganization::Hierarchical,
+        BrowseSource::Da2,
+        "0",
+        true,
+    );
+    let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+    let ownership = insert_runtime_build(&manager, Arc::clone(&control));
+    let generation = manager
+        .with_database(|db| {
+            db.start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                &timestamp_now(),
+            )
+        })
+        .unwrap();
+    let build_started = Instant::now();
+    let mut handle = InventoryHandle {
+        stream: Box::new(OperatorCancelEofStream {
+            manager: Arc::clone(&manager),
+        }),
+        control,
+    };
+    let mut state = BuildRunState::new(&manager.settings, None);
+    let outcome = manager
+        .run_build_loop("S", generation, &mut handle, &[], &mut state, build_started)
+        .await;
+    let retry_after = manager
+        .runtime
+        .lock()
+        .unwrap()
+        .get("S")
+        .unwrap()
+        .retry_after;
+
+    assert!(state.cancelled);
+    assert!(matches!(&outcome, BuildLoopOutcome::Finished));
+    assert!(retry_after.is_some());
+    manager.finalize_build(
+        BuildFinalizationContext {
+            server: "S",
+            generation,
+            control: &handle.control,
+            control_was_cancelled_before_cleanup: handle.control.is_cancelled(),
+            ownership: &ownership,
+            build_started,
+        },
+        state,
+        outcome,
+    );
+    let status = manager.status("S").await.unwrap();
+    assert_eq!(status.active_generation, 1);
+    assert!(status.last_error.is_none());
+    assert_eq!(status.scheduler.consecutive_failures, 0);
+    assert_eq!(
+        manager
+            .runtime
+            .lock()
+            .unwrap()
+            .get("S")
+            .unwrap()
+            .retry_after,
+        retry_after
+    );
+    assert_eq!(
+        manager
+            .search("S", "persisted", 3, 10)
+            .await
+            .unwrap()
+            .matches
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unexpected_stream_eof_preserves_search_and_counts_failure() {
+    let manager = Arc::new(IndexManager::new(
+        Arc::new(MockOpcClient::default()),
+        settings(PathBuf::from(":memory:")),
+    ));
+    seed_active_generation(
+        &manager,
+        NamespaceOrganization::Hierarchical,
+        BrowseSource::Da2,
+        "0",
+        true,
+    );
+    let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+    let ownership = insert_runtime_build(&manager, Arc::clone(&control));
+    let generation = manager
+        .with_database(|db| {
+            db.start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                &timestamp_now(),
+            )
+        })
+        .unwrap();
+    let build_started = Instant::now();
+    let mut handle = InventoryHandle {
+        stream: Box::new(VecInventoryStream {
+            events: VecDeque::new(),
+        }),
+        control,
+    };
+    let mut state = BuildRunState::new(&manager.settings, None);
+    let outcome = manager
+        .run_build_loop("S", generation, &mut handle, &[], &mut state, build_started)
+        .await;
+
+    assert!(matches!(
+        &outcome,
+        BuildLoopOutcome::Failed(error)
+            if error == "inventory stream ended unexpectedly before completion"
+    ));
+    manager.finalize_build(
+        BuildFinalizationContext {
+            server: "S",
+            generation,
+            control: &handle.control,
+            control_was_cancelled_before_cleanup: handle.control.is_cancelled(),
+            ownership: &ownership,
+            build_started,
+        },
+        state,
+        outcome,
+    );
+
+    let status = manager.status("S").await.unwrap();
+    assert_eq!(status.active_generation, 1);
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("inventory stream ended unexpectedly before completion")
+    );
+    assert_eq!(status.scheduler.consecutive_failures, 1);
+    assert_eq!(
+        manager
+            .search("S", "persisted", 3, 10)
+            .await
+            .unwrap()
+            .matches
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn eof_classification_fails_closed_when_runtime_lock_is_poisoned() {
+    let manager = Arc::new(IndexManager::new(
+        Arc::new(MockOpcClient::default()),
+        settings(PathBuf::from(":memory:")),
+    ));
+    let mut handle = InventoryHandle {
+        stream: Box::new(PoisonRuntimeOnEofStream {
+            manager: Arc::clone(&manager),
+        }),
+        control: Arc::new(RecordingInventoryControl::default()),
+    };
+    let mut state = BuildRunState::new(&manager.settings, None);
+
+    let outcome = manager
+        .run_build_loop("S", 1, &mut handle, &[], &mut state, Instant::now())
+        .await;
+
+    assert!(matches!(
+        outcome,
+        BuildLoopOutcome::Failed(error)
+            if error == "unable to classify inventory stream termination: index runtime lock poisoned"
+    ));
 }
 
 #[test]
@@ -2039,7 +2253,7 @@ async fn build_stops_when_maintenance_health_or_rate_limit_control_is_cancelled(
     let health = run_cancelled_case(directory.path().join("health.sqlite3"), vec![]).await;
     assert_eq!(
         health.last_error.as_deref(),
-        Some("inventory stream ended before completion")
+        Some("inventory stream ended unexpectedly before completion")
     );
 
     let now = Local::now();
@@ -2058,7 +2272,7 @@ async fn build_stops_when_maintenance_health_or_rate_limit_control_is_cancelled(
     .await;
     assert_eq!(
         maintenance.last_error.as_deref(),
-        Some("inventory stream ended before completion")
+        Some("inventory stream ended unexpectedly before completion")
     );
 
     let control = Arc::new(RecordingInventoryControl::default());
@@ -2546,6 +2760,9 @@ async fn build_readiness_failure_stops_the_loop_and_cancels_control() {
             assert!(error.contains("unable to update inventory pacing while recovering"));
         }
         BuildLoopOutcome::Finished => panic!("readiness failure unexpectedly finished"),
+        BuildLoopOutcome::InterruptedByShutdown => {
+            panic!("readiness failure unexpectedly interrupted by gateway shutdown");
+        }
     }
     assert!(control.is_cancelled());
 }
