@@ -189,7 +189,12 @@ async fn restart_during_refresh_keeps_active_status_ready() {
     let status = manager.status("S").await.unwrap();
     assert_eq!(status.state, IndexState::Ready);
     assert_eq!(status.active_generation, active);
-    assert!(status.last_error.is_none());
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("namespace index build interrupted by gateway restart")
+    );
+    assert_eq!(status.scheduler.consecutive_failures, 0);
+    assert!(!status.scheduler.circuit_open);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -17,11 +17,12 @@ Refreshes write to a staging generation. Promotion is an atomic metadata transit
 complete generation remains searchable during a refresh, and a failed, cancelled, or interrupted
 refresh does not replace it. An operator cancellation does not count as a failure. A graceful
 gateway shutdown records the build as interrupted without changing existing retry or circuit
-state; startup recovery also marks builds left active by a gateway restart as interrupted. An
-unexpected stream end remains a counted failure. A failed initial build remains visible as failed
-because there is no complete generation to preserve. A successful inventory may carry a non-fatal
-warning for skipped malformed branches; the generation remains ready and the warning remains
-visible in status.
+state; startup recovery records `namespace index build interrupted by gateway restart` in the
+preserved active generation's `last_error`. Neither interruption changes retry or circuit state.
+An unexpected stream end remains a counted failure. A failed initial build remains visible as
+failed because there is no complete generation to preserve. A successful inventory may carry a
+non-fatal warning for skipped malformed branches; the generation remains ready and the warning
+remains visible in status.
 
 Status distinguishes `not-indexed`, `partial`, `ready`, `stale`, `refreshing`, `failed`, and
 `deleting`. A `deleting` status is temporary while the gateway removes the enrollment and index
