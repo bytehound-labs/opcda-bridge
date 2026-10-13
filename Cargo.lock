@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-client"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "opcda-bridge-gateway"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "async-trait",
