@@ -3,8 +3,8 @@
 //! [`serve`] is generic over [`OpcClient`] (rather than tied to the
 //! Windows-only COM adapter) so the part of the gateway that actually
 //! implements graceful shutdown can be exercised by tests on any platform,
-//! using the same mock client as `server`'s unit tests. [`run_gateway`]
-//! builds on top of it with the full, Windows-only bootstrap (config,
+//! using the same mock client as `server`'s unit tests. The `run_gateway`
+//! function builds on top of it with the full, Windows-only bootstrap (config,
 //! logging, COM, bind) shared by both console mode and the Windows service
 //! entry point in `service.rs`.
 

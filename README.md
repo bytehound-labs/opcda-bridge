@@ -73,8 +73,9 @@ controls responsive.
 | Common connection, browse, and index issues                | [Troubleshooting](docs/troubleshooting.md)                       |
 | Package releases and artifact verification                 | [Release and package verification](docs/release.md)              |
 
-The generated [compatibility report](COMPATIBILITY.md) and
-[machine-readable catalog](compatibility.json) describe protocol release lines and test evidence.
+[`compatibility.toml`](crates/opcda-bridge-proto/compatibility.toml) is the source of protocol
+release lines and client/gateway compatibility evidence. Use the client's `compatibility` command
+to inspect a live gateway; see [Protocol and compatibility](docs/protocol-and-compatibility.md).
 The [security policy](SECURITY.md) explains the threat model and vulnerability reporting process.
 
 ## Packages

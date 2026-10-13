@@ -33,7 +33,6 @@ pre-commit:
 
     prettier-format:
       glob: '**/*.{md,yaml,yml,json}'
-      exclude: ['COMPATIBILITY.md']
       run: |
         echo "Formatting files with prettier..."
         npx prettier --write {staged_files}

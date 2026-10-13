@@ -6,7 +6,7 @@ The workspace contains four independently versioned crates:
 | ---------------------- | ------------------------------------------------- |
 | `opcda-bridge-proto`   | crates.io                                         |
 | `opcda-bridge`         | crates.io                                         |
-| `opcda-bridge-client`  | crates.io and platform release archives           |
+| `opcda-bridge-client`  | crates.io, platform release archives, and AUR     |
 | `opcda-bridge-gateway` | crates.io and the Windows gateway release archive |
 
 Client and gateway package versions do not need to match. Runtime compatibility comes from the
@@ -47,9 +47,8 @@ Tagged binary releases include:
 - keyless Sigstore signatures and bundles; and
 - GitHub artifact provenance attestations.
 
-The release workflow also attaches the generated `COMPATIBILITY.md` and `compatibility.json`
-reports. Verify a downloaded archive against its checksum and attestations before deployment.
-Keep the exact gateway artifact and checksum together with deployment records.
+Verify a downloaded archive against its checksum and attestations before deployment. Keep the
+exact gateway artifact and checksum together with deployment records.
 
 ## Validation
 
@@ -63,13 +62,11 @@ cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
 cargo deny check
 cargo machete
 cargo package --workspace --locked --no-verify
-cargo test --manifest-path compatibility-tests/Cargo.toml --locked
-python3 scripts/generate-compatibility-report.py --check
 ```
 
 The Windows gateway is built for `i686-pc-windows-msvc`; gateway deployment tests must verify the
 official artifact rather than substituting an intermediate local build. Release jobs run the
-package, compatibility, integrity, and platform checks required by the release workflows.
+package, integrity, and platform checks required by the release workflows.
 
 ## Installation sources
 

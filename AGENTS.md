@@ -36,14 +36,15 @@ expand it into a generic industrial-protocol gateway.
 - Keep each pull request focused, use Conventional Commits, and squash-merge through GitHub after
   the required checks pass. Do not change the local Git identity.
 - Add or update user-facing documentation with behavior, configuration, protocol, safety, or
-  operational changes. Generated compatibility reports are not hand-edited.
+  operational changes.
 - Preserve the branch-protection required status contexts: `check`, `coverage`,
   `release-integrity`, and `Required Sonar quality status`.
 - Never commit secrets, credentials, machine-local state, caches, build output, or temporary
   artifacts.
 - Protocol changes must preserve published Protobuf names, field numbers, and wire types. An
-  intentional wire break requires the `breaking-protobuf` label, a compatibility-catalog boundary,
-  evidence, and regenerated reports.
+  intentional wire break increments the affected protocol version under `[protocol]` in
+  `crates/opcda-bridge-proto/compatibility.toml` and updates the relevant release-line and evidence
+  records.
 
 ## Build and validation commands
 
@@ -58,8 +59,6 @@ cargo test --workspace --locked
 cargo llvm-cov --workspace --lcov --output-path lcov.info
 cargo deny check
 cargo machete
-cargo test --manifest-path compatibility-tests/Cargo.toml --locked
-python3 scripts/generate-compatibility-report.py --check
 cargo package --workspace --locked --no-verify
 ```
 
@@ -84,7 +83,8 @@ cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-
   browse/search progress remains streamable. Exact ItemIDs and opaque browse tokens are protocol
   values; do not infer hierarchy by splitting tag punctuation.
 - Treat protocol-feature versions and exact-pair test evidence as separate from crate versions.
-  Update the compatibility catalog and generated report whenever a protocol boundary changes.
+  `crates/opcda-bridge-proto/compatibility.toml` is the source for release lines, protocol versions,
+  and evidence. Use `opcda-bridge-client compatibility` to inspect a deployed pair.
 - New index enrollment explicitly stores auto-refresh off, including manual retries and
   recreation after Delete. Existing schema-4 choices survive restart. Only opted-in usable
   indexes schedule; recheck opt-out after asynchronous probes and before profile invalidation.

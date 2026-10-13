@@ -15,7 +15,7 @@ release lines do not receive backports.
 | Source    | `main` branch          | Yes                    |
 
 Each crate is versioned and released independently; see
-[Versions and compatibility](README.md#versions-and-compatibility) for how client and gateway
+[Protocol and compatibility](docs/protocol-and-compatibility.md) for how client and gateway
 versions relate.
 
 ## Reporting a vulnerability
@@ -34,8 +34,8 @@ Report them privately instead:
 Include as much of the following as you can:
 
 - the affected component and version or commit;
-- how it was installed (release archive, `cargo install`, source build, or AUR package) and, for
-  the gateway, whether it runs as a Windows service;
+- how it was installed (release archive, `cargo install`, or source build) and, for the gateway,
+  whether it runs as a Windows service;
 - the Windows version, OPC DA server, and client platform involved;
 - reproduction steps or a proof of concept; and
 - the impact you observed or expect.

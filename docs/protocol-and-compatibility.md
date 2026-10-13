@@ -35,7 +35,7 @@ read/write operations remain compatible.
 
 ## Protocol feature lines
 
-The canonical catalog is
+The canonical source for protocol-feature versions and package release lines is
 [`crates/opcda-bridge-proto/compatibility.toml`](../crates/opcda-bridge-proto/compatibility.toml).
 It defines the supported ranges for:
 
@@ -45,10 +45,9 @@ It defines the supported ranges for:
 | Namespace      |        2 | Capabilities, paged browse, browse sessions, and live search                   |
 | Indexed search |        2 | Durable on-demand index enrollment, search, and per-server scheduling controls |
 
-The generated [compatibility report](../COMPATIBILITY.md) and
-[machine-readable compatibility catalog](../compatibility.json) are derived from that source.
-Regenerate them with `python3 scripts/generate-compatibility-report.py --write`; do not hand-edit either
-generated output.
+The TOML file also records pair evidence. Use the live `opcda-bridge-client compatibility` report
+to inspect a deployed client/gateway pair; no generated Markdown or JSON compatibility reports are
+maintained.
 
 The catalog's release lines are:
 
@@ -97,12 +96,13 @@ gateway release.
 The three published Rust libraries are pre-1.0. Adding a public Rust struct field can break
 downstream struct literals even when the Protobuf wire change is additive. Such a public API break
 requires the affected crate's next minor version and its workspace dependency requirement to be
-updated. The semver check compares library APIs with their latest crates.io versions.
+updated.
 
-An intentional Protobuf wire break requires the `breaking-protobuf` label, a catalog boundary,
-updated compatibility evidence, and regenerated reports. Preserve published package names,
-Protobuf packages, services, RPCs, fields, field numbers, and enum values. Do not change the wire
-contract solely to satisfy a linter.
+An intentional Protobuf wire break increments the affected protocol version under `[protocol]` in
+the compatibility TOML and updates the corresponding release-line and evidence records. The Buf
+workflow checks wire compatibility against `main` and has no label-based bypass. Preserve
+published package names, Protobuf packages, services, RPCs, fields, field numbers, and enum values.
+Do not change the wire contract solely to satisfy a linter.
 
 The gateway migrates older indexed-search SQLite databases transactionally through schema 2, 3,
 and 4. Existing generations and full-text data are preserved; only usable active generations are
@@ -113,4 +113,4 @@ enabled for scheduled refresh automatically.
 - [Architecture](architecture.md)
 - [Indexing and search operations](indexing-and-search.md)
 - [Release and package verification](release.md)
-- [Compatibility report](../COMPATIBILITY.md)
+- [Client README and compatibility command](../crates/opcda-bridge-client/README.md)
