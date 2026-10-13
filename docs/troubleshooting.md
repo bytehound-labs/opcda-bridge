@@ -83,8 +83,14 @@ additional refresh attempts until the contention is understood. Do not remove `.
 `.build.owner` while any gateway process may still be running. The advisory lock, not the presence
 of the owner sidecar, determines whether a build is active.
 
-A failed or cancelled refresh does not replace a complete active generation. Continue using that
-generation for indexed search while the failure is investigated.
+A failed, cancelled, or interrupted refresh does not replace a complete active generation. An
+operator cancellation does not increase the failure count. A graceful shutdown reports
+`namespace index build interrupted by gateway shutdown`; startup recovery reports
+`namespace index build interrupted by gateway restart` in status on the preserved active
+generation. Neither interruption changes existing retry or circuit state. By contrast,
+`inventory stream ended unexpectedly before completion` is a counted failure. Continue using the
+complete generation for indexed search, inspect the gateway logs, and retry after addressing the
+cause.
 
 ## A namespace branch is skipped
 

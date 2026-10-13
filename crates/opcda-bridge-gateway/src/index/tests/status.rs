@@ -189,7 +189,12 @@ async fn restart_during_refresh_keeps_active_status_ready() {
     let status = manager.status("S").await.unwrap();
     assert_eq!(status.state, IndexState::Ready);
     assert_eq!(status.active_generation, active);
-    assert!(status.last_error.is_none());
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("namespace index build interrupted by gateway restart")
+    );
+    assert_eq!(status.scheduler.consecutive_failures, 0);
+    assert!(!status.scheduler.circuit_open);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -624,7 +629,7 @@ async fn build_terminal_error_and_cancellation_paths_preserve_consistent_status(
         maintenance_windows: Vec<String>,
         expected_state: IndexState,
         expected_error: Option<&str>,
-    ) {
+    ) -> IndexStatus {
         let directory = tempdir().unwrap();
         let client = Arc::new(LifecycleClient::new(
             vec![Ok(handle_with_control(
@@ -640,6 +645,7 @@ async fn build_terminal_error_and_cancellation_paths_preserve_consistent_status(
         wait_for_state(&manager, "S", expected_state).await;
         let status = manager.status("S").await.unwrap();
         assert_eq!(status.last_error.as_deref(), expected_error);
+        status
     }
 
     let subscriber = tracing_subscriber::fmt()
@@ -648,13 +654,14 @@ async fn build_terminal_error_and_cancellation_paths_preserve_consistent_status(
         .finish();
     let _default = tracing::subscriber::set_default(subscriber);
 
-    run_case(
+    let unexpected_eof = run_case(
         VecDeque::new(),
         vec![],
         IndexState::Failed,
-        Some("inventory stream ended before completion"),
+        Some("inventory stream ended unexpectedly before completion"),
     )
     .await;
+    assert_eq!(unexpected_eof.scheduler.consecutive_failures, 1);
     run_case(
         VecDeque::from([Ok(InventoryEvent::Completed(InventoryCompleted {
             complete: false,

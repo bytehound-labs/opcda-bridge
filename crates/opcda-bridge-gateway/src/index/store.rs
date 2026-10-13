@@ -381,6 +381,20 @@ impl IndexDb {
                 continue;
             }
             connection.execute(
+                "UPDATE generations
+                 SET last_error = ?1
+                 WHERE server = ?2 AND state = 'active'
+                   AND EXISTS (
+                       SELECT 1 FROM generations AS interrupted
+                       WHERE interrupted.server = ?2
+                         AND interrupted.state = 'staging'
+                   )",
+                params![
+                    "namespace index build interrupted by gateway restart",
+                    server
+                ],
+            )?;
+            connection.execute(
                 "UPDATE generations AS interrupted
                  SET state = CASE
                          WHEN EXISTS (

@@ -608,6 +608,10 @@ fn sqlite_open_quarantines_invalid_schema_and_recovers_interrupted_builds() {
     assert_eq!(rows[0].state, "active");
     assert_eq!(rows[0].generation, active);
     assert_eq!(
+        rows[0].last_error.as_deref(),
+        Some("namespace index build interrupted by gateway restart")
+    );
+    assert_eq!(
         reopened
             .connection
             .query_row(
@@ -657,6 +661,26 @@ fn sqlite_open_quarantines_invalid_schema_and_recovers_interrupted_builds() {
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
+        1
+    );
+    drop(reopened);
+    let cleanup =
+        cleanup_obsolete_generations(&interrupted_path, "S", &BackgroundTasks::new()).unwrap();
+    assert_eq!(cleanup.generations, 1);
+    let after_cleanup = IndexDb::open(&interrupted_path).unwrap();
+    let rows = after_cleanup.status_rows("S").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, "active");
+    assert_eq!(
+        rows[0].last_error.as_deref(),
+        Some("namespace index build interrupted by gateway restart")
+    );
+    assert_eq!(after_cleanup.search_generation("S").unwrap(), Some(active));
+    assert_eq!(
+        after_cleanup
+            .search("S", active, "active", 1, 10)
+            .unwrap()
+            .len(),
         1
     );
 

@@ -1723,6 +1723,102 @@ async fn build_loop_records_inventory_shutdown_failure() {
 }
 
 #[tokio::test]
+async fn gateway_shutdown_interruption_preserves_retry_state_without_opening_circuit() {
+    let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+    let manager = Arc::new(IndexManager::new(
+        Arc::new(MockOpcClient::default()),
+        settings(PathBuf::from(":memory:")),
+    ));
+    seed_active_generation(
+        &manager,
+        NamespaceOrganization::Hierarchical,
+        BrowseSource::Da2,
+        "0",
+        true,
+    );
+    let control: Arc<dyn InventoryControl> = Arc::new(RecordingInventoryControl::default());
+    let ownership = insert_runtime_build(&manager, Arc::clone(&control));
+    let generation = manager
+        .with_database(|db| {
+            let generation = db.start_generation(
+                "S",
+                NamespaceOrganization::Hierarchical,
+                BrowseSource::Da2,
+                &timestamp_now(),
+            )?;
+            db.insert_entries("S", generation, &[inventory_entry("Partial", "S.Partial")])?;
+            Ok(generation)
+        })
+        .unwrap();
+    let retry_after = std::time::SystemTime::now() + Duration::from_secs(60);
+    {
+        let mut runtime = manager.runtime.lock().unwrap();
+        let state = runtime.get_mut("S").unwrap();
+        state.retry_after = Some(retry_after);
+        state.consecutive_failures = 1;
+        state.circuit_open = false;
+    }
+    manager
+        .with_database(|db| db.set_retry_state("S", Some(retry_after), 1, false))
+        .unwrap();
+    manager.background_tasks.request_shutdown();
+    control.cancel();
+
+    let build_started = Instant::now();
+    let mut handle = InventoryHandle {
+        stream: Box::new(VecInventoryStream {
+            events: VecDeque::new(),
+        }),
+        control: Arc::clone(&control),
+    };
+    let mut state = BuildRunState::new(&manager.settings, None);
+    let outcome = manager
+        .run_build_loop("S", generation, &mut handle, &[], &mut state, build_started)
+        .await;
+
+    manager.finalize_build(
+        BuildFinalizationContext {
+            server: "S",
+            generation,
+            control: &handle.control,
+            control_was_cancelled_before_cleanup: handle.control.is_cancelled(),
+            ownership: &ownership,
+            build_started,
+        },
+        state,
+        outcome,
+    );
+    let status = manager.status("S").await.unwrap();
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("namespace index build interrupted by gateway shutdown")
+    );
+    assert_eq!(status.active_generation, 1);
+    assert_eq!(status.scheduler.consecutive_failures, 1);
+    assert!(!status.scheduler.circuit_open);
+    assert_eq!(
+        manager
+            .runtime
+            .lock()
+            .unwrap()
+            .get("S")
+            .unwrap()
+            .retry_after,
+        Some(retry_after)
+    );
+    assert_eq!(
+        manager
+            .search("S", "persisted", 3, 10)
+            .await
+            .unwrap()
+            .matches
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn build_loop_keeps_build_failure_when_shutdown_also_fails() {
     let directory = tempdir().unwrap();
     let manager = Arc::new(IndexManager::new(
