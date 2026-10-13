@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 /// Parse CLI arguments and run, returning a process exit code.
 ///
-/// Kept as a thin wrapper around [`run_with_cli`] so `main.rs` stays a
+/// Kept as a thin wrapper around `run_with_cli` so `main.rs` stays a
 /// one-line delegator while the actual control flow (config loading, error
 /// formatting) is exercised by tests against an already-parsed `Cli`,
 /// without needing to control `std::env::args()`.

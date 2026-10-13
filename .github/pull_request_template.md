@@ -14,8 +14,6 @@
 - [ ] `cargo test --workspace` passes
 - [ ] `cargo deny check` passes
 - [ ] `cargo machete` passes
-- [ ] `cargo test --manifest-path compatibility-tests/Cargo.toml --locked` passes when applicable
-- [ ] `python3 scripts/generate-compatibility-report.py --check` passes when applicable
 - [ ] Documentation (`README.md`, `AGENTS.md`, or `CONTRIBUTING.md`) updated if this changes
       user-visible behavior
 - [ ] Applicable SonarQube analysis reports zero `OPEN`/`CONFIRMED` issues, or any remaining

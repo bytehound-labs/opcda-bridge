@@ -43,8 +43,7 @@ Example: `feat(gateway): add tag subscription support`.
 - Use Rust's `stable` toolchain for local development to match the regular validation, coverage,
   SonarQube, and release-plz jobs. The MSRV (Minimum Supported Rust Version) job separately checks
   Rust 1.88.0; on rustup-managed hosts, run `rustup update stable` if the selected toolchain is
-  older. The cargo-fuzz smoke tests intentionally use nightly, and the `Semver checks` job pins
-  Rust 1.98.1 to match its pinned cargo-semver-checks 0.50.0.
+  older. The cargo-fuzz smoke tests intentionally use nightly.
 - **Build the Windows gateway for the release target, not the host target.** The gateway is
   intentionally 32-bit x86 (`i686-pc-windows-msvc`) so it can load legacy OPC DA/COM
   installations that use the 32-bit registry view, even when Windows itself is 64-bit:
@@ -57,8 +56,8 @@ Example: `feat(gateway): add tag subscription support`.
 - Both are enforced automatically by a [lefthook](https://github.com/evilmartians/lefthook)
   `pre-commit` hook (`.lefthook.yml`), which also formats `Cargo.toml`/TOML with `taplo` and
   Markdown/YAML/JSON with `prettier`. Run `lefthook install` once after cloning to enable it.
-- SonarQube Cloud analyzes the Rust workspace, compatibility support, and fuzz targets for
-  maintainability, reliability, security, complexity, and duplication issues. Reproduce its
+- SonarQube Cloud analyzes the Rust workspace and fuzz targets for maintainability, reliability,
+  security, complexity, and duplication issues. Reproduce its
   coverage input locally with `cargo llvm-cov --workspace --locked --lcov --output-path lcov.info`,
   then run `sonar-scanner` with `SONAR_TOKEN` exported. The workflow runs for relevant pull
   requests and pushes to `main`, plus a Wednesday 04:47 UTC weekly scan; fork pull requests
@@ -77,12 +76,6 @@ Example: `feat(gateway): add tag subscription support`.
   on any OS: tests exercise a hand-written `MockOpcClient` instead of a live COM connection.
 - Hardware-in-the-loop tests (against a real Windows host + OPC DA server) aren't part of CI;
   note manual verification steps in the PR description when a change needs them.
-- Cross-version protocol checks run from the isolated `compatibility-tests/` workspace:
-  `cargo test --manifest-path compatibility-tests/Cargo.toml --locked`.
-  The workflow regenerates that workspace's lockfile when package manifests change because path
-  dependencies carry the branch's package versions. After a package release, release automation
-  proposes the matching lockfile as a separate `release-plz-*` pull request, where it runs the
-  normal checks before auto-merge.
 
 ## CI
 
@@ -97,52 +90,24 @@ because same-version internal dependencies may not be published until the releas
 Linux and Windows jobs compile the current workspace sources. Documentation-only changes keep the
 required `check` and `coverage` statuses green without rebuilding the workspace.
 
-Whenever the compiled Rust validation runs, the `Semver checks` job also runs
-[cargo-semver-checks](https://github.com/obi1kenobi/cargo-semver-checks) for the published library
-crates `opcda-bridge`, `opcda-bridge-proto`, and `opcda-bridge-client`, comparing each crate's
-public API with its latest crates.io release. Its result is part of the required `check` status;
-the Windows gateway is a binary and is not checked. Reproduce the job locally with `protoc` on
-`PATH`:
-
-```sh
-cargo install cargo-semver-checks --locked
-cargo semver-checks -p opcda-bridge -p opcda-bridge-proto -p opcda-bridge-client
-```
-
-The job pins both Rust and cargo-semver-checks because the tool reads the toolchain's rustdoc JSON
-output; update the two pins together. An intentional breaking change passes only when the same
-pull request bumps the affected crate's minor version, as described under [Releases](#releases).
-
-Security workflows use immutable action pins and bounded aggregate statuses. They run CodeQL,
+Security workflows use immutable action pins and bounded aggregate statuses. They cover CodeQL,
 Semgrep, full-history Gitleaks, actionlint, zizmor, Buf Protobuf checks (lint, formatting, and
-breaking changes), and bounded fuzz smoke tests when their inputs change. Tagged binary releases
-receive checksums, an SBOM, keyless signatures, and provenance; use the release workflow's manual
-dispatch for packaging validation without publishing. Intentional Protobuf wire-contract breaks
-must carry the `breaking-protobuf` label; without that explicit approval, the Buf compatibility
-check blocks the pull request.
+breaking changes), and bounded fuzz smoke tests. Workflows with expensive checks filter for
+relevant inputs; the Buf workflow runs on pull requests and pushes to `main`. Tagged binary
+releases receive checksums, an SBOM, keyless signatures, and provenance; use the release workflow's
+manual dispatch for packaging validation without publishing. An intentional Protobuf wire break
+increments the affected protocol version under `[protocol]` in
+`crates/opcda-bridge-proto/compatibility.toml` and updates the related release-line and evidence
+records.
 
-The generated compatibility files must remain synchronized with
-`crates/opcda-bridge-proto/compatibility.toml`:
-
-```sh
-python3 scripts/generate-compatibility-report.py --check
-```
-
-`COMPATIBILITY.md` is generated output; do not run the repository's general
-Prettier hook over it, because the generator owns its Markdown table layout.
-
-The catalog describes protocol release lines rather than equal package versions. An intentional
-breaking Protobuf change requires the `breaking-protobuf` label, a new or changed compatibility
-boundary, updated boundary evidence, and regenerated reports. The Buf compatibility workflow
-enforces those requirements.
-
-The same workflow lints the schema with Buf's `STANDARD` rules and requires the schema files to
-match `buf format` output. Run both checks from the repository root before submitting a Protobuf
-change:
+The Protobuf workflow lints the schema with Buf's `STANDARD` rules, checks `buf format` output, and
+compares the schema with `main`. Run the checks from the repository root before submitting a
+Protobuf change:
 
 ```sh
 buf lint
 buf format --diff --exit-code
+buf breaking --against '.git#ref=refs/remotes/origin/main'
 ```
 
 The `except` entries in `buf.yaml` cover names that are already part of the published wire
@@ -172,11 +137,8 @@ The four crates are versioned independently and use package-specific tags
 jobs, updates only packages with releasable Conventional Commits, and publishes crates in
 dependency order. `changelog_include` entries cascade a reusable library or protocol change to
 the dependent packages that must be rebuilt, without restoring workspace-wide lockstep versions.
-The generated release metadata must pass the package-aware `release-integrity` check, while the
-release commit filter and crates.io rate limit provide additional safeguards.
-The release workflow proposes a separate `release-plz-*` pull request for any generated
-compatibility-test lockfile update; that change follows the normal checks and auto-merge path
-instead of being pushed directly to `main`.
+Release pull requests pass the release-content integrity check; the release commit filter and
+crates.io rate limit provide additional safeguards.
 
 The gateway's native COM dependency, `bytehound-opc-da-client`, is maintained in
 [`bytehound-labs/opc-cli`](https://github.com/bytehound-labs/opc-cli), outside this workspace. Its
@@ -189,24 +151,17 @@ release. A pull request that breaks the public API of `opcda-bridge`, `opcda-bri
 `opcda-bridge-client`, including adding a field to a public struct that callers can construct with
 a struct literal, bumps that crate's minor version in the same pull request (for example, `0.5.x`
 to `0.6.0`). A bump of `opcda-bridge` or `opcda-bridge-proto` also updates its `version`
-requirement under `[workspace.dependencies]` in the root `Cargo.toml`. The `Semver checks` job
-enforces this against the latest crates.io releases. Non-breaking changes leave version bumps to
-release-plz. The catalog's current release line already spans later `0.x` versions, so a Rust-only
-API break needs no catalog change; Protobuf wire breaks still follow the `breaking-protobuf`
-process described under [CI](#ci).
-
-Every publishable package version must fall within exactly one catalog release line. Client and
-gateway binary Releases include `COMPATIBILITY.md` and `compatibility.json` so operators can inspect
-the same protocol evidence offline.
+requirement under `[workspace.dependencies]` in the root `Cargo.toml`. Non-breaking changes leave
+version bumps to release-plz. The protocol compatibility source records package release lines,
+feature versions, and evidence. Increment the affected protocol version under `[protocol]` for an
+intentional wire break and update the related release-line and evidence records. Run
+`opcda-bridge-client compatibility` to inspect a deployed pair.
 
 All four crates publish to crates.io. GitHub Releases and prebuilt platform archives are reserved
 for the client and gateway tags; the protocol crate and reusable library do not produce binary
 archives. Client/gateway compatibility is defined by the wire protocol and advertised capability
 versions rather than matching package versions. Published crate names and versions are permanent;
-a yanked version cannot be reused. The AUR package is generated by `scripts/aurpkg` from the
-client-specific tag and uses standard Arch `pkgver-pkgrel` versioning. Its generated source
-filenames include the package version so cached files from an earlier release cannot cause
-checksum failures; packaging-only changes use a bumped `pkgrel`.
+a yanked version cannot be reused.
 
 ## Reporting security issues
 

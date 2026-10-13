@@ -21,8 +21,7 @@ the client and gateway tags; protocol and reusable-library releases do not produ
 Do not publish directly with `cargo publish` or create test tags for intermediate builds.
 
 The gateway release archive is always the 32-bit `i686-pc-windows-msvc` build. Client archives are
-produced for Linux x86_64, macOS arm64, and Windows x86_64. The client release workflow also
-publishes the client binary to the AUR.
+produced for Linux x86_64, macOS arm64, and Windows x86_64.
 
 A manual dispatch of the **Release** workflow builds dry-run packages and uploads them as
 workflow artifacts without creating a GitHub Release. This is a packaging check, not a release or
@@ -47,9 +46,8 @@ Tagged binary releases include:
 - keyless Sigstore signatures and bundles; and
 - GitHub artifact provenance attestations.
 
-The release workflow also attaches the generated `COMPATIBILITY.md` and `compatibility.json`
-reports. Verify a downloaded archive against its checksum and attestations before deployment.
-Keep the exact gateway artifact and checksum together with deployment records.
+Verify a downloaded archive against its checksum and attestations before deployment. Keep the
+exact gateway artifact and checksum together with deployment records.
 
 ## Validation
 
@@ -63,13 +61,11 @@ cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
 cargo deny check
 cargo machete
 cargo package --workspace --locked --no-verify
-cargo test --manifest-path compatibility-tests/Cargo.toml --locked
-python3 scripts/generate-compatibility-report.py --check
 ```
 
 The Windows gateway is built for `i686-pc-windows-msvc`; gateway deployment tests must verify the
 official artifact rather than substituting an intermediate local build. Release jobs run the
-package, compatibility, integrity, and platform checks required by the release workflows.
+package, integrity, and platform checks required by the release workflows.
 
 ## Installation sources
 
@@ -79,8 +75,7 @@ package, compatibility, integrity, and platform checks required by the release w
   client/gateway pair.
 - [GitHub Releases](https://github.com/bytehound-labs/opcda-bridge/releases) contains the
   prebuilt client and gateway archives.
-- The client can also be installed with `cargo install opcda-bridge-client` or from the
-  `opcda-bridge-client-bin` AUR package.
+- The client can also be installed with `cargo install opcda-bridge-client`.
 - The gateway can be installed with Cargo on Windows using the explicit 32-bit target documented
   in the gateway deployment guide.
 

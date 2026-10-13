@@ -42,7 +42,6 @@ jobs:
               - 'sonar-project.properties'
               - 'build.rs'
               - 'crates/**'
-              - 'compatibility-tests/**'
               - 'fuzz/**'
               - 'scripts/**'
               - '.github/workflows/**'

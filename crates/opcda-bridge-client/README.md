@@ -26,7 +26,8 @@ capabilities. `full`, `partial`, `incompatible`, and `unknown` describe negotiat
 `unverified` evidence means the protocol ranges overlap but that exact package pair has not been
 exercised in CI. The report distinguishes the client binary version from the reusable-library
 version implementing its protocol contract. See the repository's
-[compatibility catalog](../../COMPATIBILITY.md) for release lines and boundary evidence.
+[protocol and compatibility guide](../../docs/protocol-and-compatibility.md) for release lines and
+boundary evidence.
 
 Read output contains semantic values. An OPC DA `VT_BSTR` is returned exactly as supplied by the
 server, so a BSTR containing `AUT` produces `"value": "AUT"` rather than a display-quoted value.
