@@ -1,35 +1,28 @@
 # Contributing to opcda-bridge
 
-opcda-bridge is under active development. The practices below apply to all contributions.
+Use focused pull requests, preserve the OPC DA safety boundary, and follow the checks below.
 
 ## Development workflow: trunk-based
 
-- `main` is the only long-lived branch and should always be green (builds, passes CI).
-- Work happens on short-lived branches named `<type>/<short-description>` (e.g.
-  `feat/gateway-rpc-protocol`, `fix/quality-flag-mapping`), opened as a PR and merged within a
-  day or two — not long-running feature branches.
-- PRs are squash-merged, so the squash commit message (not the intermediate commits) must follow
-  the commit convention below.
-- No `develop` branch and no long-lived `release` branches. Releases are tagged directly off
-  `main` (`<component>-vX.Y.Z`, [SemVer](https://semver.org/)).
-- Incomplete or experimental work that must land before it's fully ready goes behind a Cargo
-  feature flag rather than sitting unmerged on a branch.
-- Every change, including documentation-only fixes, goes through a feature branch and pull
-  request so the repository's checks run before it reaches `main`.
-- After opening a pull request, keep repairing the same branch until every applicable required
-  check and SonarQube status passes. If a check reports that the branch is behind `main`, update
-  the branch before merging; do not bypass the protection rule with a direct push.
+- Synchronize a clean local `main`, then create a short-lived `<type>/<short-description>` branch.
+  `main` is the only long-lived branch; there is no `develop` or long-lived release branch.
+- Keep one logical change per PR, including documentation-only fixes. Work that must land before
+  its behavior is ready stays behind a Cargo feature flag.
+- Run targeted and applicable full validation. Fill in the PR template with exact commands,
+  results, and any required manual verification.
+- Repair failures on the same branch until every applicable required check passes. If `main`
+  advances, update the branch before merging; never bypass protection or push directly to `main`.
+- Squash-merge after maintainer approval and passing checks. The squash message must follow the
+  commit convention below. Wait for post-merge workflows and applicable main Sonar analysis before
+  starting dependent work.
 
-The standard change protocol is: synchronize a clean local `main`, create a named feature/fix/docs
-branch, keep one logical change group per pull request, run targeted and applicable full
-validation, commit with Conventional Commits, push and open the focused pull request, repair
-failures on that branch until all required checks are green, and squash-merge only then. Applicable
-PR SonarQube analyses must report zero `OPEN`/`CONFIRMED` issues; an intentional Accepted or False
-Positive finding needs a durable rationale and a related pull request or documentation link. After
-the merge, wait for the resulting `main` workflows and SonarQube analysis and verify the intended
-findings disappeared without introducing new ones before starting dependent work. Direct pushes to
-`main`, `NOSONAR`, broad exclusions, weakened quality profiles, and dashboard-only suppression of
-real findings are not permitted.
+Applicable PR Sonar analyses must report zero `OPEN`/`CONFIRMED` issues. Query
+`bytehound-labs_opcda-bridge` with an explicit `pullRequest=<number>` before merge and `branch=main`
+after the merge analysis completes, using `issueStatuses=OPEN,CONFIRMED`. Authenticate with
+`SONAR_TOKEN` from the ignored local `.env`; never print the token. An Accepted or False Positive
+finding requires an
+evidence-backed rationale and related link. Do not use `NOSONAR`, broad exclusions, weakened quality
+profiles, or dashboard-only suppression to hide real findings.
 
 ## Commit messages
 
@@ -38,71 +31,57 @@ real findings are not permitted.
 Common types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `ci`.
 Example: `feat(gateway): add tag subscription support`.
 
-## Code style
+## Development setup and style
 
-- Use Rust's `stable` toolchain for local development to match the regular validation, coverage,
-  SonarQube, and release-plz jobs. The MSRV (Minimum Supported Rust Version) job separately checks
-  Rust 1.88.0; on rustup-managed hosts, run `rustup update stable` if the selected toolchain is
-  older. The cargo-fuzz smoke tests intentionally use nightly.
-- **Build the Windows gateway for the release target, not the host target.** The gateway is
-  intentionally 32-bit x86 (`i686-pc-windows-msvc`) so it can load legacy OPC DA/COM
-  installations that use the 32-bit registry view, even when Windows itself is 64-bit:
-  `rustup target add i686-pc-windows-msvc` followed by
-  `cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-msvc`.
-  The cross-platform client has an independent architecture and remains x86_64 on Windows.
-- Format with `cargo fmt --all` (default rustfmt settings) before committing.
-- Lint with `cargo clippy --workspace --all-targets --all-features -- -D warnings`; fix every
-  warning or justify an explicit `#[allow(...)]` with a comment.
-- Both are enforced automatically by a [lefthook](https://github.com/evilmartians/lefthook)
-  `pre-commit` hook (`.lefthook.yml`), which also formats `Cargo.toml`/TOML with `taplo` and
-  Markdown/YAML/JSON with `prettier`. Run `lefthook install` once after cloning to enable it.
-- SonarQube Cloud analyzes the Rust workspace and fuzz targets for maintainability, reliability,
-  security, complexity, and duplication issues. Reproduce its
-  coverage input locally with `cargo llvm-cov --workspace --locked --lcov --output-path lcov.info`,
-  then run `sonar-scanner` with `SONAR_TOKEN` exported. The workflow runs for relevant pull
-  requests and pushes to `main`, plus a Wednesday 04:47 UTC weekly scan; fork pull requests
-  intentionally skip the secret-bearing analysis. Applicable pull requests also require zero
-  `OPEN`/`CONFIRMED` issues; Accepted and False Positive findings require a durable rationale and
-  related link. A post-upload scan failure also prints the Compute Engine response and the projects
-  visible to the analysis token in the workflow log, which helps distinguish project identity
-  errors from server-side processing failures.
+- Use stable Rust and put `protoc` on `PATH`. The separate MSRV job checks Rust 1.88.0; cargo-fuzz
+  smoke tests use nightly.
+- Build the Windows gateway with the explicit MSVC toolchain and 32-bit target in
+  [gateway installation](docs/gateway-deployment.md#install-the-gateway), not the host default.
+  The cross-platform client is independently built and remains x86_64 on Windows.
+- Use default rustfmt settings and fix Clippy warnings; an intentional `#[allow(...)]` needs a
+  justification.
+- Run `lefthook install` after cloning. The [hooks](.lefthook.yml) format staged Rust, TOML,
+  Markdown, YAML, JSON, and shell files, run Rust checks, and synchronize secrets through the
+  configured dotenv workflow. Never commit `.env` or credentials.
 
-## Testing
+## Validation
 
-- Unit-test protocol/parsing logic with `cargo test --workspace` — no hardware required.
-- The gateway depends on `opc-da-client` only on Windows (`#[cfg(target_os = "windows")]`). Its
-  core logic is abstracted behind an `OpcClient` trait
-  (`crates/opcda-bridge-gateway/src/opc.rs`) so it stays testable
-  on any OS: tests exercise a hand-written `MockOpcClient` instead of a live COM connection.
-- Hardware-in-the-loop tests (against a real Windows host + OPC DA server) aren't part of CI;
-  note manual verification steps in the PR description when a change needs them.
+Run the smallest checks covering the change, then every gate it can affect:
 
-## CI
+```sh
+cargo fmt --check --all
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked
+cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+cargo deny check
+cargo machete
+cargo build --workspace --locked
+cargo package --workspace --locked --no-verify
+```
 
-PRs must pass `cargo fmt --check --all`, `cargo clippy --workspace --all-targets --all-features
--- -D warnings`, and `cargo test --workspace` before merge. The gateway crate is Windows-only
-(COM); the client crate should build and test on Linux, macOS, and Windows.
+The gateway's native COM adapter is Windows-only; its RPC, lifecycle, and index logic is tested
+cross-platform through [`OpcClient`](crates/opcda-bridge-gateway/src/opc.rs) and shared mocks.
+Workspace tests require no OPC hardware. Live OPC DA/DCOM verification is outside CI; document
+the manual steps when a change requires it. Do not write tags or refresh a production namespace
+merely to validate a documentation change.
 
-The workflows are change-aware: compiled validation runs for Rust, workspace, dependency, script,
-or workflow changes; package archive validation also runs when crate metadata or packaged
-documentation changes. The archive job uses `cargo package --workspace --locked --no-verify`
-because same-version internal dependencies may not be published until the release PR merges; the
-Linux and Windows jobs compile the current workspace sources. Documentation-only changes keep the
-required `check` and `coverage` statuses green without rebuilding the workspace.
+[Codecov](codecov.yml) targets 100% project and patch coverage with a one-percentage-point status
+threshold; preserve that policy. The [workflows](.github/workflows) filter expensive jobs by changed
+paths. Root documentation-only changes skip compiled validation and coverage; a packaged crate
+README also triggers archive validation and Sonar analysis. Fork PRs skip secret-bearing Sonar
+analysis.
 
-Security workflows use immutable action pins and bounded aggregate statuses. They cover CodeQL,
-Semgrep, full-history Gitleaks, actionlint, zizmor, Buf Protobuf checks (lint, formatting, and
-breaking changes), and bounded fuzz smoke tests. Workflows with expensive checks filter for
-relevant inputs; the Buf workflow runs on pull requests and pushes to `main`. Tagged binary
-releases receive checksums, an SBOM, keyless signatures, and provenance; use the release workflow's
-manual dispatch for packaging validation without publishing. An intentional Protobuf wire break
-increments the affected protocol version under `[protocol]` in
-`crates/opcda-bridge-proto/compatibility.toml` and updates the related release-line and evidence
-records.
+The archive job adds validation-only local patches for unpublished same-version workspace crates.
+`--no-verify` assembles archives rather than compiling their extracted sources; Linux and Windows
+jobs compile the workspace when Rust inputs change. Packaged manifests retain real registry
+version requirements. Do not use those patches for publication.
 
-The Protobuf workflow lints the schema with Buf's `STANDARD` rules, checks `buf format` output, and
-compares the schema with `main`. Run the checks from the repository root before submitting a
-Protobuf change:
+Security checks cover CodeQL, Semgrep, full-history Gitleaks, actionlint, zizmor, and bounded fuzz
+smoke tests. Protobuf checks run on PRs and pushes to `main`.
+
+### Protobuf changes
+
+From the repository root:
 
 ```sh
 buf lint
@@ -115,56 +94,26 @@ contract: the `bridge` package and its file layout, the `Bridge` service, and th
 domain-named RPC response messages. Renaming those elements would change gRPC method paths or the
 generated Rust API, so they remain documented lint exceptions rather than lint fixes.
 
-## Pull requests
-
-- Keep PRs small and focused — one logical change each.
-- Describe what changed and why; link an issue if one exists.
-- Include the targeted validation performed and any manual verification needed for the change.
-- Squash-merge only after every applicable required check and the PR SonarQube zero-issue check
-  pass. Do not use `NOSONAR` or a dashboard status change to hide a real unresolved code issue.
+Buf uses `STANDARD` rules and compares the wire contract with `main`; there is no label-based
+bypass. An intentional wire break also requires the
+[protocol version and evidence changes](docs/protocol-and-compatibility.md#versioning-and-protocol-changes).
 
 ## Releases
 
-The workspace publishes four crates to crates.io:
+The four workspace crates release independently from `main` with package-specific tags. The client
+and gateway have prebuilt archives; protocol and reusable-library releases are crates.io-only.
+Use the canonical references:
 
-- `opcda-bridge-proto` — generated gRPC protocol types.
-- `opcda-bridge` — reusable async Rust client library.
-- `opcda-bridge-client` — cross-platform CLI.
-- `opcda-bridge-gateway` — Windows OPC DA gateway.
+- [Release flow and verification](docs/release.md): release-plz, dependency-order publication,
+  native-client publisher ownership, archive checksums/signatures/provenance, and dry-run limits.
+- [Rust API and wire versioning](docs/protocol-and-compatibility.md#versioning-and-protocol-changes):
+  pre-1.0 API breaks, workspace dependency requirements, negotiated features, and pair evidence.
+- [AUR package](docs/release.md#aur-package): generated client package, versioned source filenames,
+  and `pkgver`/`pkgrel`.
 
-The four crates are versioned independently and use package-specific tags
-(`opcda-bridge-client-vX.Y.Z`, for example). `release-plz` runs separate release-PR and publish
-jobs, updates only packages with releasable Conventional Commits, and publishes crates in
-dependency order. `changelog_include` entries cascade a reusable library or protocol change to
-the dependent packages that must be rebuilt, without restoring workspace-wide lockstep versions.
-Release pull requests pass the release-content integrity check; the release commit filter and
-crates.io rate limit provide additional safeguards.
-
-The gateway's native COM dependency, `bytehound-opc-da-client`, is maintained in
-[`bytehound-labs/opc-cli`](https://github.com/bytehound-labs/opc-cli), outside this workspace. Its
-`Publish ByteHound OPC DA client` workflow there verifies the selected commit; publication is
-available only through that repository's protected `crates-publish` environment. Do not add a
-second publisher for this crate here.
-
-Versioning follows Cargo's rules for `0.x` crates, where a minor version bump marks a breaking
-release. A pull request that breaks the public API of `opcda-bridge`, `opcda-bridge-proto`, or
-`opcda-bridge-client`, including adding a field to a public struct that callers can construct with
-a struct literal, bumps that crate's minor version in the same pull request (for example, `0.5.x`
-to `0.6.0`). A bump of `opcda-bridge` or `opcda-bridge-proto` also updates its `version`
-requirement under `[workspace.dependencies]` in the root `Cargo.toml`. Non-breaking changes leave
-version bumps to release-plz. The protocol compatibility source records package release lines,
-feature versions, and evidence. Increment the affected protocol version under `[protocol]` for an
-intentional wire break and update the related release-line and evidence records. Run
-`opcda-bridge-client compatibility` to inspect a deployed pair.
-
-All four crates publish to crates.io. GitHub Releases and prebuilt platform archives are reserved
-for the client and gateway tags; the protocol crate and reusable library do not produce binary
-archives. Client/gateway compatibility is defined by the wire protocol and advertised capability
-versions rather than matching package versions. Published crate names and versions are permanent;
-a yanked version cannot be reused. The AUR package is generated by `scripts/aurpkg` from the
-client-specific tag and uses standard Arch `pkgver-pkgrel` versioning. Its generated source
-filenames include the package version so cached files from an earlier release cannot cause
-checksum failures; packaging-only changes use a bumped `pkgrel`.
+Release workflow manual dispatch is a packaging dry run. Release-plz dispatch is not: only run
+publication as part of an explicitly approved release. Do not create intermediate releases or
+publish directly with `cargo publish`.
 
 ## Reporting security issues
 

@@ -23,8 +23,7 @@ expand it into a generic industrial-protocol gateway.
   [`bytehound-labs/opc-cli`](https://github.com/bytehound-labs/opc-cli), outside this workspace.
   Its `Publish ByteHound OPC DA client` workflow and protected `crates-publish` environment are
   the sole publication path. Do not add a duplicate publisher here or bypass that environment.
-  This repository's `release-plz` workflow publishes workspace crates; `release.yml` builds
-  binary archives.
+  Workspace publication and binary archives follow [release guidance](docs/release.md).
 - Keep the deployment threat model accurate; see
   [gateway deployment](docs/gateway-deployment.md), [indexing operations](docs/indexing-and-search.md),
   and [the security policy](SECURITY.md).
@@ -40,7 +39,8 @@ expand it into a generic industrial-protocol gateway.
 - Preserve the branch-protection required status contexts: `check`, `coverage`,
   `release-integrity`, and `Required Sonar quality status`.
 - Never commit secrets, credentials, machine-local state, caches, build output, or temporary
-  artifacts.
+  artifacts. Do not run `ds reverse` or `ds push` without the intended populated `.env`.
+  For an isolated worktree without it, commit with `LEFTHOOK=0` and run applicable checks separately.
 - Protocol changes must preserve published Protobuf names, field numbers, and wire types. An
   intentional wire break increments the affected protocol version under `[protocol]` in
   `crates/opcda-bridge-proto/compatibility.toml` and updates the relevant release-line and evidence
@@ -51,31 +51,18 @@ expand it into a generic industrial-protocol gateway.
 Use stable Rust and install `protoc` for workspace builds. The declared MSRV is Rust 1.88. The
 cargo-fuzz smoke workflow uses nightly.
 
-```sh
-cargo build --workspace --locked
-cargo fmt --check --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --locked
-cargo llvm-cov --workspace --lcov --output-path lcov.info
-cargo deny check
-cargo machete
-cargo package --workspace --locked --no-verify
-```
-
-Build the supported Windows gateway target explicitly:
-
-```powershell
-rustup target add i686-pc-windows-msvc
-cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-msvc
-```
+Use the canonical [contributor validation commands](CONTRIBUTING.md#validation) and
+[Windows gateway build instructions](docs/gateway-deployment.md#install-the-gateway).
+Select the MSVC toolchain and `i686-pc-windows-msvc` target explicitly, including on a host whose
+default Rust toolchain is GNU.
 
 ## Code and test constraints
 
 - Keep gateway OPC operations behind the `OpcClient` abstraction so RPC and lifecycle behavior can
   be tested cross-platform. The concrete COM adapter is Windows-only; use the shared mock client
   in tests.
-- Add focused tests with new behavior and preserve the repository's complete source-line coverage
-  gate. Operational SQLite lock errors are not corrupt-cache evidence and must not trigger
+- Add focused tests with new behavior and preserve the [coverage policy](codecov.yml).
+  Operational SQLite lock errors are not corrupt-cache evidence and must not trigger
   quarantine.
 - Keep config precedence as CLI > environment > TOML > built-in default. Missing auto-discovered
   config files are allowed; malformed existing files and missing explicit paths are errors.

@@ -93,10 +93,12 @@ All four workspace crates publish to crates.io. Each has its own version; GitHub
 binary archives are produced for the client and gateway. A client release does not need a matching
 gateway release.
 
-The three published Rust libraries are pre-1.0. Adding a public Rust struct field can break
-downstream struct literals even when the Protobuf wire change is additive. Such a public API break
-requires the affected crate's next minor version and its workspace dependency requirement to be
-updated.
+The published Rust APIs are pre-1.0. A public API break in `opcda-bridge`,
+`opcda-bridge-proto`, or `opcda-bridge-client` requires that crate's next minor version in the same
+PR, such as `0.5.x` to `0.6.0`. Adding a public struct field can break downstream struct literals
+even when the Protobuf change is additive. A reusable-library or protocol-crate bump also updates
+its `version` requirement under `[workspace.dependencies]` in the root
+[`Cargo.toml`](../Cargo.toml). Non-breaking version bumps are left to release-plz.
 
 An intentional Protobuf wire break increments the affected protocol version under `[protocol]` in
 the compatibility TOML and updates the corresponding release-line and evidence records. The Buf
@@ -105,8 +107,10 @@ published package names, Protobuf packages, services, RPCs, fields, field number
 Do not change the wire contract solely to satisfy a linter.
 
 The gateway migrates older indexed-search SQLite databases transactionally through schema 2, 3,
-and 4. Existing generations and full-text data are preserved; only usable active generations are
-enabled for scheduled refresh automatically.
+and 4, preserving generations and full-text data. The schema-3-to-4 migration enables auto-refresh
+only for servers with a usable active generation; failed-only histories remain visible without
+scheduled refresh. An existing schema-4 database retains its saved choices. New and recreated
+indexes start with auto-refresh off, and manual refresh or retry does not opt them in.
 
 ## Related references
 

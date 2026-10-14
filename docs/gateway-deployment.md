@@ -48,19 +48,19 @@ Download `opcda-bridge-gateway-windows-x86.zip` from the
 release checksums and attestations as described in [Release and package verification](release.md),
 extract it on the OPC DA server host, and run `opcda-bridge-gateway.exe`.
 
-Building or installing from source requires Rust 1.88 or newer, `protoc` on `PATH`, and the
-explicit x86 target:
+Building or installing from source requires Rust 1.88 or newer, `protoc` on `PATH`, and the MSVC
+C++ build tools and Windows SDK. Select both the MSVC toolchain and x86 target explicitly, even
+when the host's default Rust toolchain is GNU:
 
 ```powershell
-rustup target add i686-pc-windows-msvc
-cargo build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-msvc
+rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --target i686-pc-windows-msvc
+cargo +stable-x86_64-pc-windows-msvc build --release --locked -p opcda-bridge-gateway --target i686-pc-windows-msvc
 ```
 
-To install the published crate:
+With that toolchain installed, install the published crate:
 
 ```powershell
-rustup target add i686-pc-windows-msvc
-cargo install --locked --target i686-pc-windows-msvc opcda-bridge-gateway
+cargo +stable-x86_64-pc-windows-msvc install --locked --target i686-pc-windows-msvc opcda-bridge-gateway
 ```
 
 A plain `cargo build --release` on 64-bit Windows produces an x64 host build and does not produce
@@ -82,13 +82,13 @@ address. `Ctrl+C` requests graceful shutdown and lets in-flight requests drain.
 
 The gateway includes service-management subcommands:
 
-| Command | Effect |
-| --- | --- |
-| `opcda-bridge-gateway.exe install` | Registers the automatic `OpcdaBridgeGateway` service as `LocalSystem` |
-| `opcda-bridge-gateway.exe start` | Starts the registered service |
-| `opcda-bridge-gateway.exe status` | Reports the Service Control Manager state |
-| `opcda-bridge-gateway.exe stop` | Requests graceful shutdown |
-| `opcda-bridge-gateway.exe uninstall` | Stops the service if needed and removes its registration |
+| Command                              | Effect                                                                |
+| ------------------------------------ | --------------------------------------------------------------------- |
+| `opcda-bridge-gateway.exe install`   | Registers the automatic `OpcdaBridgeGateway` service as `LocalSystem` |
+| `opcda-bridge-gateway.exe start`     | Starts the registered service                                         |
+| `opcda-bridge-gateway.exe status`    | Reports the Service Control Manager state                             |
+| `opcda-bridge-gateway.exe stop`      | Requests graceful shutdown                                            |
+| `opcda-bridge-gateway.exe uninstall` | Stops the service if needed and removes its registration              |
 
 Run `install`, `start`, `stop`, and `uninstall` from an elevated Administrator prompt. The service
 reports `Running` after its listener is ready and drains in-flight requests during a stop.
