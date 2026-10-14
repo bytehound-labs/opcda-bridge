@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.6.1...opcda-bridge-gateway-v0.6.2) - 2026-10-13
+
+### Fixed
+
+- distinguish interrupted index builds ([#193](https://github.com/bytehound-labs/opcda-bridge/pull/193))
+
+### Other
+
+- simplify pre-release compatibility gates
+
 ## [0.6.1](https://github.com/bytehound-labs/opcda-bridge/compare/opcda-bridge-gateway-v0.6.0...opcda-bridge-gateway-v0.6.1) - 2026-10-12
 
 ### Fixed
