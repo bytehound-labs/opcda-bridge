@@ -100,8 +100,9 @@ negotiated through protocol and capability versions; equal package versions are 
 
 ## Contributing
 
-Contributions use focused pull requests and the repository's required validation checks. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the contributor workflow.
+Contributions use focused pull requests and the repository's required validation checks.
+[CONTRIBUTING.md](CONTRIBUTING.md) provides the development setup, canonical local checks, and
+links to the release, AUR, and protocol-change requirements.
 
 ## License
 

@@ -14,11 +14,21 @@ advertised protocol-feature ranges and compatibility evidence, not equal version
 
 ## Release flow
 
-Release-plz prepares package-specific release pull requests from changes on `main`. After the
-release pull request passes required checks and is merged, release automation publishes eligible
-crates and creates package-specific tags. The release workflow builds GitHub release archives for
-the client and gateway tags; protocol and reusable-library releases do not produce binary archives.
-Do not publish directly with `cargo publish` or create test tags for intermediate builds.
+Release-plz prepares package-specific release pull requests from releasable Conventional Commits
+on `main`. Separate release-PR and publish jobs update eligible packages and publish them in
+dependency order. `changelog_include` entries in [release-plz.toml](../release-plz.toml) cascade
+protocol or reusable-library changes to their dependents without lockstep package versions.
+Release-content integrity checks, release-commit filtering, and crates.io rate-limit checks protect
+the release path.
+
+After an approved release pull request passes required checks and is merged, release automation
+publishes eligible crates and creates package-specific tags, such as
+`opcda-bridge-client-vX.Y.Z`. The release workflow builds GitHub release archives for the client
+and gateway tags; protocol and reusable-library releases do not produce binary archives.
+Published crate names and versions are permanent; yanking a version does not make it reusable.
+Do not publish directly with `cargo publish` or create test tags for intermediate builds. See
+[Rust API and protocol versioning](protocol-and-compatibility.md#versioning-and-protocol-changes)
+before introducing a breaking change.
 
 The gateway release archive is always the 32-bit `i686-pc-windows-msvc` build. Client archives are
 produced for Linux x86_64, macOS arm64, and Windows x86_64. The client release workflow also
@@ -50,23 +60,22 @@ Tagged binary releases include:
 Verify a downloaded archive against its checksum and attestations before deployment. Keep the
 exact gateway artifact and checksum together with deployment records.
 
+## AUR package
+
+The client release workflow generates `opcda-bridge-client-bin` from the client-specific tag using
+[`scripts/aurpkg`](../scripts/aurpkg). The generator writes `PKGBUILD` and `.SRCINFO` from the
+release version and verified archive, license, and README checksums.
+
+Arch uses `pkgver-pkgrel`: a client release changes `pkgver`; a packaging-only revision increments
+`pkgrel`. Download source filenames include the package version so an older cached archive,
+license, or README cannot be mistaken for a different release's input.
+
 ## Validation
 
-The repository's standard local checks are:
-
-```sh
-cargo fmt --check --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --locked
-cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
-cargo deny check
-cargo machete
-cargo package --workspace --locked --no-verify
-```
-
-The Windows gateway is built for `i686-pc-windows-msvc`; gateway deployment tests must verify the
-official artifact rather than substituting an intermediate local build. Release jobs run the
-package, integrity, and platform checks required by the release workflows.
+Use the [canonical contributor checks](../CONTRIBUTING.md#validation). Release jobs run the
+required package, integrity, and platform checks. The Windows gateway is built for
+`i686-pc-windows-msvc`; release deployment tests verify the official artifact rather than
+substituting an intermediate local build.
 
 ## Installation sources
 

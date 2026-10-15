@@ -14,12 +14,9 @@ components only through the 32-bit COM and registry view. Windows runs this gate
 WOW64 on a 64-bit host. The x86 gateway is the supported Windows gateway; a host-default x64
 build is not a substitute.
 
-Install it with Cargo on a Windows host:
-
-```powershell
-rustup target add i686-pc-windows-msvc
-cargo install --locked --target i686-pc-windows-msvc opcda-bridge-gateway
-```
+For Cargo installation or a source build, use the
+[gateway installation guide](https://github.com/bytehound-labs/opcda-bridge/blob/main/docs/gateway-deployment.md#install-the-gateway).
+It selects the MSVC toolchain and x86 target explicitly, including on GNU-default Windows hosts.
 
 The gateway is versioned independently from the client and protocol crates. Prebuilt archives use
 `opcda-bridge-gateway-vX.Y.Z` tags; client/gateway interoperability is determined by the wire
