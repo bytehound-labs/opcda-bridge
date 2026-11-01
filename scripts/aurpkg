@@ -86,6 +86,8 @@ cat > "$OUTPUT_DIR/PKGBUILD" << BUILDEOF
 
 pkgname=opcda-bridge-client-bin
 pkgver=$pkgver
+# Epoch 1 was previously published and must remain for Arch upgrade ordering.
+epoch=1
 pkgrel=$PKGREL
 pkgdesc='OPC DA cross-platform client'
 arch=('x86_64')
@@ -114,6 +116,7 @@ cat > "$OUTPUT_DIR/.SRCINFO" << SRCINFOEOF
 	pkgbase = opcda-bridge-client-bin
 	pkgdesc = OPC DA cross-platform client
 	pkgver = $pkgver
+	epoch = 1
 	pkgrel = $PKGREL
 	url = https://github.com/bytehound-labs/opcda-bridge
 	arch = x86_64

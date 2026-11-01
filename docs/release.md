@@ -66,9 +66,10 @@ The client release workflow generates `opcda-bridge-client-bin` from the client-
 [`scripts/aurpkg`](../scripts/aurpkg). The generator writes `PKGBUILD` and `.SRCINFO` from the
 release version and verified archive, license, and README checksums.
 
-Arch uses `pkgver-pkgrel`: a client release changes `pkgver`; a packaging-only revision increments
-`pkgrel`. Download source filenames include the package version so an older cached archive,
-license, or README cannot be mistaken for a different release's input.
+Arch package metadata retains the previously published `epoch=1` for upgrade ordering. A client
+release changes `pkgver`; a packaging-only revision increments `pkgrel`. Download source filenames
+include the package version so an older cached archive, license, or README cannot be mistaken for a
+different release's input.
 
 ## Validation
 
